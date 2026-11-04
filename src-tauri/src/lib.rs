@@ -126,6 +126,15 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
+    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64)> {
+        Ok((
+            db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
+            db.query_row("SELECT coalesce(sum(length(content)), 0) FROM messages", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))?,
+            db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
+        ))
+    };
+    let source_content = content(db)?;
     let mut target = Connection::open(path)?;
     {
         let backup = rusqlite::backup::Backup::new(db, &mut target)?;
@@ -135,7 +144,7 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
     let check = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_keys: i64 = check.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
-    if integrity != "ok" || foreign_keys != 0 {
+    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())

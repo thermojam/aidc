@@ -1,4 +1,5 @@
 {
+  "identifier": "com.nikitamensky.ai-desktop-client.ipc-test",
   "app": {
     "windows": [
       { "label": "main", "title": "AI Desktop Client", "width": 900, "height": 650 },
