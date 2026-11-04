@@ -3,33 +3,32 @@ import { createRoot } from "react-dom/client";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import "./style.css";
 
-type Message = { id: number; role: "user" | "assistant"; content: string; status: string };
+type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
+type History = { messages: Message[]; active_leaf_id: number | null };
 type StreamEvent =
   | { event: "delta"; data: { attempt_id: number; seq: number; text: string } }
   | { event: "end"; data: { attempt_id: number; status: string } };
 
 function App() {
-  const [history, setHistory] = useState<Message[]>([]);
+  const [history, setHistory] = useState<History>({ messages: [], active_leaf_id: null });
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
 
   async function reload() {
-    setHistory(await invoke<Message[]>("list_history"));
+    setHistory(await invoke<History>("list_history"));
   }
 
   useEffect(() => {
     reload().catch((reason) => setError(String(reason)));
   }, []);
 
-  async function send() {
-    const value = prompt.trim();
-    if (!value || busy) return;
+  async function runMock(command: string, args: Record<string, unknown>, restorePrompt?: string) {
+    if (busy) return;
     setBusy(true);
     setError("");
     setDraft("");
-    setPrompt("");
     const channel = new Channel<StreamEvent>();
     let lastSeq = 0;
     channel.onmessage = (message) => {
@@ -47,11 +46,31 @@ function App() {
       }
     };
     try {
-      await invoke<number>("start_mock_generation", { prompt: value, onEvent: channel });
+      await invoke<number>(command, { ...args, onEvent: channel });
       await reload();
     } catch (reason) {
       setBusy(false);
-      setPrompt(value);
+      if (restorePrompt !== undefined) setPrompt(restorePrompt);
+      setError(String(reason));
+    }
+  }
+
+  async function send() {
+    const value = prompt.trim();
+    if (!value || busy) return;
+    setPrompt("");
+    await runMock("start_mock_generation", { prompt: value }, value);
+  }
+
+  async function retry(assistantId: number) {
+    await runMock("retry_mock_generation", { assistantId });
+  }
+
+  async function selectBranch(messageId: number) {
+    try {
+      await invoke("select_branch", { messageId });
+      await reload();
+    } catch (reason) {
       setError(String(reason));
     }
   }
@@ -64,7 +83,15 @@ function App() {
     }
   }
 
-  const visible = busy ? history.filter((message) => message.status !== "streaming") : history;
+  const byId = new Map(history.messages.map((message) => [message.id, message]));
+  const activeIds = new Set<number>();
+  for (let id = history.active_leaf_id; id !== null;) {
+    const message = byId.get(id);
+    if (!message || activeIds.has(id)) break;
+    activeIds.add(id);
+    id = message.parent_id;
+  }
+  const visible = history.messages.filter((message) => activeIds.has(message.id) && (!busy || message.status !== "streaming"));
   return (
     <main>
       <header>
@@ -77,6 +104,16 @@ function App() {
             <strong>{message.role === "user" ? "Вы" : "Тестовый ответ"}</strong>
             <p>{message.content}</p>
             {message.status !== "completed" && <small>{message.status}</small>}
+            {message.role === "assistant" && (
+              <div className="branch-actions">
+                {history.messages.filter((candidate) => candidate.role === "assistant" && candidate.parent_id === message.parent_id).map((candidate, index) => (
+                  <button type="button" key={candidate.id} disabled={busy || candidate.id === message.id} onClick={() => void selectBranch(candidate.id)}>
+                    Ответ {index + 1}{candidate.id === message.id ? " · выбран" : ""}
+                  </button>
+                ))}
+                <button type="button" disabled={busy} onClick={() => void retry(message.id)}>Повторить тестовый ответ</button>
+              </div>
+            )}
           </article>
         ))}
         {busy && <article><strong>Тестовый ответ</strong><p>{draft || "Ожидание ответа…"}</p></article>}
