@@ -49,7 +49,12 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
          UPDATE messages SET status='interrupted' WHERE status='streaming';
          UPDATE attempts SET status='interrupted' WHERE status='streaming';
          COMMIT;",
-    )
+    )?;
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 0 {
+        db.execute_batch(include_str!("../migrations/0002_tree.sql"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -75,20 +80,30 @@ fn list_history(state: State<'_, AppState>) -> Result<Vec<Message>, String> {
 
 fn create_attempt(db: &mut Connection, prompt: &str) -> rusqlite::Result<i64> {
     let tx = db.transaction()?;
-    tx.execute(
-        "INSERT INTO messages(role, content, status) VALUES('user', ?1, 'completed')",
-        [prompt],
+    let parent_id: Option<i64> = tx.query_row(
+        "SELECT active_leaf_id FROM conversations WHERE id=1",
+        [],
+        |row| row.get(0),
     )?;
     tx.execute(
-        "INSERT INTO messages(role, content, status) VALUES('assistant', '', 'streaming')",
-        [],
+        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('user', ?1, 'completed', 1, ?2)",
+        params![prompt, parent_id],
+    )?;
+    let user_message_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', 1, ?1)",
+        [user_message_id],
     )?;
     let assistant_id = tx.last_insert_rowid();
     tx.execute(
-        "INSERT INTO attempts(assistant_id, status) VALUES(?1, 'streaming')",
-        [assistant_id],
+        "INSERT INTO attempts(assistant_id, status, conversation_id, user_message_id) VALUES(?1, 'streaming', 1, ?2)",
+        params![assistant_id, user_message_id],
     )?;
     let attempt_id = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE conversations SET active_leaf_id=?1 WHERE id=1",
+        [assistant_id],
+    )?;
     tx.commit()?;
     Ok(attempt_id)
 }
@@ -258,6 +273,40 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_existing_history_into_one_conversation() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL);
+             CREATE TABLE attempts (id INTEGER PRIMARY KEY, assistant_id INTEGER NOT NULL UNIQUE REFERENCES messages(id), status TEXT NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO messages VALUES (1, 'user', 'first', 'completed'), (2, 'assistant', 'answer', 'completed'),
+                                         (3, 'user', 'second', 'completed'), (4, 'assistant', 'partial', 'streaming');
+             INSERT INTO attempts VALUES (1, 2, 'completed', 1), (2, 4, 'streaming', 2);",
+        ).unwrap();
+        init_db(&db).unwrap();
+        init_db(&db).unwrap();
+        let nodes: Vec<(i64, Option<i64>, String)> = db.prepare(
+            "SELECT id, parent_id, content FROM messages ORDER BY id",
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap().map(Result::unwrap).collect();
+        assert_eq!(nodes, vec![
+            (1, None, "first".into()), (2, Some(1), "answer".into()),
+            (3, Some(2), "second".into()), (4, Some(3), "partial".into()),
+        ]);
+        let attempt: (i64, i64, String, i64) = db.query_row(
+            "SELECT conversation_id, user_message_id, status, last_seq FROM attempts WHERE id=2",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(attempt, (1, 3, "interrupted".into(), 2));
+        assert_eq!(create_attempt(&mut db, "third").unwrap(), 3);
+        let parent: i64 = db.query_row("SELECT parent_id FROM messages WHERE id=5", [], |row| row.get(0)).unwrap();
+        assert_eq!(parent, 4);
+        let foreign_key_errors: i64 = db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0)).unwrap();
+        assert_eq!(foreign_key_errors, 0);
+    }
 
     #[test]
     fn sse_handles_split_utf8_and_multiple_events() {
