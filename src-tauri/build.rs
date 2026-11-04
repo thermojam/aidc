@@ -5,6 +5,10 @@ fn main() {
                 "list_history",
                 "start_mock_generation",
                 "stop_generation",
+                "save_key",
+                "delete_key",
+                "key_status",
+                "create_backup",
             ]),
         ),
     )

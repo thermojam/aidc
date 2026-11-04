@@ -7,6 +7,10 @@
     "core:default",
     "allow-list-history",
     "allow-start-mock-generation",
-    "allow-stop-generation"
+    "allow-stop-generation",
+    "allow-save-key",
+    "allow-delete-key",
+    "allow-key-status",
+    "allow-create-backup"
   ]
 }

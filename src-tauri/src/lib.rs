@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -12,6 +13,7 @@ type Db = Arc<Mutex<Connection>>;
 struct AppState {
     db: Db,
     active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>,
+    key_lock: Mutex<()>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +78,82 @@ fn list_history(state: State<'_, AppState>) -> Result<Vec<Message>, String> {
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
     Ok(rows)
+}
+
+fn key_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new("com.nikitamensky.ai-desktop-client", "simpleclaw")
+        .map_err(|_| "Не удалось открыть системное хранилище".into())
+}
+
+fn save_key_for(entry: &keyring::Entry, key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("Введите ключ".into());
+    }
+    entry.set_password(key).map_err(|_| "Не удалось сохранить ключ".into())
+}
+
+fn key_status_for(entry: &keyring::Entry) -> Result<bool, String> {
+    match entry.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(_) => Err("Не удалось проверить ключ".into()),
+    }
+}
+
+fn delete_key_for(entry: &keyring::Entry) -> Result<(), String> {
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("Не удалось удалить ключ".into()),
+    }
+}
+
+#[tauri::command]
+fn save_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
+    save_key_for(&key_entry()?, &key)
+}
+
+#[tauri::command]
+fn key_status(state: State<'_, AppState>) -> Result<bool, String> {
+    let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
+    key_status_for(&key_entry()?)
+}
+
+#[tauri::command]
+fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
+    delete_key_for(&key_entry()?)
+}
+
+fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
+    let mut target = Connection::open(path)?;
+    {
+        let backup = rusqlite::backup::Backup::new(db, &mut target)?;
+        backup.run_to_completion(100, Duration::from_millis(50), None)?;
+    }
+    drop(target);
+    let check = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    let foreign_keys: i64 = check.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
+    if integrity != "ok" || foreign_keys != 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn create_backup(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let directory = app.path().app_data_dir().map_err(|_| "Не удалось открыть каталог данных")?.join("backups");
+    std::fs::create_dir_all(&directory).map_err(|_| "Не удалось создать каталог копий")?;
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Не удалось создать имя копии")?.as_nanos();
+    let path = directory.join(format!("history-{timestamp}.sqlite"));
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    if let Err(_) = backup_history_to(&db, &path) {
+        let _ = std::fs::remove_file(&path);
+        return Err("Не удалось создать проверенную копию".into());
+    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn create_attempt(db: &mut Connection, prompt: &str) -> rusqlite::Result<i64> {
@@ -262,10 +340,11 @@ pub fn run() {
             app.manage(AppState {
                 db: Arc::new(Mutex::new(db)),
                 active: Arc::new(Mutex::new(None)),
+                key_lock: Mutex::new(()),
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, start_mock_generation, stop_generation])
+        .invoke_handler(tauri::generate_handler![list_history, start_mock_generation, stop_generation, save_key, delete_key, key_status, create_backup])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -273,6 +352,37 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_reopens_with_history_and_partial_attempt() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-backup-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let id = create_attempt(&mut db, "synthetic question").unwrap();
+        append_delta(&mut db, id, 1, "partial answer").unwrap();
+        backup_history_to(&db, &path).unwrap();
+        let backup = Connection::open(&path).unwrap();
+        let saved: (String, String, i64) = backup.query_row(
+            "SELECT m.content, a.status, a.last_seq FROM messages m JOIN attempts a ON m.id=a.assistant_id WHERE a.id=?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(saved, ("partial answer".into(), "streaming".into(), 1));
+        drop(backup);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn key_commands_report_only_presence_and_support_replace_and_delete() {
+        let entry = keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()));
+        assert!(!key_status_for(&entry).unwrap());
+        save_key_for(&entry, "synthetic-first").unwrap();
+        assert!(key_status_for(&entry).unwrap());
+        save_key_for(&entry, "synthetic-second").unwrap();
+        assert_eq!(entry.get_password().unwrap(), "synthetic-second");
+        delete_key_for(&entry).unwrap();
+        assert!(!key_status_for(&entry).unwrap());
+    }
 
     #[test]
     fn migrates_existing_history_into_one_conversation() {
