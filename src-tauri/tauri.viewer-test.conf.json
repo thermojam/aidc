@@ -1,0 +1,8 @@
+{
+  "app": {
+    "windows": [
+      { "label": "main", "title": "AI Desktop Client", "width": 900, "height": 650 },
+      { "label": "viewer", "title": "IPC boundary test", "url": "viewer.html", "width": 420, "height": 220 }
+    ]
+  }
+}

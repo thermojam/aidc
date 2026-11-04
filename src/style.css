@@ -1,0 +1,16 @@
+:root { font-family: system-ui, sans-serif; color: #202020; background: #fff; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 760px; height: 100vh; margin: auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+header p { margin: 0; color: #555; }
+.history { flex: 1; overflow-y: auto; border-top: 1px solid #ddd; border-bottom: 1px solid #ddd; }
+article { padding: 14px 0; border-bottom: 1px solid #eee; }
+article p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+small { color: #666; }
+form { display: grid; gap: 8px; }
+textarea { min-height: 80px; padding: 10px; font: inherit; resize: vertical; }
+.actions { display: flex; gap: 8px; }
+button { padding: 9px 14px; font: inherit; cursor: pointer; }
+button:disabled { cursor: default; }
+[role="alert"] { color: #a00000; margin: 0; }
