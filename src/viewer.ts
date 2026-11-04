@@ -12,7 +12,7 @@ Promise.allSettled([
   invoke("key_status"),
   invoke("create_backup"),
 ]).then((calls) => {
-  result.textContent = calls.every((call) => call.status === "rejected")
+  result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
     ? "PASS: все девять команд отклонены"
     : "FAIL: хотя бы одна команда доступна";
 });

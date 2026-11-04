@@ -97,6 +97,16 @@ function App() {
       <header>
         <h1>AI Desktop Client</h1>
         <p>Локальный тест потока. Запросы в сеть не отправляются.</p>
+        {history.messages.some((message) => message.role === "assistant") && (
+          <label htmlFor="branch">
+            Ветка
+            <select id="branch" value={history.active_leaf_id ?? ""} disabled={busy} onChange={(event) => void selectBranch(Number(event.target.value))}>
+              {history.messages.filter((message) => message.role === "assistant").map((message) => (
+                <option key={message.id} value={message.id}>Ответ #{message.id}</option>
+              ))}
+            </select>
+          </label>
+        )}
       </header>
       <section className="history" aria-label="История сообщений">
         {visible.map((message) => (

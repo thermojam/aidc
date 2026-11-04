@@ -14,6 +14,7 @@ struct AppState {
     db: Db,
     active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>,
     key_lock: Mutex<()>,
+    key_service: String,
 }
 
 #[derive(Serialize)]
@@ -90,8 +91,8 @@ fn list_history(state: State<'_, AppState>) -> Result<History, String> {
     Ok(History { messages: rows, active_leaf_id })
 }
 
-fn key_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new("com.nikitamensky.ai-desktop-client", "simpleclaw")
+fn key_entry(service: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(service, "simpleclaw")
         .map_err(|_| "Не удалось открыть системное хранилище".into())
 }
 
@@ -120,19 +121,19 @@ fn delete_key_for(entry: &keyring::Entry) -> Result<(), String> {
 #[tauri::command]
 fn save_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
     let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
-    save_key_for(&key_entry()?, &key)
+    save_key_for(&key_entry(&state.key_service)?, &key)
 }
 
 #[tauri::command]
 fn key_status(state: State<'_, AppState>) -> Result<bool, String> {
     let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
-    key_status_for(&key_entry()?)
+    key_status_for(&key_entry(&state.key_service)?)
 }
 
 #[tauri::command]
 fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
     let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
-    delete_key_for(&key_entry()?)
+    delete_key_for(&key_entry(&state.key_service)?)
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
@@ -243,7 +244,8 @@ fn select_branch_in_db(db: &mut Connection, message_id: i64) -> rusqlite::Result
 
 #[tauri::command]
 fn select_branch(message_id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    if state.active.lock().map_err(|_| "Запрос занят")?.is_some() {
+    let active = state.active.lock().map_err(|_| "Запрос занят")?;
+    if active.is_some() {
         return Err("Дождитесь завершения текущего ответа".into());
     }
     let mut db = state.db.lock().map_err(|_| "База занята")?;
@@ -264,15 +266,16 @@ fn append_delta(db: &mut Connection, attempt_id: i64, seq: i64, text: &str) -> r
 }
 
 fn finish(db: &Connection, attempt_id: i64, status: &str) -> rusqlite::Result<()> {
-    db.execute(
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
         "UPDATE messages SET status=?1 WHERE id=(SELECT assistant_id FROM attempts WHERE id=?2)",
         params![status, attempt_id],
     )?;
-    db.execute(
+    tx.execute(
         "UPDATE attempts SET status=?1 WHERE id=?2",
         params![status, attempt_id],
     )?;
-    Ok(())
+    tx.commit()
 }
 
 // Keep raw bytes until a whole SSE event arrives; a TCP chunk may split UTF-8 or JSON.
@@ -419,6 +422,7 @@ pub fn run() {
                 db: Arc::new(Mutex::new(db)),
                 active: Arc::new(Mutex::new(None)),
                 key_lock: Mutex::new(()),
+                key_service: app.config().identifier.clone(),
             });
             Ok(())
         })
@@ -571,6 +575,17 @@ mod tests {
         assert_eq!(branch_parent, 2);
         let old_answer: String = db.query_row("SELECT content FROM messages WHERE id=3", [], |row| row.get(0)).unwrap();
         assert_eq!(old_answer, "new answer");
+    }
+
+    #[test]
+    fn failed_attempt_status_update_keeps_message_status_unchanged() {
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let id = create_attempt(&mut db, "synthetic question").unwrap();
+        db.execute_batch("CREATE TRIGGER reject_finish BEFORE UPDATE ON attempts BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+        assert!(finish(&db, id, "completed").is_err());
+        let status: String = db.query_row("SELECT status FROM messages WHERE id=2", [], |row| row.get(0)).unwrap();
+        assert_eq!(status, "streaming");
     }
 
     #[test]
