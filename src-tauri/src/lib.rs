@@ -1106,16 +1106,44 @@ mod tests {
         (url, handle)
     }
 
-    fn http_attempt() -> (Db, i64) {
+    fn http_attempt_for(model_id: &str) -> (Db, i64) {
         let mut connection = Connection::open_in_memory().unwrap();
         init_db(&connection).unwrap();
         let catalog = ModelCatalog { fetched_at: 100, models: vec![CatalogModel {
-            id: "synthetic-model".into(), name: "Synthetic".into(), input_rubles_per_million: None, output_rubles_per_million: None,
+            id: model_id.into(), name: "Test model".into(), input_rubles_per_million: None, output_rubles_per_million: None,
         }] };
         connection.execute("INSERT INTO model_catalog_snapshots(fetched_at, source, data_json) VALUES(100, 'test', ?1)",
             [serde_json::to_string(&catalog).unwrap()]).unwrap();
-        let id = create_attempt_for_model(&mut connection, "synthetic question", &[], "synthetic-model").unwrap();
+        let id = create_attempt_for_model(&mut connection, "Ответь одним словом: проверка.", &[], model_id).unwrap();
         (Arc::new(Mutex::new(connection)), id)
+    }
+
+    fn http_attempt() -> (Db, i64) { http_attempt_for("synthetic-model") }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "one paid SimpleClaw POST; run only with explicit spending authorization"]
+    fn live_simpleclaw_stream_once() {
+        let key = std::env::var("SIMPLECLAW_API_KEY").expect("SIMPLECLAW_API_KEY must be set for the paid probe");
+        let service = format!("ai-desktop-live-probe-{}", std::process::id());
+        let entry = keyring::Entry::new(&service, "simpleclaw").unwrap();
+        delete_key_for(&entry).unwrap();
+        save_key_for(&entry, &key).unwrap();
+        drop(key);
+        let stored_key = entry.get_password().unwrap();
+        let (db, id) = http_attempt_for("gpt-oss-20b");
+        tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
+            "gpt-oss-20b".into(), stored_key, "https://simple-claw.ru/v1/chat/completions", Channel::new(|_| Ok(()))));
+        delete_key_for(&entry).unwrap();
+        let connection = db.lock().unwrap();
+        let result: (String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64) = connection.query_row(
+            "SELECT status, http_status, error_code, server_response_id, server_request_id, usage_json, last_seq,
+                    (SELECT length(content) FROM messages WHERE id=assistant_id) FROM attempts WHERE id=?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))).unwrap();
+        println!("{}", serde_json::json!({"status": result.0, "http_status": result.1, "error_code": result.2,
+            "server_response_id": result.3, "server_request_id": result.4,
+            "usage": result.5.as_ref().and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok()),
+            "seq": result.6, "answer_bytes": result.7}));
     }
 
     #[test]
@@ -1195,7 +1223,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_on_delta = cancel.clone();
         let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
-            if String::from_utf8_lossy(&body.into_bytes()).contains("delta") {
+            if matches!(body, tauri::ipc::InvokeResponseBody::Json(ref json) if json.contains("delta")) {
                 cancel_on_delta.store(true, Ordering::SeqCst);
             }
             Ok(())

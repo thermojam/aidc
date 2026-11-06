@@ -147,15 +147,23 @@ function App() {
         setDraft("");
         const channel = new Channel<StreamEvent>();
         let lastSeq = 0;
+        let pending = "";
+        let frame = 0;
         channel.onmessage = (message) => {
             if (message.event === "delta") {
                 if (message.data.seq === lastSeq + 1) {
                     lastSeq = message.data.seq;
-                    setDraft((current) => current + message.data.text);
+                    pending += message.data.text;
+                    if (!frame) frame = requestAnimationFrame(() => {
+                        setDraft((current) => current + pending);
+                        pending = "";
+                        frame = 0;
+                    });
                 } else if (message.data.seq > lastSeq + 1) {
                     reload().catch((reason) => setError(String(reason)));
                 }
             } else {
+                if (frame) cancelAnimationFrame(frame);
                 setBusy(false);
                 setDraft("");
                 if (message.data.error_code) setError(`${message.data.http_status ? `HTTP ${message.data.http_status} · ` : ""}${message.data.error_code}${message.data.request_id ? ` · запрос ${message.data.request_id}` : ""}. Расход неизвестен.`);
@@ -167,6 +175,7 @@ function App() {
             await reload();
             return true;
         } catch (reason) {
+            if (frame) cancelAnimationFrame(frame);
             setBusy(false);
             if (restorePrompt !== undefined) setPrompt(restorePrompt);
             setError(String(reason));
