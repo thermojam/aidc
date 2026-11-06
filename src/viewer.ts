@@ -2,17 +2,22 @@ import {Channel, invoke} from "@tauri-apps/api/core";
 
 const result = document.getElementById("result")!;
 Promise.allSettled([
-    invoke("list_history"),
+    invoke("list_history", {conversationId: 1}),
+    invoke("list_conversations"),
+    invoke("create_conversation"),
+    invoke("rename_conversation", {conversationId: 1, title: "viewer"}),
+    invoke("archive_conversation", {conversationId: 1, archived: true}),
     invoke("start_mock_generation", {
+        conversationId: 1,
         prompt: "viewer must fail",
         attachmentIds: [],
         modelId: "local-mock",
         onEvent: new Channel()
     }),
-    invoke("retry_mock_generation", {assistantId: 2, modelId: "local-mock", onEvent: new Channel()}),
-    invoke("start_generation", {prompt: "viewer must fail", attachmentIds: [], modelId: "synthetic-model", onEvent: new Channel()}),
-    invoke("retry_generation", {assistantId: 2, modelId: "synthetic-model", onEvent: new Channel()}),
-    invoke("select_branch", {messageId: 2}),
+    invoke("retry_mock_generation", {conversationId: 1, assistantId: 2, modelId: "local-mock", onEvent: new Channel()}),
+    invoke("start_generation", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], modelId: "synthetic-model", onEvent: new Channel()}),
+    invoke("retry_generation", {conversationId: 1, assistantId: 2, modelId: "synthetic-model", onEvent: new Channel()}),
+    invoke("select_branch", {conversationId: 1, messageId: 2}),
     invoke("stop_generation"),
     invoke("save_key", {key: "viewer must fail"}),
     invoke("delete_key"),
@@ -26,9 +31,11 @@ Promise.allSettled([
     invoke("list_model_categories"),
     invoke("set_model_category", {modelId: "synthetic-model", category: "speed"}),
     invoke("refresh_models"),
-    invoke("preview_context", {prompt: "viewer must fail", attachmentIds: [], modelId: "local-mock"}),
+    invoke("preview_context", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], modelId: "local-mock"}),
+    invoke("create_artifact", {messageId: 2, kind: "html", title: "viewer", content: "<p>test</p>"}),
+    invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все двадцать команд отклонены"
+        ? "PASS: все двадцать шесть команд отклонены"
         : "FAIL: хотя бы одна команда доступна";
 });

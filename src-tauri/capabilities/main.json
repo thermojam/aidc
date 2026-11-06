@@ -6,6 +6,10 @@
   "permissions": [
     "core:default",
     "allow-list-history",
+    "allow-list-conversations",
+    "allow-create-conversation",
+    "allow-rename-conversation",
+    "allow-archive-conversation",
     "allow-start-mock-generation",
     "allow-retry-mock-generation",
     "allow-start-generation",
@@ -24,6 +28,8 @@
     "allow-list-model-categories",
     "allow-set-model-category",
     "allow-refresh-models",
-    "allow-preview-context"
+    "allow-preview-context",
+    "allow-create-artifact",
+    "allow-export-artifact"
   ]
 }

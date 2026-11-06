@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -94,9 +94,29 @@ struct Message {
 struct History {
     messages: Vec<Message>,
     attachments: Vec<AttachmentMeta>,
+    artifacts: Vec<ArtifactVersion>,
     active_leaf_id: Option<i64>,
     contexts: Vec<SavedContext>,
     attempts: Vec<AttemptMeta>,
+}
+
+#[derive(Serialize)]
+struct ConversationSummary {
+    id: i64,
+    title: String,
+    archived: bool,
+}
+
+#[derive(Serialize)]
+struct ArtifactVersion {
+    id: i64,
+    message_id: i64,
+    previous_version_id: Option<i64>,
+    kind: String,
+    title: String,
+    content: String,
+    sha256: String,
+    created_at: i64,
 }
 
 #[derive(Serialize)]
@@ -177,7 +197,15 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0007_http_status.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 6 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 6 {
+        db.execute_batch(include_str!("../migrations/0008_artifacts.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 7 {
+        db.execute_batch(include_str!("../migrations/0009_conversations.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 8 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -361,16 +389,61 @@ fn remove_text_attachment(id: i64, state: State<'_, AppState>) -> Result<(), Str
     Ok(())
 }
 
+fn list_conversations_in_db(db: &Connection) -> rusqlite::Result<Vec<ConversationSummary>> {
+    let mut statement = db.prepare("SELECT id, title, archived FROM conversations ORDER BY id")?;
+    let rows = statement.query_map([], |row| Ok(ConversationSummary {
+        id: row.get(0)?, title: row.get(1)?, archived: row.get(2)?,
+    }))?;
+    rows.collect()
+}
+
 #[tauri::command]
-fn list_history(state: State<'_, AppState>) -> Result<History, String> {
+fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    list_conversations_in_db(&db).map_err(|_| "Не удалось прочитать беседы".into())
+}
+
+#[tauri::command]
+fn create_conversation(state: State<'_, AppState>) -> Result<i64, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    db.execute("INSERT INTO conversations(title) VALUES('Новая беседа')", [])
+        .map_err(|_| "Не удалось создать беседу")?;
+    Ok(db.last_insert_rowid())
+}
+
+#[tauri::command]
+fn rename_conversation(conversation_id: i64, title: String, state: State<'_, AppState>) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 80 { return Err("Название должно содержать от 1 до 80 символов".into()); }
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    if db.execute("UPDATE conversations SET title=?1 WHERE id=?2", params![title, conversation_id])
+        .map_err(|_| "Не удалось переименовать беседу")? == 0 { return Err("Беседа не найдена".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn archive_conversation(conversation_id: i64, archived: bool, state: State<'_, AppState>) -> Result<(), String> {
+    if state.active.lock().map_err(|_| "Запрос занят")?.is_some() { return Err("Дождитесь завершения текущего ответа".into()); }
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    if db.execute("UPDATE conversations SET archived=?1 WHERE id=?2", params![archived, conversation_id])
+        .map_err(|_| "Не удалось изменить архив")? == 0 { return Err("Беседа не найдена".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn list_history(conversation_id: i64, state: State<'_, AppState>) -> Result<History, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let active_leaf_id = db.query_row("SELECT active_leaf_id FROM conversations WHERE id=1", [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
+    history_for(&db, conversation_id)
+}
+
+fn history_for(db: &Connection, conversation_id: i64) -> Result<History, String> {
+    let active_leaf_id = db.query_row("SELECT active_leaf_id FROM conversations WHERE id=?1", [conversation_id], |row| row.get(0))
+        .map_err(|_| "Беседа не найдена")?;
     let mut statement = db
-        .prepare("SELECT id, parent_id, role, content, status FROM messages ORDER BY id")
+        .prepare("SELECT id, parent_id, role, content, status FROM messages WHERE conversation_id=?1 ORDER BY id")
         .map_err(|e| e.to_string())?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([conversation_id], |row| {
             Ok(Message {
                 id: row.get(0)?,
                 parent_id: row.get(1)?,
@@ -382,26 +455,75 @@ fn list_history(state: State<'_, AppState>) -> Result<History, String> {
         .map_err(|e| e.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
-    let mut statement = db.prepare("SELECT message_id, name, size, sha256 FROM attachments ORDER BY id")
+    let mut statement = db.prepare("SELECT a.message_id, a.name, a.size, a.sha256 FROM attachments a JOIN messages m ON m.id=a.message_id WHERE m.conversation_id=?1 ORDER BY a.id")
         .map_err(|e| e.to_string())?;
-    let attachments = statement.query_map([], |row| Ok(AttachmentMeta {
+    let attachments = statement.query_map([conversation_id], |row| Ok(AttachmentMeta {
         message_id: row.get(0)?, name: row.get(1)?, size: row.get(2)?, sha256: row.get(3)?,
     })).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
-    let mut statement = db.prepare("SELECT assistant_id, context_json FROM attempts WHERE context_json IS NOT NULL ORDER BY id")
+    let mut statement = db.prepare("SELECT a.id, a.message_id, a.previous_version_id, a.kind, a.title, a.content, a.sha256, a.created_at FROM artifact_versions a JOIN messages m ON m.id=a.message_id WHERE m.conversation_id=?1 ORDER BY a.id")
+        .map_err(|_| "Не удалось прочитать Artifacts")?;
+    let artifacts = statement.query_map([conversation_id], |row| Ok(ArtifactVersion {
+        id: row.get(0)?, message_id: row.get(1)?, previous_version_id: row.get(2)?, kind: row.get(3)?,
+        title: row.get(4)?, content: row.get(5)?, sha256: row.get(6)?, created_at: row.get(7)?,
+    })).map_err(|_| "Не удалось прочитать Artifacts")?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать Artifacts")?;
+    let mut statement = db.prepare("SELECT assistant_id, context_json FROM attempts WHERE conversation_id=?1 AND context_json IS NOT NULL ORDER BY id")
         .map_err(|e| e.to_string())?;
-    let contexts = statement.query_map([], |row| {
+    let contexts = statement.query_map([conversation_id], |row| {
         let json: String = row.get(1)?;
         Ok(SavedContext { assistant_id: row.get(0)?, context: serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery)? })
     }).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
-    let mut statement = db.prepare("SELECT assistant_id, model_id, server_response_id, server_request_id, usage_json, error_code, http_status FROM attempts ORDER BY id")
+    let mut statement = db.prepare("SELECT assistant_id, model_id, server_response_id, server_request_id, usage_json, error_code, http_status FROM attempts WHERE conversation_id=?1 ORDER BY id")
         .map_err(|e| e.to_string())?;
-    let attempts = statement.query_map([], |row| {
+    let attempts = statement.query_map([conversation_id], |row| {
         let usage_json: Option<String> = row.get(4)?;
         Ok(AttemptMeta { assistant_id: row.get(0)?, model_id: row.get(1)?, server_response_id: row.get(2)?,
             server_request_id: row.get(3)?, usage: usage_json.map(|json| serde_json::from_str(&json).map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?,
             error_code: row.get(5)?, http_status: row.get(6)? })
     }).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
-    Ok(History { messages: rows, attachments, active_leaf_id, contexts, attempts })
+    Ok(History { messages: rows, attachments, artifacts, active_leaf_id, contexts, attempts })
+}
+
+fn create_artifact_in_db(db: &Connection, message_id: i64, kind: &str, title: &str, content: &str) -> Result<i64, String> {
+    if !["code", "html", "svg"].contains(&kind) || title.trim().is_empty() || title.len() > 120
+        || content.is_empty() || content.len() > 256 * 1024 {
+        return Err("Некорректный Artifact".into());
+    }
+    let (source, status): (String, String) = db.query_row(
+        "SELECT content, status FROM messages WHERE id=?1 AND role='assistant'", [message_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| "Ответ не найден")?;
+    if status != "completed" || !source.contains(content) { return Err("Код отсутствует в завершённом ответе".into()); }
+    let previous: Option<i64> = db.query_row(
+        "SELECT id FROM artifact_versions WHERE message_id=?1 ORDER BY id DESC LIMIT 1", [message_id], |row| row.get(0),
+    ).optional().map_err(|_| "Не удалось прочитать версии")?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Не удалось определить время")?.as_secs() as i64;
+    db.execute("INSERT INTO artifact_versions(message_id, previous_version_id, kind, title, content, sha256, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![message_id, previous, kind, title, content, format!("{:x}", Sha256::digest(content.as_bytes())), now])
+        .map_err(|_| "Не удалось сохранить Artifact")?;
+    Ok(db.last_insert_rowid())
+}
+
+#[tauri::command]
+fn create_artifact(message_id: i64, kind: String, title: String, content: String, state: State<'_, AppState>) -> Result<i64, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    create_artifact_in_db(&db, message_id, &kind, &title, &content)
+}
+
+#[tauri::command]
+async fn export_artifact(id: i64, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let (title, kind, content): (String, String, String) = {
+        let db = state.db.lock().map_err(|_| "База занята")?;
+        db.query_row("SELECT title, kind, content FROM artifact_versions WHERE id=?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|_| "Artifact не найден")?
+    };
+    let extension = match kind.as_str() { "html" => "html", "svg" => "svg", _ => "txt" };
+    let safe_title = title.chars().filter(|ch| ch.is_alphanumeric() || *ch == '-' || *ch == '_').take(60).collect::<String>();
+    let Some(path) = app.dialog().file().set_file_name(format!("{}.{}", if safe_title.is_empty() { "artifact" } else { &safe_title }, extension)).blocking_save_file() else { return Ok(()); };
+    let path = path.into_path().map_err(|_| "Выберите локальный путь")?;
+    std::fs::write(path, content).map_err(|_| "Не удалось сохранить Artifact".into())
 }
 
 fn key_entry(service: &str) -> Result<keyring::Entry, String> {
@@ -450,13 +572,15 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64, i64, i64)> {
+    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64, i64, i64, i64, i64)> {
         Ok((
+            db.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
             db.query_row("SELECT coalesce(sum(length(content)), 0) FROM messages", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM attachments", [], |row| row.get(0))?,
             db.query_row("SELECT coalesce(sum(size), 0) FROM attachments", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM artifact_versions", [], |row| row.get(0))?,
             db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
         ))
     };
@@ -470,7 +594,7 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
     let check = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_keys: i64 = check.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
-    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? {
+    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !conversation_links_valid(&check)? {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
@@ -486,6 +610,32 @@ fn attachments_valid(db: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 
+fn artifacts_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = db.prepare("SELECT sha256, content FROM artifact_versions")?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (hash, content) = row?;
+        if hash != format!("{:x}", Sha256::digest(content.as_bytes())) { return Ok(false); }
+    }
+    Ok(true)
+}
+
+fn conversation_links_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let invalid: i64 = db.query_row(
+        "SELECT
+           (SELECT count(*) FROM messages m LEFT JOIN messages p ON p.id=m.parent_id
+            WHERE m.conversation_id IS NULL OR (m.parent_id IS NOT NULL AND m.conversation_id IS NOT p.conversation_id))
+         + (SELECT count(*) FROM conversations c LEFT JOIN messages m ON m.id=c.active_leaf_id
+            WHERE c.active_leaf_id IS NOT NULL AND c.id IS NOT m.conversation_id)
+         + (SELECT count(*) FROM attempts a
+            LEFT JOIN messages m ON m.id=a.assistant_id LEFT JOIN messages u ON u.id=a.user_message_id
+            WHERE a.conversation_id IS NULL OR a.user_message_id IS NULL
+               OR a.conversation_id IS NOT m.conversation_id OR a.conversation_id IS NOT u.conversation_id)",
+        [], |row| row.get(0),
+    )?;
+    Ok(invalid == 0)
+}
+
 fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()> {
     let source = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = source.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -494,7 +644,9 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
     let conversations: i64 = source.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?;
     let _: i64 = source.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?;
     let _: i64 = source.query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))?;
-    if integrity != "ok" || foreign_keys != 0 || !(1..=6).contains(&version) || conversations != 1 || (version >= 2 && !attachments_valid(&source)?) {
+    if integrity != "ok" || foreign_keys != 0 || !(1..=8).contains(&version) || conversations < 1
+        || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
+        || (version >= 8 && !conversation_links_valid(&source)?) {
         return Err(rusqlite::Error::InvalidQuery);
     }
     {
@@ -563,16 +715,22 @@ fn create_attempt_with_attachments(db: &mut Connection, prompt: &str, attachment
     create_attempt_for_model(db, prompt, attachments, "local-mock")
 }
 
+#[cfg(test)]
 fn create_attempt_for_model(db: &mut Connection, prompt: &str, attachments: &[&PendingAttachment], model_id: &str) -> rusqlite::Result<i64> {
+    create_attempt_for_conversation(db, 1, prompt, attachments, model_id)
+}
+
+fn create_attempt_for_conversation(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str) -> rusqlite::Result<i64> {
     let tx = db.transaction()?;
     let parent_id: Option<i64> = tx.query_row(
-        "SELECT active_leaf_id FROM conversations WHERE id=1",
-        [],
+        "SELECT c.active_leaf_id FROM conversations c WHERE c.id=?1 AND c.archived=0 AND
+           (c.active_leaf_id IS NULL OR EXISTS (SELECT 1 FROM messages m WHERE m.id=c.active_leaf_id AND m.conversation_id=c.id))",
+        [conversation_id],
         |row| row.get(0),
     )?;
     tx.execute(
-        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('user', ?1, 'completed', 1, ?2)",
-        params![prompt, parent_id],
+        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('user', ?1, 'completed', ?2, ?3)",
+        params![prompt, conversation_id, parent_id],
     )?;
     let user_message_id = tx.last_insert_rowid();
     for draft in attachments {
@@ -582,23 +740,23 @@ fn create_attempt_for_model(db: &mut Connection, prompt: &str, attachments: &[&P
                 format!("{:x}", Sha256::digest(&draft.content)), draft.content],
         )?;
     }
-    let context = context_for(&tx, Some(user_message_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let context = context_for(&tx, conversation_id, Some(user_message_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
     tx.execute(
-        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', 1, ?1)",
-        [user_message_id],
+        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', ?1, ?2)",
+        params![conversation_id, user_message_id],
     )?;
     let assistant_id = tx.last_insert_rowid();
     tx.execute(
         "INSERT INTO attempts(assistant_id, status, conversation_id, user_message_id, model_id, pricing_json, catalog_fetched_at, context_json)
-         VALUES(?1, 'streaming', 1, ?2, ?3, ?4, ?5, ?6)",
-        params![assistant_id, user_message_id, model_id,
+         VALUES(?1, 'streaming', ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![assistant_id, conversation_id, user_message_id, model_id,
             serde_json::json!({"input": context.input_rubles_per_million, "output": context.output_rubles_per_million}).to_string(),
             context.catalog_fetched_at, serde_json::to_string(&context).map_err(|_| rusqlite::Error::InvalidQuery)?],
     )?;
     let attempt_id = tx.last_insert_rowid();
     tx.execute(
-        "UPDATE conversations SET active_leaf_id=?1 WHERE id=1",
-        [assistant_id],
+        "UPDATE conversations SET active_leaf_id=?1 WHERE id=?2",
+        params![assistant_id, conversation_id],
     )?;
     tx.commit()?;
     Ok(attempt_id)
@@ -609,35 +767,42 @@ fn create_retry_attempt(db: &mut Connection, assistant_id: i64) -> rusqlite::Res
     create_retry_for_model(db, assistant_id, "local-mock")
 }
 
+#[cfg(test)]
 fn create_retry_for_model(db: &mut Connection, assistant_id: i64, model_id: &str) -> rusqlite::Result<(i64, String)> {
+    create_retry_for_conversation(db, 1, assistant_id, model_id)
+}
+
+fn create_retry_for_conversation(db: &mut Connection, conversation_id: i64, assistant_id: i64, model_id: &str) -> rusqlite::Result<(i64, String)> {
     let tx = db.transaction()?;
     let (user_id, prompt): (i64, String) = tx.query_row(
         "SELECT u.id, u.content FROM messages a
          JOIN attempts old ON old.assistant_id=a.id
          JOIN messages u ON u.id=a.parent_id AND u.id=old.user_message_id
-         WHERE a.id=?1 AND a.conversation_id=1 AND u.role='user' AND old.status!='streaming'",
-        [assistant_id], |row| Ok((row.get(0)?, row.get(1)?)),
+         JOIN conversations c ON c.id=a.conversation_id
+         WHERE a.id=?1 AND a.conversation_id=?2 AND u.conversation_id=?2 AND c.archived=0
+           AND u.role='user' AND old.status!='streaming'",
+        params![assistant_id, conversation_id], |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let context = context_for(&tx, Some(user_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let context = context_for(&tx, conversation_id, Some(user_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
     tx.execute(
-        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', 1, ?1)",
-        [user_id],
+        "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', ?1, ?2)",
+        params![conversation_id, user_id],
     )?;
     let new_assistant_id = tx.last_insert_rowid();
     tx.execute(
         "INSERT INTO attempts(assistant_id, status, conversation_id, user_message_id, model_id, pricing_json, catalog_fetched_at, context_json)
-         VALUES(?1, 'streaming', 1, ?2, ?3, ?4, ?5, ?6)",
-        params![new_assistant_id, user_id, model_id,
+         VALUES(?1, 'streaming', ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![new_assistant_id, conversation_id, user_id, model_id,
             serde_json::json!({"input": context.input_rubles_per_million, "output": context.output_rubles_per_million}).to_string(),
             context.catalog_fetched_at, serde_json::to_string(&context).map_err(|_| rusqlite::Error::InvalidQuery)?],
     )?;
     let attempt_id = tx.last_insert_rowid();
-    tx.execute("UPDATE conversations SET active_leaf_id=?1 WHERE id=1", [new_assistant_id])?;
+    tx.execute("UPDATE conversations SET active_leaf_id=?1 WHERE id=?2", params![new_assistant_id, conversation_id])?;
     tx.commit()?;
     Ok((attempt_id, prompt))
 }
 
-fn context_for(db: &Connection, leaf_id: Option<i64>, tail: Option<(&str, &[&PendingAttachment])>, model_id: &str) -> Result<ContextPreview, String> {
+fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail: Option<(&str, &[&PendingAttachment])>, model_id: &str) -> Result<ContextPreview, String> {
     let catalog = cached_catalog(db).map_err(|_| "Не удалось прочитать каталог")?;
     let model = if model_id == "local-mock" { None } else {
         Some(catalog.as_ref().and_then(|catalog| catalog.models.iter().find(|model| model.id == model_id))
@@ -645,13 +810,13 @@ fn context_for(db: &Connection, leaf_id: Option<i64>, tail: Option<(&str, &[&Pen
     };
     let mut statement = db.prepare(
         "WITH RECURSIVE path(id, parent_id, role, content, status, depth) AS (
-           SELECT id, parent_id, role, content, status, 0 FROM messages WHERE id=?1
+           SELECT id, parent_id, role, content, status, 0 FROM messages WHERE id=?1 AND conversation_id=?2
            UNION ALL
            SELECT m.id, m.parent_id, m.role, m.content, m.status, path.depth+1
-           FROM messages m JOIN path ON m.id=path.parent_id WHERE path.depth<10000
+           FROM messages m JOIN path ON m.id=path.parent_id WHERE m.conversation_id=?2 AND path.depth<10000
          ) SELECT id, role, content, status FROM path ORDER BY depth DESC"
     ).map_err(|_| "Не удалось собрать историю")?;
-    let rows = statement.query_map([leaf_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))
+    let rows = statement.query_map(params![leaf_id, conversation_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))
         .map_err(|_| "Не удалось собрать историю")?;
     let mut messages = Vec::new();
     for row in rows {
@@ -706,7 +871,7 @@ fn context_for(db: &Connection, leaf_id: Option<i64>, tail: Option<(&str, &[&Pen
 }
 
 #[tauri::command]
-fn preview_context(prompt: String, attachment_ids: Vec<i64>, model_id: String, state: State<'_, AppState>) -> Result<ContextPreview, String> {
+fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, model_id: String, state: State<'_, AppState>) -> Result<ContextPreview, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
     let drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
@@ -715,30 +880,36 @@ fn preview_context(prompt: String, attachment_ids: Vec<i64>, model_id: String, s
     }
     let selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).collect::<Vec<_>>();
     let db = state.db.lock().map_err(|_| "База занята")?;
-    let leaf_id: Option<i64> = db.query_row("SELECT active_leaf_id FROM conversations WHERE id=1", [], |row| row.get(0)).map_err(|_| "Не удалось выбрать ветку")?;
-    context_for(&db, leaf_id, Some((prompt, &selected)), &model_id)
+    let leaf_id: Option<i64> = db.query_row("SELECT c.active_leaf_id FROM conversations c WHERE c.id=?1 AND c.archived=0 AND
+        (c.active_leaf_id IS NULL OR EXISTS (SELECT 1 FROM messages m WHERE m.id=c.active_leaf_id AND m.conversation_id=c.id))", [conversation_id], |row| row.get(0)).map_err(|_| "Беседа не найдена или в архиве")?;
+    context_for(&db, conversation_id, leaf_id, Some((prompt, &selected)), &model_id)
 }
 
+#[cfg(test)]
 fn select_branch_in_db(db: &mut Connection, message_id: i64) -> rusqlite::Result<()> {
+    select_branch_for_conversation(db, 1, message_id)
+}
+
+fn select_branch_for_conversation(db: &mut Connection, conversation_id: i64, message_id: i64) -> rusqlite::Result<()> {
     let changed = db.execute(
-        "UPDATE conversations SET active_leaf_id=?1 WHERE id=1 AND EXISTS (
+        "UPDATE conversations SET active_leaf_id=?1 WHERE id=?2 AND archived=0 AND EXISTS (
            SELECT 1 FROM messages m JOIN attempts a ON a.assistant_id=m.id
-           WHERE m.id=?1 AND m.conversation_id=1 AND a.status!='streaming'
+           WHERE m.id=?1 AND m.conversation_id=?2 AND a.status!='streaming'
          )",
-        [message_id],
+        params![message_id, conversation_id],
     )?;
     if changed == 0 { return Err(rusqlite::Error::QueryReturnedNoRows); }
     Ok(())
 }
 
 #[tauri::command]
-fn select_branch(message_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+fn select_branch(conversation_id: i64, message_id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let active = state.active.lock().map_err(|_| "Запрос занят")?;
     if active.is_some() {
         return Err("Дождитесь завершения текущего ответа".into());
     }
     let mut db = state.db.lock().map_err(|_| "База занята")?;
-    select_branch_in_db(&mut db, message_id).map_err(|_| "Ветка не найдена".into())
+    select_branch_for_conversation(&mut db, conversation_id, message_id).map_err(|_| "Ветка не найдена".into())
 }
 
 fn append_delta(db: &mut Connection, attempt_id: i64, seq: i64, text: &str) -> rusqlite::Result<()> {
@@ -856,20 +1027,20 @@ fn run_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>, cancel
 }
 
 #[tauri::command]
-fn start_mock_generation(prompt: String, attachment_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_mock_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 {
         return Err("Введите от 1 до 2000 символов".into());
     }
-    start_mock(&state, on_event, Some(prompt), None, &attachment_ids, &model_id)
+    start_mock(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &model_id)
 }
 
 #[tauri::command]
-fn retry_mock_generation(assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_mock(&state, on_event, None, Some(assistant_id), &[], &model_id)
+fn retry_mock_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+    start_mock(&state, on_event, conversation_id, None, Some(assistant_id), &[], &model_id)
 }
 
-fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], model_id: &str) -> Result<i64, String> {
+fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], model_id: &str) -> Result<i64, String> {
     let mut active = state.active.lock().map_err(|e| e.to_string())?;
     if active.is_some() {
         return Err("Дождитесь завершения текущего ответа".into());
@@ -881,11 +1052,11 @@ fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, promp
         }
         let mut db = state.db.lock().map_err(|e| e.to_string())?;
         if let Some(id) = retry_id {
-            create_retry_for_model(&mut db, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены".to_string())?
+            create_retry_for_conversation(&mut db, conversation_id, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены".to_string())?
         } else {
             let prompt = prompt.unwrap();
             let selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).collect::<Vec<_>>();
-            let attempt_id = create_attempt_for_model(&mut db, prompt, &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов".to_string())?;
+            let attempt_id = create_attempt_for_conversation(&mut db, conversation_id, prompt, &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов".to_string())?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             (attempt_id, prompt.to_owned())
         }
@@ -1013,18 +1184,18 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
 }
 
 #[tauri::command]
-fn start_generation(prompt: String, attachment_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
-    start_remote(&state, on_event, Some(prompt), None, &attachment_ids, &model_id)
+    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &model_id)
 }
 
 #[tauri::command]
-fn retry_generation(assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_remote(&state, on_event, None, Some(assistant_id), &[], &model_id)
+fn retry_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &model_id)
 }
 
-fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], model_id: &str) -> Result<i64, String> {
+fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], model_id: &str) -> Result<i64, String> {
     if model_id == "local-mock" { return Err("Выберите модель SimpleClaw".into()); }
     let key = {
         let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
@@ -1039,10 +1210,10 @@ fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, pro
         }
         let mut db = state.db.lock().map_err(|_| "База занята")?;
         if let Some(id) = retry_id {
-            create_retry_for_model(&mut db, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены")?.0
+            create_retry_for_conversation(&mut db, conversation_id, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены")?.0
         } else {
             let selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).collect::<Vec<_>>();
-            let attempt_id = create_attempt_for_model(&mut db, prompt.unwrap(), &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов")?;
+            let attempt_id = create_attempt_for_conversation(&mut db, conversation_id, prompt.unwrap(), &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов")?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             attempt_id
         }
@@ -1081,7 +1252,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -1303,7 +1474,7 @@ mod tests {
         assert!(parts[3]["content"].as_str().unwrap().contains("old file"));
         assert_eq!(parts[3]["attachment_ids"][0], 1);
         assert!(!saved.contains("Локальный тестовый ответ"));
-        assert!(context_for(&db, Some(4), None, "missing-model").is_err());
+        assert!(context_for(&db, 1, Some(4), None, "missing-model").is_err());
     }
 
     #[test]
@@ -1314,11 +1485,11 @@ mod tests {
         append_delta(&mut db, first, 1, &"x".repeat(200_000)).unwrap();
         finish(&db, first, "completed").unwrap();
         let draft = PendingAttachment { id: 1, name: "note.txt".into(), mime: "text/plain".into(), content: vec![b'y'; 100_000], preview: "y".repeat(100_000) };
-        let preview = context_for(&db, Some(2), Some(("new question", &[&draft])), "local-mock").unwrap();
+        let preview = context_for(&db, 1, Some(2), Some(("new question", &[&draft])), "local-mock").unwrap();
         assert_eq!(preview.omitted_exchanges, 1);
         assert_eq!(preview.messages.len(), 2);
         let huge = PendingAttachment { id: 2, name: "large.txt".into(), mime: "text/plain".into(), content: vec![b'z'; 256 * 1024], preview: "z".repeat(256 * 1024) };
-        assert!(context_for(&db, Some(2), Some(("new question", &[&huge])), "local-mock").is_err());
+        assert!(context_for(&db, 1, Some(2), Some(("new question", &[&huge])), "local-mock").is_err());
     }
 
     #[test]
@@ -1411,7 +1582,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 8);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -1434,6 +1605,33 @@ mod tests {
         assert_eq!(saved, ("partial answer".into(), "streaming".into(), 1));
         drop(backup);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn artifact_requires_completed_source_and_survives_backup() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-artifact-{}.sqlite", std::process::id()));
+        let invalid = std::env::temp_dir().join(format!("ai-desktop-artifact-invalid-{}.sqlite", std::process::id()));
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let attempt = create_attempt(&mut db, "show html").unwrap();
+        append_delta(&mut db, attempt, 1, "```html\n<script>alert(1)</script>\n```").unwrap();
+        assert!(create_artifact_in_db(&db, 2, "html", "example", "<script>alert(1)</script>").is_err());
+        finish(&db, attempt, "completed").unwrap();
+        let first = create_artifact_in_db(&db, 2, "html", "example", "<script>alert(1)</script>").unwrap();
+        let second = create_artifact_in_db(&db, 2, "html", "example", "<script>alert(1)</script>").unwrap();
+        assert!(create_artifact_in_db(&db, 2, "html", "example", "different code").is_err());
+        assert_eq!(db.query_row("SELECT previous_version_id FROM artifact_versions WHERE id=?1", [second], |row| row.get::<_, i64>(0)).unwrap(), first);
+        backup_history_to(&db, &path).unwrap();
+        std::fs::copy(&path, &invalid).unwrap();
+        let tampered = Connection::open(&invalid).unwrap();
+        tampered.execute("UPDATE artifact_versions SET content='changed' WHERE id=?1", [first]).unwrap();
+        drop(tampered);
+        db.execute("DELETE FROM artifact_versions", []).unwrap();
+        assert!(restore_history_from(&mut db, &invalid).is_err());
+        restore_history_from(&mut db, &path).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM artifact_versions", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(invalid).unwrap();
     }
 
     #[test]
@@ -1522,7 +1720,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 8);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
@@ -1557,6 +1755,59 @@ mod tests {
         assert_eq!(branch_parent, 2);
         let old_answer: String = db.query_row("SELECT content FROM messages WHERE id=3", [], |row| row.get(0)).unwrap();
         assert_eq!(old_answer, "new answer");
+    }
+
+    #[test]
+    fn conversations_keep_messages_files_artifacts_and_branches_separate_after_restore() {
+        let source_path = std::env::temp_dir().join(format!("ai-desktop-conversations-live-{}.sqlite", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ai-desktop-conversations-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&path);
+        let mut db = Connection::open(&source_path).unwrap();
+        init_db(&db).unwrap();
+        db.execute("INSERT INTO conversations(title) VALUES('Вторая')", []).unwrap();
+        let first = create_attempt_for_conversation(&mut db, 1, "вопрос один", &[], "local-mock").unwrap();
+        append_delta(&mut db, first, 1, "<p>ответ один</p>").unwrap();
+        finish(&db, first, "completed").unwrap();
+        create_artifact_in_db(&db, 2, "html", "Первый", "<p>ответ один</p>").unwrap();
+        let file = PendingAttachment { id: 1, name: "second.txt".into(), mime: "text/plain".into(),
+            content: b"second file".to_vec(), preview: "second file".into() };
+        let second = create_attempt_for_conversation(&mut db, 2, "вопрос два", &[&file], "local-mock").unwrap();
+        append_delta(&mut db, second, 1, "ответ два").unwrap();
+        finish(&db, second, "completed").unwrap();
+        assert!(create_retry_for_conversation(&mut db, 1, 4, "local-mock").is_err());
+        assert!(select_branch_for_conversation(&mut db, 1, 4).is_err());
+        let first_history = history_for(&db, 1).unwrap();
+        let second_history = history_for(&db, 2).unwrap();
+        assert_eq!(first_history.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(), ["вопрос один", "<p>ответ один</p>"]);
+        assert_eq!(second_history.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(), ["вопрос два", "ответ два"]);
+        assert_eq!((first_history.attachments.len(), first_history.artifacts.len(), second_history.attachments.len(), second_history.artifacts.len()), (0, 1, 1, 0));
+        assert!(second_history.contexts[0].context.to_string().contains("second file"));
+        assert!(!second_history.contexts[0].context.to_string().contains("вопрос один"));
+        db.execute("UPDATE conversations SET archived=1 WHERE id=2", []).unwrap();
+        assert!(create_attempt_for_conversation(&mut db, 2, "ещё", &[], "local-mock").is_err());
+        backup_history_to(&db, &path).unwrap();
+        drop(db);
+        let reopened = Connection::open(&source_path).unwrap();
+        init_db(&reopened).unwrap();
+        assert_eq!(history_for(&reopened, 1).unwrap().artifacts.len(), 1);
+        assert_eq!(history_for(&reopened, 2).unwrap().attachments.len(), 1);
+        drop(reopened);
+        let mut restored = Connection::open_in_memory().unwrap();
+        init_db(&restored).unwrap();
+        restore_history_from(&mut restored, &path).unwrap();
+        let conversations = list_conversations_in_db(&restored).unwrap();
+        assert_eq!(conversations.iter().map(|item| (item.title.as_str(), item.archived)).collect::<Vec<_>>(), [("Локальный чат", false), ("Вторая", true)]);
+        assert_eq!(history_for(&restored, 1).unwrap().messages.len(), 2);
+        assert_eq!(history_for(&restored, 2).unwrap().attachments.len(), 1);
+        assert_eq!(history_for(&restored, 1).unwrap().artifacts.len(), 1);
+        let corrupt = Connection::open(&path).unwrap();
+        corrupt.execute("UPDATE conversations SET active_leaf_id=2 WHERE id=2", []).unwrap();
+        drop(corrupt);
+        assert!(restore_history_from(&mut restored, &path).is_err());
+        assert_eq!(history_for(&restored, 2).unwrap().messages.len(), 2);
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

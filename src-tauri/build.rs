@@ -3,6 +3,10 @@ fn main() {
         tauri_build::Attributes::new().app_manifest(
             tauri_build::AppManifest::new().commands(&[
                 "list_history",
+                "list_conversations",
+                "create_conversation",
+                "rename_conversation",
+                "archive_conversation",
                 "start_mock_generation",
                 "retry_mock_generation",
                 "start_generation",
@@ -22,6 +26,8 @@ fn main() {
                 "set_model_category",
                 "refresh_models",
                 "preview_context",
+                "create_artifact",
+                "export_artifact",
             ]),
         ),
     )
