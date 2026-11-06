@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>AI Desktop Client — макет MVP</title>
+  <style>
+    :root {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color-scheme: light;
+      --bg: #fff; --panel: #f7f8fa; --line: #e4e7ec; --text: #20232a;
+      --muted: #626a79; --accent: #3574f0; --selected: #e8f0ff; --code: #f1f3f6;
+      --good: #25764c; --warning: #8b5b15;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #1e1f22; --panel: #191a1c; --line: #393b40; --text: #dfe1e5;
+      --muted: #a9adb5; --accent: #6b9bfa; --selected: #2e436e; --code: #26282b;
+      --good: #80caa0; --warning: #e2bb79;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]):not([data-theme="dark"]) {
+        color-scheme: dark;
+        --bg: #1e1f22; --panel: #191a1c; --line: #393b40; --text: #dfe1e5;
+        --muted: #a9adb5; --accent: #6b9bfa; --selected: #2e436e; --code: #26282b;
+        --good: #80caa0; --warning: #e2bb79;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-size: 13px; line-height: 1.48; }
+    button, select, textarea, input { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .app { display: grid; grid-template-columns: 46px 232px minmax(420px, 1fr) 390px; height: 100vh; min-height: 620px; }
+    .rail { display: flex; flex-direction: column; align-items: center; gap: 9px; padding: 12px 5px; border-right: 1px solid var(--line); background: var(--panel); }
+    .rail button { width: 32px; height: 32px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 16px; }
+    .rail button:hover, .rail button[aria-current="page"] { background: var(--selected); color: var(--text); }
+    .rail .rail-bottom { margin-top: auto; }
+    .sidebar, .artifact { background: var(--panel); min-width: 0; }
+    .sidebar { display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+    .artifact { display: flex; flex-direction: column; border-left: 1px solid var(--line); }
+    .brand { height: 45px; display: flex; align-items: center; gap: 10px; padding: 0 14px; border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 650; }
+    .brand-mark { display: grid; place-items: center; width: 24px; height: 24px; color: #fff; background: #3574f0; font-size: 13px; font-weight: 750; }
+    .sidebar-main { padding: 16px 9px; flex: 1; overflow: auto; }
+    .sidebar-title { display: flex; justify-content: space-between; align-items: center; padding: 0 9px 8px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+    .chat-list { display: grid; gap: 3px; }
+    .chat-item { width: 100%; text-align: left; padding: 10px 11px; border: 0; background: transparent; color: var(--text); }
+    .chat-item:hover, .chat-item[aria-current="page"] { background: var(--selected); }
+    .chat-item strong, .chat-item span { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .chat-item strong { font-size: 13px; font-weight: 600; }
+    .chat-item span { margin-top: 3px; color: var(--muted); font-size: 11px; }
+    .sidebar-footer { border-top: 1px solid var(--line); padding: 12px 14px; display: grid; gap: 8px; }
+    .side-action { text-align: left; padding: 7px 4px; border: 0; background: transparent; color: var(--text); }
+    .side-action:hover { color: var(--accent); }
+    .main { min-width: 0; display: flex; flex-direction: column; }
+    .workspace-tabs { display: flex; align-items: stretch; min-height: 45px; padding: 0 8px; gap: 3px; border-bottom: 1px solid var(--line); background: var(--code); }
+    .workspace-tabs button { align-self: center; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--muted); min-height: 29px; padding: 4px 12px; }
+    .workspace-tabs button:hover, .workspace-tabs button[aria-current="page"] { border-color: var(--line); background: var(--selected); color: var(--text); }
+    .topbar { min-height: 55px; padding: 10px 23px; display: flex; align-items: center; justify-content: space-between; gap: 15px; border-bottom: 1px solid var(--line); }
+    .topbar h1 { margin: 0; font-size: 15px; line-height: 20px; font-weight: 650; }
+    .subtitle, .small { color: var(--muted); font-size: 11px; }
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+    .button { border: 1px solid var(--line); background: var(--bg); color: var(--text); min-height: 30px; padding: 5px 10px; border-radius: 4px; white-space: nowrap; }
+    .button:hover { border-color: var(--accent); }
+    .button.primary { background: #3574f0; border-color: #3574f0; color: #fff; font-weight: 600; }
+    .button.primary:hover { background: #3369d6; }
+    .button.quiet { border-color: transparent; background: transparent; }
+    .statusbar { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; min-height: 36px; padding: 6px 24px; background: var(--panel); border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+    .statusbar strong { color: var(--good); font-weight: 600; }
+    .conversation { flex: 1; overflow: auto; padding: 26px 24px 24px; }
+    .thread { width: min(100%, 740px); margin: 0 auto; }
+    .date { text-align: center; color: var(--muted); font-size: 11px; margin: 0 0 26px; }
+    .message { margin: 0 0 26px; }
+    .message.user { display: flex; justify-content: flex-end; }
+    .user-content { max-width: 82%; padding: 12px 15px; border: 1px solid var(--line); background: var(--panel); }
+    .message-head { display: flex; gap: 9px; align-items: baseline; color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+    .message-head strong { color: var(--text); font-size: 12px; }
+    p { margin: 0 0 10px; }
+    p:last-child { margin-bottom: 0; }
+    .attachment-chip { display: inline-flex; gap: 8px; align-items: center; border: 1px solid var(--line); background: var(--bg); color: var(--text); padding: 5px 8px; font-size: 11px; }
+    .attachment-chip .size { color: var(--muted); }
+    .answer { padding-left: 12px; border-left: 2px solid var(--accent); }
+    .answer h2 { font-size: 14px; margin: 13px 0 7px; }
+    .answer ol { padding-left: 19px; margin: 7px 0 12px; }
+    .code-card { border: 1px solid var(--line); background: var(--code); margin: 13px 0; }
+    .code-head { display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+    .code-card pre, .artifact pre { margin: 0; padding: 12px; overflow: auto; font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; tab-size: 2; }
+    .inline-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+    .inline-actions .button { font-size: 11px; min-height: 27px; }
+    .note { color: var(--muted); font-size: 11px; }
+    .branch-row { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 12px; display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 11px; }
+    .branch-row select, .toolbar select, .settings select { border: 1px solid var(--line); background: var(--bg); color: var(--text); min-height: 30px; padding: 3px 8px; }
+    .composer-wrap { border-top: 1px solid var(--line); padding: 12px 24px 16px; }
+    .composer { max-width: 740px; margin: 0 auto; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); }
+    .composer:focus-within { border-color: #3574f0; box-shadow: inset 0 0 0 1px #3574f0; }
+    .composer textarea { display: block; width: 100%; min-height: 68px; resize: vertical; border: 0; background: transparent; color: var(--text); padding: 12px; outline: none; }
+    .composer-tools { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 7px 9px; border-top: 1px solid var(--line); }
+    .composer-left, .composer-right { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+    .selected-files { max-width: 740px; margin: 0 auto 9px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .selected-files:empty { display: none; }
+    .composer-hint { max-width: 740px; margin: 8px auto 0; color: var(--muted); font-size: 11px; }
+    .artifact-header { min-height: 62px; padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); gap: 8px; }
+    .artifact-header strong { display: block; font-size: 13px; }
+    .artifact-tabs { display: flex; gap: 16px; border-bottom: 1px solid var(--line); padding: 0 16px; }
+    .artifact-tabs button { padding: 11px 0 9px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); }
+    .artifact-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+    .artifact-body { overflow: auto; flex: 1; }
+    .artifact pre { white-space: pre; }
+    .preview { margin: 17px; background: #fff; color: #20232a; padding: 20px; border: 1px solid #d8dce3; min-height: 260px; }
+    .preview h2 { font-size: 18px; margin: 0 0 12px; }
+    .preview p { color: #626a79; }
+    .preview .preview-bar { height: 10px; background: #d4e2ff; margin: 18px 0 6px; }
+    .preview .preview-bar:nth-of-type(2) { width: 72%; }
+    .preview .preview-bar:nth-of-type(3) { width: 48%; }
+    .artifact-foot { padding: 12px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+    .demo-label { padding: 7px 12px; text-align: center; color: #65450f; background: #fff0c7; border-bottom: 1px solid #e7d395; font-size: 11px; }
+    dialog { border: 1px solid var(--line); background: var(--bg); color: var(--text); width: min(520px, calc(100vw - 28px)); padding: 0; box-shadow: 0 20px 60px #0004; }
+    dialog::backdrop { background: #1118; }
+    .dialog-head { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); padding: 14px 18px; }
+    .dialog-head h2 { font-size: 15px; margin: 0; }
+    .dialog-content { padding: 17px 18px 20px; }
+    .settings { display: grid; gap: 17px; }
+    .setting-row { display: grid; gap: 7px; }
+    .setting-row label { font-weight: 600; }
+    .setting-row input { min-height: 34px; padding: 6px 9px; background: var(--bg); color: var(--text); border: 1px solid var(--line); }
+    .setting-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+    .context-list { margin: 8px 0 0; padding-left: 18px; }
+    .context-list li { margin: 7px 0; }
+    .toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); padding: 9px 13px; background: var(--text); color: var(--bg); border: 1px solid var(--line); z-index: 3; max-width: calc(100vw - 32px); text-align: center; }
+    [hidden] { display: none !important; }
+    @media (max-width: 1120px) { .app { grid-template-columns: 44px 190px minmax(380px, 1fr) 330px; } }
+    .app.artifact-hidden { grid-template-columns: 46px 232px minmax(0, 1fr); }
+    .artifact.is-closed { display: none; }
+    @media (max-width: 900px) { .app, .app.artifact-hidden { grid-template-columns: 44px 190px minmax(0, 1fr); } .artifact { display: none; position: fixed; z-index: 2; right: 0; top: 0; bottom: 0; width: min(390px, 90vw); box-shadow: -10px 0 35px #0003; } .artifact.is-open { display: flex; } }
+    @media (max-width: 620px) { .app { display: block; height: 100vh; min-height: 0; } .rail, .sidebar { display: none; } .main { height: 100%; } .topbar { padding: 10px 13px; } .statusbar, .conversation, .composer-wrap { padding-left: 13px; padding-right: 13px; } .top-actions .button:first-child { display: none; } .user-content { max-width: 95%; } }
+  </style>
+</head>
+<body>
+  <div class="demo-label">Макет будущего MVP · все данные и действия здесь демонстрационные · запросы в сеть не отправляются</div>
+  <div class="app" id="app" style="height:calc(100vh - 31px)">
+    <nav class="rail" aria-label="Разделы приложения">
+      <button id="rail-chats" aria-label="Чаты" title="Чаты" aria-current="page">☰</button>
+      <button id="rail-result" aria-label="Результат" title="Результат">▣</button>
+      <button id="rail-context" aria-label="Состав запроса" title="Состав запроса">▤</button>
+      <button id="rail-settings" class="rail-bottom" aria-label="Настройки" title="Настройки">⚙</button>
+    </nav>
+    <aside class="sidebar" aria-label="Список чатов">
+      <div class="brand"><span class="brand-mark">AI</span> Desktop Client</div>
+      <div class="sidebar-main">
+        <button class="button primary" id="new-chat" style="width:100%;margin-bottom:23px">+ Новый чат</button>
+        <div class="sidebar-title"><span>История</span><span>локально</span></div>
+        <nav class="chat-list" id="chat-list" aria-label="Чаты">
+          <button class="chat-item" aria-current="page" data-chat="plan"><strong>Краткий план страницы</strong><span>Сегодня · 3 сообщения</span></button>
+          <button class="chat-item" data-chat="notes"><strong>Заметки к интервью</strong><span>Вчера · 6 сообщений</span></button>
+          <button class="chat-item" data-chat="draft"><strong>Новый чат</strong><span>Черновик</span></button>
+        </nav>
+      </div>
+      <div class="sidebar-footer">
+        <button class="side-action" id="open-settings">⚙ &nbsp;Настройки и ключ</button>
+        <button class="side-action" id="backup">▣ &nbsp;Резервная копия</button>
+        <span class="small">История хранится на этом компьютере</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <nav class="workspace-tabs" aria-label="Открытые области"><button id="chat-tab" aria-current="page">◉ &nbsp; Краткий план страницы</button><button id="result-tab">▣ &nbsp; index.html</button></nav>
+      <header class="topbar">
+        <div><h1 id="chat-title">Краткий план страницы</h1><div class="subtitle" id="branch-subtitle">Чат сохранён локально · выбрана основная ветка</div></div>
+        <div class="top-actions">
+          <button class="button" id="context">Что отправится</button>
+          <button class="button" id="show-artifact">Результат ↗</button>
+        </div>
+      </header>
+      <div class="statusbar" aria-label="Состояние чата">
+        <span>● <strong>Ключ сохранён</strong> · это не проверка подключения</span>
+        <span id="catalog-status">Каталог моделей: примерный снимок</span>
+        <span>Расход: <b id="cost-status">неизвестно</b></span>
+      </div>
+      <div class="conversation" id="conversation">
+        <div class="thread" id="thread">
+          <div class="date">Сегодня</div>
+          <article class="message user">
+            <div class="user-content">
+              <div class="message-head"><strong>Вы</strong><span>10:42</span></div>
+              <p>Сделай простой план страницы по моим заметкам. Покажи итоговый HTML отдельно.</p>
+              <span class="attachment-chip">▤ &nbsp; notes.txt <span class="size">· 4 КБ · снимок файла</span></span>
+            </div>
+          </article>
+          <article class="message">
+            <div class="message-head"><strong>Ассистент</strong><span id="answer-status">Модель для примера · ответ завершён</span></div>
+            <div class="answer" id="answer">
+              <p>Я взял только выбранный файл <b>notes.txt</b> и ваш вопрос. История другой ветки в этот запрос не входила.</p>
+              <h2>План страницы</h2>
+              <ol><li>Короткий заголовок с главным обещанием.</li><li>Три понятных преимущества.</li><li>Действие в конце страницы.</li></ol>
+              <div class="code-card">
+                <div class="code-head"><span>HTML · index.html</span><button class="button quiet" id="open-from-code">Открыть как результат ↗</button></div>
+                <pre>&lt;main&gt;
+  &lt;h1&gt;Понятный первый экран&lt;/h1&gt;
+  &lt;p&gt;Короткое описание идеи.&lt;/p&gt;
+&lt;/main&gt;</pre>
+              </div>
+              <p class="note">Токены: сервер не сообщил · цена: неизвестна · списание: неизвестно.</p>
+              <div class="inline-actions">
+                <button class="button" id="retry">Повторить ответ</button>
+                <button class="button" id="continue">Продолжить ответ</button>
+                <button class="button" id="edit">Изменить вопрос</button>
+              </div>
+              <div class="branch-row"><label for="branch">Ветка ответа</label><select id="branch"><option value="main">1 из 2 · основная</option><option value="other">2 из 2 · альтернативная</option></select><span>Старые ответы сохраняются</span></div>
+            </div>
+          </article>
+        </div>
+      </div>
+      <div class="composer-wrap">
+        <div class="selected-files" id="selected-files"><span class="attachment-chip">▤ &nbsp; notes.txt <span class="size">· выбран для следующего сообщения</span></span></div>
+        <form class="composer" id="composer">
+          <label for="prompt" class="small" style="position:absolute;clip-path:inset(50%);width:1px;height:1px;overflow:hidden">Сообщение</label>
+          <textarea id="prompt" placeholder="Напишите сообщение…"></textarea>
+          <div class="composer-tools">
+            <div class="composer-left"><button type="button" class="button" id="attach">+ Файл</button><button type="button" class="button" id="inspect">Состав запроса</button></div>
+            <div class="composer-right"><select id="model" aria-label="Модель"><optgroup label="Скорость"><option>Модель для примера</option></optgroup><optgroup label="Мышление"><option>Другая модель · цена неизвестна</option></optgroup><optgroup label="Экономия"><option>Экономная модель · цена неизвестна</option></optgroup><optgroup label="Остальные"><option>Новая модель · свойства неизвестны</option></optgroup></select><button class="button primary" type="submit">Отправить</button></div>
+          </div>
+        </form>
+        <p class="composer-hint">В готовом приложении отправка будет платной. Макет только показывает будущий экран.</p>
+      </div>
+    </main>
+
+    <aside class="artifact" id="artifact" aria-label="Результат">
+      <div class="artifact-header"><div><strong>index.html</strong><span class="small">Версия 2 · создано из ответа</span></div><button class="button quiet" id="close-artifact" aria-label="Закрыть результат">✕</button></div>
+      <div class="artifact-tabs" role="tablist" aria-label="Режим результата">
+        <button id="tab-preview" role="tab" aria-selected="true">Статический просмотр</button>
+        <button id="tab-code" role="tab" aria-selected="false">Код</button>
+      </div>
+      <div class="artifact-body">
+        <div id="preview-panel" role="tabpanel" aria-labelledby="tab-preview"><div class="preview"><h2>Понятный первый экран</h2><p>Короткое описание идеи.</p><div class="preview-bar"></div><div class="preview-bar"></div><div class="preview-bar"></div></div><p class="note" style="padding:0 17px">Это статический образец. Код страницы здесь не выполняется.</p></div>
+        <pre id="code-panel" role="tabpanel" aria-labelledby="tab-code" hidden>&lt;!doctype html&gt;
+&lt;html lang="ru"&gt;
+  &lt;main&gt;
+    &lt;h1&gt;Понятный первый экран&lt;/h1&gt;
+    &lt;p&gt;Короткое описание идеи.&lt;/p&gt;
+  &lt;/main&gt;
+&lt;/html&gt;</pre>
+      </div>
+      <div class="artifact-foot"><button class="button" id="export">Экспортировать HTML</button><p style="margin-top:9px">Интерактивный просмотр появится только после проверки безопасности на macOS и Windows.</p></div>
+    </aside>
+  </div>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <div class="dialog-head"><h2 id="settings-title">Настройки</h2><button class="button quiet" data-close="settings-dialog" aria-label="Закрыть">✕</button></div>
+    <div class="dialog-content settings">
+      <div class="setting-row"><label for="key-input">Ключ SimpleClaw</label><span class="small">В готовом приложении ключ хранит система. Этот макет его не сохраняет.</span><input id="key-input" type="password" placeholder="Здесь только вид будущего поля" autocomplete="off"><div class="setting-actions"><button class="button" id="save-key">Сохранить ключ</button><button class="button" id="delete-key">Удалить ключ</button></div></div>
+      <div class="setting-row"><label for="theme">Тема</label><select id="theme"><option value="system">Системная</option><option value="light">Светлая</option><option value="dark" selected>Тёмная</option></select></div>
+      <div class="setting-row"><label>Каталог моделей</label><span class="small">В готовом приложении рядом будет время последнего обновления и цена из полученного каталога.</span><button class="button" id="refresh-models" style="justify-self:start">Обновить каталог</button></div>
+      <div class="setting-row"><label>История</label><span class="small">Резервная копия включает чаты и файлы, но не ключ.</span><div class="setting-actions"><button class="button" id="settings-backup">Создать копию</button><button class="button" id="restore">Восстановить копию</button></div></div>
+    </div>
+  </dialog>
+
+  <dialog id="context-dialog" aria-labelledby="context-title">
+    <div class="dialog-head"><h2 id="context-title">Что войдёт в следующий запрос</h2><button class="button quiet" data-close="context-dialog" aria-label="Закрыть">✕</button></div>
+    <div class="dialog-content"><p>Состав показан на примере. Готовое приложение соберёт его из выбранной ветки перед отправкой.</p><ol class="context-list"><li>Текущая ветка чата: вопрос и выбранный ответ.</li><li>Новый текст из поля ввода.</li><li>Только явно выбранные файлы: <strong id="context-file">notes.txt</strong>.</li><li>Модель: <strong id="context-model">Модель для примера</strong>.</li></ol><p class="note" style="margin-top:14px">Оценка размера может быть приблизительной. Если проверенный предел модели неизвестен, приложение предупредит до отправки.</p></div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const toast = (message) => {
+      $('toast').textContent = message;
+      $('toast').hidden = false;
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => $('toast').hidden = true, 3500);
+    };
+    const open = (id) => $(id).showModal();
+    const showArtifact = () => { $('artifact').classList.remove('is-closed'); $('artifact').classList.add('is-open'); $('app').classList.remove('artifact-hidden'); };
+    const setArtifactTab = (tab) => {
+      $('tab-preview').setAttribute('aria-selected', String(tab === 'preview'));
+      $('tab-code').setAttribute('aria-selected', String(tab === 'code'));
+      $('preview-panel').hidden = tab !== 'preview';
+      $('code-panel').hidden = tab !== 'code';
+    };
+    document.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => $(button.dataset.close).close()));
+    $('open-settings').addEventListener('click', () => open('settings-dialog'));
+    $('rail-settings').addEventListener('click', () => open('settings-dialog'));
+    $('rail-chats').addEventListener('click', () => { $('chat-list').scrollIntoView({ block: 'nearest' }); toast('Выбрана область чатов'); });
+    $('rail-result').addEventListener('click', showArtifact);
+    $('rail-context').addEventListener('click', () => open('context-dialog'));
+    $('context').addEventListener('click', () => open('context-dialog'));
+    $('inspect').addEventListener('click', () => open('context-dialog'));
+    $('show-artifact').addEventListener('click', showArtifact);
+    $('result-tab').addEventListener('click', showArtifact);
+    $('chat-tab').addEventListener('click', () => $('conversation').scrollIntoView({ block: 'nearest' }));
+    $('open-from-code').addEventListener('click', () => { showArtifact(); setArtifactTab('code'); });
+    $('close-artifact').addEventListener('click', () => { $('artifact').classList.add('is-closed'); $('artifact').classList.remove('is-open'); $('app').classList.add('artifact-hidden'); });
+    $('tab-preview').addEventListener('click', () => setArtifactTab('preview'));
+    $('tab-code').addEventListener('click', () => setArtifactTab('code'));
+    $('theme').addEventListener('change', (event) => document.documentElement.dataset.theme = event.target.value === 'system' ? '' : event.target.value);
+    $('model').addEventListener('change', (event) => $('context-model').textContent = event.target.value);
+    $('branch').addEventListener('change', (event) => {
+      const other = event.target.value === 'other';
+      $('answer').querySelector('p').textContent = other
+        ? 'Альтернативная ветка: ответ оборвался после плана и фрагмента кода. Частичный текст сохранён, а расход неизвестен.'
+        : 'Я взял только выбранный файл notes.txt и ваш вопрос. История другой ветки в этот запрос не входила.';
+      $('answer-status').textContent = other ? 'Модель для примера · ответ прерван' : 'Модель для примера · ответ завершён';
+      $('branch-subtitle').textContent = other ? 'Чат сохранён локально · выбрана альтернативная ветка' : 'Чат сохранён локально · выбрана основная ветка';
+      toast(other ? 'Показана альтернативная ветка' : 'Показана основная ветка');
+    });
+    $('retry').addEventListener('click', () => toast('В готовом приложении это создаст новую ветку. Возможен новый расход.'));
+    $('continue').addEventListener('click', () => toast('В готовом приложении это будет отдельный платный запрос с частичным ответом.'));
+    $('edit').addEventListener('click', () => { $('prompt').value = 'Сделай простой план страницы по моим заметкам. Покажи итоговый HTML отдельно.'; $('prompt').focus(); toast('Изменённый вопрос создаст новую ветку.'); });
+    $('attach').addEventListener('click', () => {
+      const selected = !$('selected-files').hasAttribute('data-empty');
+      $('selected-files').toggleAttribute('data-empty', selected);
+      $('selected-files').hidden = selected;
+      $('context-file').textContent = selected ? 'нет' : 'notes.txt';
+      toast(selected ? 'Файл убран из следующего запроса' : 'Файл выбран для следующего запроса');
+    });
+    $('composer').addEventListener('submit', (event) => { event.preventDefault(); toast('Это макет: сообщение не отправлено и деньги не списаны.'); });
+    $('new-chat').addEventListener('click', () => { $('chat-title').textContent = 'Новый чат'; $('chat-tab').textContent = '◉  Новый чат'; $('prompt').value = ''; $('prompt').focus(); toast('Новый чат показан в макете; история не изменена.'); });
+    document.querySelectorAll('.chat-item').forEach((button) => button.addEventListener('click', () => {
+      document.querySelectorAll('.chat-item').forEach((item) => item.removeAttribute('aria-current'));
+      button.setAttribute('aria-current', 'page');
+      $('chat-title').textContent = button.querySelector('strong').textContent;
+      $('chat-tab').textContent = '◉  ' + button.querySelector('strong').textContent;
+      toast('В макете меняется заголовок; переписка остаётся примером.');
+    }));
+    ['backup', 'settings-backup'].forEach((id) => $(id).addEventListener('click', () => toast('Макет: резервная копия не создаётся.')));
+    $('restore').addEventListener('click', () => toast('Макет: восстановление не выполняется.'));
+    $('refresh-models').addEventListener('click', () => toast('Макет: запрос к каталогу не отправляется.'));
+    $('save-key').addEventListener('click', () => { $('key-input').value = ''; toast('Макет: ключ не сохранён.'); });
+    $('delete-key').addEventListener('click', () => { $('key-input').value = ''; toast('Макет: ключ не хранился.'); });
+    $('export').addEventListener('click', () => {
+      const html = '<!doctype html>\n<html lang="ru"><meta charset="utf-8"><title>Пример</title><main><h1>Понятный первый экран</h1><p>Короткое описание идеи.</p></main></html>';
+      const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      const link = document.createElement('a'); link.href = url; link.download = 'example-index.html'; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast('Скачан только демонстрационный HTML.');
+    });
+  </script>
+</body>
+</html>
