@@ -4,6 +4,8 @@ fn main() {
             tauri_build::AppManifest::new().commands(&[
                 "list_history",
                 "list_conversations",
+                "search_conversations",
+                "set_conversation_pinned",
                 "create_conversation",
                 "rename_conversation",
                 "archive_conversation",

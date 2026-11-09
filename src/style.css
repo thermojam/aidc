@@ -141,6 +141,21 @@ button, select {
     text-align: left;
 }
 
+.chat-search {
+    min-width: 0;
+    margin: 0 4px 8px;
+    padding: 6px 8px;
+    color: var(--text);
+    background: var(--field);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+}
+
+.sidebar-empty {
+    padding: 0 10px;
+    color: var(--muted);
+}
+
 .chat-select, .chat-action {
     color: var(--text);
     background: transparent;

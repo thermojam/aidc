@@ -41,7 +41,7 @@ type StreamEvent =
     | { event: "delta"; data: { attempt_id: number; seq: number; text: string } }
     | { event: "end"; data: { attempt_id: number; status: string; error_code: string | null; request_id: string | null; http_status: number | null } };
 type Theme = "system" | "light" | "dark";
-type Conversation = { id: number; title: string; archived: boolean };
+type Conversation = { id: number; title: string; archived: boolean; pinned: boolean };
 
 const statusLabel: Record<string, string> = {
     interrupted: "Ответ прерван",
@@ -56,6 +56,8 @@ const categoryOrder = ["thinking", "speed", "economy", "other"];
 
 function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
+    const [conversationSearch, setConversationSearch] = useState("");
+    const [searchMatches, setSearchMatches] = useState<number[] | null>(null);
     const [conversationId, setConversationId] = useState(1);
     const [history, setHistory] = useState<History>({
         messages: [],
@@ -121,6 +123,18 @@ function App() {
         setConversations(items);
         return items;
     }
+
+    useEffect(() => {
+        const query = conversationSearch.trim();
+        if (!query) { setSearchMatches(null); return; }
+        let current = true;
+        const timer = window.setTimeout(() => {
+            invoke<Conversation[]>("search_conversations", {query})
+                .then((items) => { if (current) setSearchMatches(items.map((item) => item.id)); })
+                .catch((reason) => { if (current) setError(String(reason)); });
+        }, 150);
+        return () => { current = false; window.clearTimeout(timer); };
+    }, [conversationSearch, conversations]);
 
     useEffect(() => {
         refreshConversations().then((items) => {
@@ -193,6 +207,14 @@ function App() {
                 }
                 await switchConversation(nextId, true);
             }
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function togglePin(item: Conversation) {
+        try {
+            await invoke("set_conversation_pinned", {conversationId: item.id, pinned: !item.pinned});
+            await refreshConversations();
+            setError("");
         } catch (reason) { setError(String(reason)); }
     }
 
@@ -409,8 +431,9 @@ function App() {
     const visible = history.messages.filter((message) => activeIds.has(message.id) && (!busy || message.status !== "streaming"));
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
     const selectedConversation = conversations.find((item) => item.id === conversationId);
-    const activeConversations = conversations.filter((item) => !item.archived);
-    const archivedConversations = conversations.filter((item) => item.archived);
+    const shownConversations = searchMatches === null ? conversations : conversations.filter((item) => searchMatches.includes(item.id));
+    const activeConversations = shownConversations.filter((item) => !item.archived);
+    const archivedConversations = shownConversations.filter((item) => item.archived);
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
     const selectedCategory = categories.find((item) => item.model_id === modelId);
     function follows(message: Message, ancestorId: number): boolean {
@@ -430,21 +453,28 @@ function App() {
                 <div className="sidebar-label">Беседы</div>
                 <button type="button" className="secondary-button new-chat" disabled={busy}
                         onClick={() => void createConversation()}>Новая беседа</button>
+                <input className="chat-search" type="search" aria-label="Поиск бесед" placeholder="Поиск бесед"
+                       maxLength={100} value={conversationSearch} onChange={(event) => setConversationSearch(event.target.value)}/>
                 <div className="sidebar-chats">
+                    {shownConversations.length === 0 && <p className="sidebar-empty">Ничего не найдено</p>}
                     {activeConversations.map((item) => <div className="chat-item" key={item.id}>
                         <button type="button" className="chat-item-title chat-select" title={item.title}
                                 aria-current={item.id === conversationId ? "page" : undefined} disabled={busy}
                                 onClick={() => void switchConversation(item.id)}>{item.title}</button>
+                        <button type="button" className="chat-action" aria-label={`${item.pinned ? "Открепить" : "Закрепить"} ${item.title}`}
+                                aria-pressed={item.pinned} onClick={() => void togglePin(item)}>{item.pinned ? "★" : "☆"}</button>
                         <button type="button" className="chat-action" aria-label={`Переименовать ${item.title}`} disabled={busy}
                                 onClick={() => void renameConversation(item)}>✎</button>
                         <button type="button" className="chat-action" aria-label={`Архивировать ${item.title}`}
                                 disabled={busy}
                                 onClick={() => void archiveConversation(item)}>▤</button>
                     </div>)}
-                    {archivedConversations.length > 0 && <details className="archived-chats">
+                    {archivedConversations.length > 0 && <details key={conversationSearch.trim() ? "search" : "browse"} className="archived-chats" open={!!conversationSearch.trim()}>
                         <summary>Архив</summary>
                         {archivedConversations.map((item) => <div className="chat-item" key={item.id}>
                             <span className="chat-item-title" title={item.title}>{item.title}</span>
+                            <button type="button" className="chat-action" aria-label={`${item.pinned ? "Открепить" : "Закрепить"} ${item.title}`}
+                                    aria-pressed={item.pinned} onClick={() => void togglePin(item)}>{item.pinned ? "★" : "☆"}</button>
                             <button type="button" className="chat-action" aria-label={`Вернуть ${item.title} из архива`} disabled={busy}
                                     onClick={() => void archiveConversation(item)}>↩</button>
                         </div>)}

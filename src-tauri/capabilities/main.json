@@ -7,6 +7,8 @@
     "core:default",
     "allow-list-history",
     "allow-list-conversations",
+    "allow-search-conversations",
+    "allow-set-conversation-pinned",
     "allow-create-conversation",
     "allow-rename-conversation",
     "allow-archive-conversation",
