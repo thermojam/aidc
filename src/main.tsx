@@ -41,7 +41,8 @@ type StreamEvent =
     | { event: "delta"; data: { attempt_id: number; seq: number; text: string } }
     | { event: "end"; data: { attempt_id: number; status: string; error_code: string | null; request_id: string | null; http_status: number | null } };
 type Theme = "system" | "light" | "dark";
-type Conversation = { id: number; title: string; archived: boolean; pinned: boolean };
+type Conversation = { id: number; title: string; archived: boolean; pinned: boolean; project_id: number | null };
+type Project = { id: number; title: string; archived: boolean };
 
 const statusLabel: Record<string, string> = {
     interrupted: "Ответ прерван",
@@ -56,6 +57,9 @@ const categoryOrder = ["thinking", "speed", "economy", "other"];
 
 function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
+    const [projects, setProjects] = useState<Project[]>([]);
+    const [projectFilter, setProjectFilter] = useState<number | null>(null);
+    const [renameTarget, setRenameTarget] = useState<{kind: "project" | "conversation"; id: number; title: string} | null>(null);
     const [conversationSearch, setConversationSearch] = useState("");
     const [searchMatches, setSearchMatches] = useState<number[] | null>(null);
     const [conversationId, setConversationId] = useState(1);
@@ -124,17 +128,23 @@ function App() {
         return items;
     }
 
+    async function refreshProjects() {
+        const items = await invoke<Project[]>("list_projects");
+        setProjects(items);
+        return items;
+    }
+
     useEffect(() => {
         const query = conversationSearch.trim();
         if (!query) { setSearchMatches(null); return; }
         let current = true;
         const timer = window.setTimeout(() => {
-            invoke<Conversation[]>("search_conversations", {query})
+            invoke<Conversation[]>("search_conversations", {query, projectFilter})
                 .then((items) => { if (current) setSearchMatches(items.map((item) => item.id)); })
                 .catch((reason) => { if (current) setError(String(reason)); });
         }, 150);
         return () => { current = false; window.clearTimeout(timer); };
-    }, [conversationSearch, conversations]);
+    }, [conversationSearch, conversations, projectFilter]);
 
     useEffect(() => {
         refreshConversations().then((items) => {
@@ -142,6 +152,7 @@ function App() {
                 setConversationId(items.find((item) => !item.archived)?.id ?? items[0]?.id ?? 1);
             }
         }).catch((reason) => setError(String(reason)));
+        refreshProjects().catch((reason) => setError(String(reason)));
         invoke<string[]>("list_backups").then(setBackups).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog | null>("list_models").then(setCatalog).catch((reason) => setCatalogError(String(reason)));
         invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => setCatalogError(String(reason)));
@@ -176,17 +187,23 @@ function App() {
         if ((prompt.trim() || pendingAttachments.length) && !window.confirm("Создать беседу? Черновик и выбранные файлы будут убраны.")) return;
         try {
             const id = await invoke<number>("create_conversation");
+            if (projectFilter && projectFilter > 0) await invoke("move_conversation", {conversationId: id, projectId: projectFilter});
             await refreshConversations();
             await switchConversation(id, true);
         } catch (reason) { setError(String(reason)); }
     }
 
-    async function renameConversation(item: Conversation) {
-        const title = window.prompt("Название беседы", item.title);
-        if (title === null) return;
+    async function saveRename() {
+        if (!renameTarget) return;
         try {
-            await invoke("rename_conversation", {conversationId: item.id, title});
-            await refreshConversations();
+            if (renameTarget.kind === "conversation") {
+                await invoke("rename_conversation", {conversationId: renameTarget.id, title: renameTarget.title});
+                await refreshConversations();
+            } else {
+                await invoke("rename_project", {id: renameTarget.id, title: renameTarget.title});
+                await refreshProjects();
+            }
+            setRenameTarget(null);
             setError("");
         } catch (reason) { setError(String(reason)); }
     }
@@ -218,6 +235,33 @@ function App() {
         } catch (reason) { setError(String(reason)); }
     }
 
+    async function createProject() {
+        try {
+            const id = await invoke<number>("create_project");
+            await refreshProjects();
+            setProjectFilter(id);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function archiveProject(item: Project) {
+        try {
+            await invoke("archive_project", {id: item.id, archived: !item.archived});
+            await refreshProjects();
+            if (!item.archived && projectFilter === item.id) setProjectFilter(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function moveConversation(projectId: number | null) {
+        try {
+            await invoke("move_conversation", {conversationId, projectId});
+            await refreshConversations();
+            setProjectFilter(projectId ?? 0);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
     async function createBackup() {
         try {
             await invoke<string>("create_backup");
@@ -233,6 +277,8 @@ function App() {
         try {
             await invoke("restore_backup", {name: selectedBackup});
             const items = await refreshConversations();
+            setProjects(await invoke<Project[]>("list_projects"));
+            setProjectFilter(null);
             const nextId = items.some((item) => item.id === conversationId && !item.archived)
                 ? conversationId : items.find((item) => !item.archived)?.id ?? items[0]?.id ?? 1;
             setConversationId(nextId);
@@ -431,7 +477,11 @@ function App() {
     const visible = history.messages.filter((message) => activeIds.has(message.id) && (!busy || message.status !== "streaming"));
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
     const selectedConversation = conversations.find((item) => item.id === conversationId);
-    const shownConversations = searchMatches === null ? conversations : conversations.filter((item) => searchMatches.includes(item.id));
+    const selectedProject = projects.find((item) => item.id === projectFilter && !item.archived);
+    const activeProjects = projects.filter((item) => !item.archived);
+    const archivedProjects = projects.filter((item) => item.archived);
+    const shownConversations = (searchMatches === null ? conversations : conversations.filter((item) => searchMatches.includes(item.id)))
+        .filter((item) => projectFilter === null || item.project_id === (projectFilter || null));
     const activeConversations = shownConversations.filter((item) => !item.archived);
     const archivedConversations = shownConversations.filter((item) => item.archived);
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
@@ -450,6 +500,32 @@ function App() {
                     <button type="button" className="secondary-button sidebar-close" aria-label="Закрыть список чатов"
                             onClick={() => setSidebarOpen(false)}>×</button>
                 </div>
+                <div className="sidebar-label">Проекты</div>
+                <div className="project-controls">
+                    <select aria-label="Выбранный проект" value={projectFilter ?? -1}
+                            onChange={(event) => { setProjectFilter(Number(event.target.value) === -1 ? null : Number(event.target.value)); setSearchMatches(null); }}>
+                        <option value={-1}>Все беседы</option><option value={0}>Без проекта</option>
+                        {activeProjects.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
+                    </select>
+                    <button type="button" className="secondary-button" aria-label="Создать проект" onClick={() => void createProject()}>+</button>
+                </div>
+                {selectedProject && <div className="project-actions">
+                    <button type="button" className="secondary-button" onClick={() => setRenameTarget({kind: "project", id: selectedProject.id, title: selectedProject.title})}>Переименовать</button>
+                    <button type="button" className="secondary-button" onClick={() => void archiveProject(selectedProject)}>Архивировать</button>
+                </div>}
+                {archivedProjects.length > 0 && <details className="archived-chats"><summary>Архив проектов</summary>
+                    {archivedProjects.map((item) => <div className="project-archived" key={item.id}>
+                        <span>{item.title}</span><button type="button" className="chat-action" onClick={() => void archiveProject(item)}>Вернуть</button>
+                    </div>)}
+                </details>}
+                {renameTarget && <form className="rename-form" onSubmit={(event) => { event.preventDefault(); void saveRename(); }}>
+                    <label htmlFor="rename-title">Название {renameTarget.kind === "project" ? "проекта" : "беседы"}</label>
+                    <input id="rename-title" autoFocus maxLength={80} value={renameTarget.title}
+                           onChange={(event) => setRenameTarget({...renameTarget, title: event.target.value})}
+                           onKeyDown={(event) => { if (event.key === "Escape") setRenameTarget(null); }}/>
+                    <div><button type="submit" disabled={!renameTarget.title.trim()}>Сохранить</button>
+                        <button type="button" onClick={() => setRenameTarget(null)}>Отмена</button></div>
+                </form>}
                 <div className="sidebar-label">Беседы</div>
                 <button type="button" className="secondary-button new-chat" disabled={busy}
                         onClick={() => void createConversation()}>Новая беседа</button>
@@ -464,7 +540,7 @@ function App() {
                         <button type="button" className="chat-action" aria-label={`${item.pinned ? "Открепить" : "Закрепить"} ${item.title}`}
                                 aria-pressed={item.pinned} onClick={() => void togglePin(item)}>{item.pinned ? "★" : "☆"}</button>
                         <button type="button" className="chat-action" aria-label={`Переименовать ${item.title}`} disabled={busy}
-                                onClick={() => void renameConversation(item)}>✎</button>
+                                onClick={() => setRenameTarget({kind: "conversation", id: item.id, title: item.title})}>✎</button>
                         <button type="button" className="chat-action" aria-label={`Архивировать ${item.title}`}
                                 disabled={busy}
                                 onClick={() => void archiveConversation(item)}>▤</button>
@@ -488,6 +564,12 @@ function App() {
                     <button type="button" className="secondary-button sidebar-toggle" aria-label="Открыть список чатов" aria-expanded={sidebarOpen}
                             onClick={() => setSidebarOpen((open) => !open)}>☰</button>
                     <h1>{selectedConversation?.title ?? "Беседа"}</h1>
+                    <select className="conversation-project" aria-label="Проект беседы" value={selectedConversation?.project_id ?? 0}
+                            disabled={busy || !selectedConversation} onChange={(event) => void moveConversation(Number(event.target.value) || null)}>
+                        <option value={0}>Без проекта</option>
+                        {projects.filter((item) => !item.archived || item.id === selectedConversation?.project_id)
+                            .map((item) => <option key={item.id} value={item.id}>{item.title}{item.archived ? " (архив)" : ""}</option>)}
+                    </select>
                     <button ref={compactSettingsButton} type="button" className="secondary-button compact-settings"
                             onClick={() => setSettingsOpen(true)}>Настройки</button>
                 </header>

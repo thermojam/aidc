@@ -113,6 +113,21 @@ button, select {
     font-size: 12px;
 }
 
+.project-controls, .project-actions, .project-archived {
+    display: flex;
+    gap: 4px;
+    margin: 0 4px 8px;
+}
+
+.project-controls select { flex: 1; min-width: 0; }
+.project-actions button { flex: 1; }
+.project-archived { align-items: center; justify-content: space-between; }
+
+.rename-form { display: grid; gap: 6px; margin: 0 4px 12px; }
+.rename-form input { min-width: 0; padding: 6px 8px; color: var(--text); background: var(--field); border: 1px solid var(--border); }
+.rename-form div { display: flex; gap: 4px; }
+.rename-form button { flex: 1; }
+
 .chat-item {
     display: flex;
     align-items: center;
@@ -211,6 +226,9 @@ button, select {
     padding: 0 18px;
     border-bottom: 1px solid var(--border);
 }
+
+.chat-header h1 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-project { margin-left: auto; max-width: 180px; }
 
 h1 {
     margin: 0;

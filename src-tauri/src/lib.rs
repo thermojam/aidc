@@ -107,6 +107,14 @@ struct ConversationSummary {
     title: String,
     archived: bool,
     pinned: bool,
+    project_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ProjectSummary {
+    id: i64,
+    title: String,
+    archived: bool,
 }
 
 #[derive(Serialize)]
@@ -211,7 +219,11 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0010_conversation_pins.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 9 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 9 {
+        db.execute_batch(include_str!("../migrations/0011_projects.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 10 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -396,16 +408,17 @@ fn remove_text_attachment(id: i64, state: State<'_, AppState>) -> Result<(), Str
 }
 
 fn list_conversations_in_db(db: &Connection) -> rusqlite::Result<Vec<ConversationSummary>> {
-    let mut statement = db.prepare("SELECT id, title, archived, pinned FROM conversations ORDER BY pinned DESC, id")?;
+    let mut statement = db.prepare("SELECT id, title, archived, pinned, project_id FROM conversations ORDER BY pinned DESC, id")?;
     let rows = statement.query_map([], |row| Ok(ConversationSummary {
-        id: row.get(0)?, title: row.get(1)?, archived: row.get(2)?, pinned: row.get(3)?,
+        id: row.get(0)?, title: row.get(1)?, archived: row.get(2)?, pinned: row.get(3)?, project_id: row.get(4)?,
     }))?;
     rows.collect()
 }
 
-fn search_conversations_in_db(db: &Connection, query: &str) -> rusqlite::Result<Vec<ConversationSummary>> {
+fn search_conversations_in_db(db: &Connection, query: &str, project_filter: Option<i64>) -> rusqlite::Result<Vec<ConversationSummary>> {
     let needle = query.trim().to_lowercase();
-    let conversations = list_conversations_in_db(db)?;
+    let conversations = list_conversations_in_db(db)?.into_iter()
+        .filter(|item| project_filter.is_none_or(|id| item.project_id.unwrap_or(0) == id)).collect::<Vec<_>>();
     if needle.is_empty() { return Ok(conversations); }
     let mut matches = HashSet::new();
     let mut statement = db.prepare("SELECT conversation_id, content FROM messages")?;
@@ -415,6 +428,39 @@ fn search_conversations_in_db(db: &Connection, query: &str) -> rusqlite::Result<
         if content.to_lowercase().contains(&needle) { matches.insert(id); }
     }
     Ok(conversations.into_iter().filter(|item| item.title.to_lowercase().contains(&needle) || matches.contains(&item.id)).collect())
+}
+
+fn list_projects_in_db(db: &Connection) -> rusqlite::Result<Vec<ProjectSummary>> {
+    let mut statement = db.prepare("SELECT id, title, archived FROM projects ORDER BY archived, id")?;
+    let rows = statement.query_map([], |row| Ok(ProjectSummary { id: row.get(0)?, title: row.get(1)?, archived: row.get(2)? }))?;
+    rows.collect()
+}
+
+fn create_project_in_db(db: &Connection) -> rusqlite::Result<i64> {
+    db.execute("INSERT INTO projects(title) VALUES('Новый проект')", [])?;
+    Ok(db.last_insert_rowid())
+}
+
+fn rename_project_in_db(db: &Connection, id: i64, title: &str) -> rusqlite::Result<()> {
+    if db.execute("UPDATE projects SET title=?1 WHERE id=?2", params![title, id])? == 0 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    Ok(())
+}
+
+fn archive_project_in_db(db: &Connection, id: i64, archived: bool) -> rusqlite::Result<()> {
+    if db.execute("UPDATE projects SET archived=?1 WHERE id=?2", params![archived, id])? == 0 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    Ok(())
+}
+
+fn move_conversation_in_db(db: &Connection, conversation_id: i64, project_id: Option<i64>) -> rusqlite::Result<()> {
+    if let Some(id) = project_id {
+        if !db.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1 AND archived=0)", [id], |row| row.get::<_, bool>(0))? {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+    }
+    if db.execute("UPDATE conversations SET project_id=?1 WHERE id=?2", params![project_id, conversation_id])? == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
 }
 
 fn set_conversation_pinned_in_db(db: &Connection, conversation_id: i64, pinned: bool) -> rusqlite::Result<()> {
@@ -431,10 +477,42 @@ fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationSumm
 }
 
 #[tauri::command]
-fn search_conversations(query: String, state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
+fn search_conversations(query: String, project_filter: Option<i64>, state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
     if query.chars().count() > 100 { return Err("Поисковый запрос слишком длинный".into()); }
     let db = state.db.lock().map_err(|_| "База занята")?;
-    search_conversations_in_db(&db, &query).map_err(|_| "Не удалось найти беседы".into())
+    search_conversations_in_db(&db, &query, project_filter).map_err(|_| "Не удалось найти беседы".into())
+}
+
+#[tauri::command]
+fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    list_projects_in_db(&db).map_err(|_| "Не удалось прочитать проекты".into())
+}
+
+#[tauri::command]
+fn create_project(state: State<'_, AppState>) -> Result<i64, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    create_project_in_db(&db).map_err(|_| "Не удалось создать проект".into())
+}
+
+#[tauri::command]
+fn rename_project(id: i64, title: String, state: State<'_, AppState>) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 80 { return Err("Название должно содержать от 1 до 80 символов".into()); }
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    rename_project_in_db(&db, id, title).map_err(|_| "Проект не найден".into())
+}
+
+#[tauri::command]
+fn archive_project(id: i64, archived: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    archive_project_in_db(&db, id, archived).map_err(|_| "Проект не найден".into())
+}
+
+#[tauri::command]
+fn move_conversation(conversation_id: i64, project_id: Option<i64>, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    move_conversation_in_db(&db, conversation_id, project_id).map_err(|_| "Беседа или проект не найдены".into())
 }
 
 #[tauri::command]
@@ -687,7 +765,11 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
     let invalid_pins: i64 = if version >= 9 {
         source.query_row("SELECT count(*) FROM conversations WHERE pinned NOT IN (0, 1)", [], |row| row.get(0))?
     } else { 0 };
-    if integrity != "ok" || foreign_keys != 0 || !(1..=9).contains(&version) || conversations < 1 || invalid_pins != 0
+    if version >= 10 {
+        let _: i64 = source.query_row("SELECT count(*) FROM projects", [], |row| row.get(0))?;
+        let _: i64 = source.query_row("SELECT count(*) FROM conversations WHERE project_id IS NOT NULL", [], |row| row.get(0))?;
+    }
+    if integrity != "ok" || foreign_keys != 0 || !(1..=10).contains(&version) || conversations < 1 || invalid_pins != 0
         || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
         || (version >= 8 && !conversation_links_valid(&source)?) {
         return Err(rusqlite::Error::InvalidQuery);
@@ -1295,7 +1377,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -1625,7 +1707,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 9);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -1763,7 +1845,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 9);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
@@ -1863,11 +1945,11 @@ mod tests {
         db.execute("INSERT INTO conversations(title) VALUES('Вторая')", []).unwrap();
         let attempt = create_attempt_for_conversation(&mut db, 2, "Уникальная ИСТОРИЯ", &[], "local-mock").unwrap();
         finish(&db, attempt, "completed").unwrap();
-        assert_eq!(search_conversations_in_db(&db, "первая").unwrap().iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
-        assert_eq!(search_conversations_in_db(&db, "история").unwrap().iter().map(|item| item.id).collect::<Vec<_>>(), [2]);
-        assert!(search_conversations_in_db(&db, "несуществующее").unwrap().is_empty());
+        assert_eq!(search_conversations_in_db(&db, "первая", None).unwrap().iter().map(|item| item.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(search_conversations_in_db(&db, "история", None).unwrap().iter().map(|item| item.id).collect::<Vec<_>>(), [2]);
+        assert!(search_conversations_in_db(&db, "несуществующее", None).unwrap().is_empty());
         db.execute("UPDATE conversations SET archived=1 WHERE id=2", []).unwrap();
-        assert_eq!(search_conversations_in_db(&db, "история").unwrap()[0].id, 2);
+        assert_eq!(search_conversations_in_db(&db, "история", None).unwrap()[0].id, 2);
         set_conversation_pinned_in_db(&db, 2, true).unwrap();
         assert!(set_conversation_pinned_in_db(&db, 99, true).is_err());
         assert_eq!(list_conversations_in_db(&db).unwrap().iter().map(|item| (item.id, item.pinned)).collect::<Vec<_>>(), [(2, true), (1, false)]);
@@ -1875,7 +1957,7 @@ mod tests {
         let mut restored = Connection::open_in_memory().unwrap();
         init_db(&restored).unwrap();
         restore_history_from(&mut restored, &path).unwrap();
-        assert_eq!(search_conversations_in_db(&restored, "история").unwrap()[0].id, 2);
+        assert_eq!(search_conversations_in_db(&restored, "история", None).unwrap()[0].id, 2);
         assert!(list_conversations_in_db(&restored).unwrap()[0].pinned);
         set_conversation_pinned_in_db(&restored, 2, false).unwrap();
         assert!(!list_conversations_in_db(&restored).unwrap()[1].pinned);
@@ -1884,6 +1966,41 @@ mod tests {
         drop(damaged);
         assert!(restore_history_from(&mut restored, &path).is_err());
         assert_eq!(list_conversations_in_db(&restored).unwrap().len(), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn projects_keep_conversation_data_when_moved_and_restored() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-projects-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let project_id = create_project_in_db(&db).unwrap();
+        rename_project_in_db(&db, project_id, "Проект").unwrap();
+        let file = PendingAttachment { id: 1, name: "project.txt".into(), mime: "text/plain".into(),
+            content: b"project file".to_vec(), preview: "project file".into() };
+        let attempt = create_attempt_for_conversation(&mut db, 1, "вопрос", &[&file], "local-mock").unwrap();
+        append_delta(&mut db, attempt, 1, "<p>ответ</p>").unwrap();
+        finish(&db, attempt, "completed").unwrap();
+        create_artifact_in_db(&db, 2, "html", "Результат", "<p>ответ</p>").unwrap();
+        move_conversation_in_db(&db, 1, Some(project_id)).unwrap();
+        assert_eq!(list_conversations_in_db(&db).unwrap()[0].project_id, Some(project_id));
+        assert_eq!(search_conversations_in_db(&db, "вопрос", Some(project_id)).unwrap().len(), 1);
+        assert!(search_conversations_in_db(&db, "вопрос", Some(0)).unwrap().is_empty());
+        archive_project_in_db(&db, project_id, true).unwrap();
+        assert!(move_conversation_in_db(&db, 1, Some(project_id)).is_err());
+        backup_history_to(&db, &path).unwrap();
+        let mut restored = Connection::open_in_memory().unwrap();
+        init_db(&restored).unwrap();
+        restore_history_from(&mut restored, &path).unwrap();
+        assert_eq!(list_projects_in_db(&restored).unwrap()[0].title, "Проект");
+        assert!(list_projects_in_db(&restored).unwrap()[0].archived);
+        assert_eq!(list_conversations_in_db(&restored).unwrap()[0].project_id, Some(project_id));
+        let history = history_for(&restored, 1).unwrap();
+        assert_eq!((history.messages.len(), history.attempts.len(), history.attachments.len(), history.artifacts.len()), (2, 1, 1, 1));
+        archive_project_in_db(&restored, project_id, false).unwrap();
+        move_conversation_in_db(&restored, 1, None).unwrap();
+        assert!(list_conversations_in_db(&restored).unwrap()[0].project_id.is_none());
         std::fs::remove_file(path).unwrap();
     }
 

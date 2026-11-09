@@ -4,8 +4,13 @@ const result = document.getElementById("result")!;
 Promise.allSettled([
     invoke("list_history", {conversationId: 1}),
     invoke("list_conversations"),
-    invoke("search_conversations", {query: "viewer"}),
+    invoke("search_conversations", {query: "viewer", projectFilter: null}),
     invoke("set_conversation_pinned", {conversationId: 1, pinned: true}),
+    invoke("list_projects"),
+    invoke("create_project"),
+    invoke("rename_project", {id: 1, title: "viewer"}),
+    invoke("archive_project", {id: 1, archived: true}),
+    invoke("move_conversation", {conversationId: 1, projectId: null}),
     invoke("create_conversation"),
     invoke("rename_conversation", {conversationId: 1, title: "viewer"}),
     invoke("archive_conversation", {conversationId: 1, archived: true}),
@@ -38,6 +43,6 @@ Promise.allSettled([
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все двадцать восемь команд отклонены"
+        ? "PASS: все тридцать три команды отклонены"
         : "FAIL: хотя бы одна команда доступна";
 });
