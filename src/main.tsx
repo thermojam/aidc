@@ -43,6 +43,7 @@ type StreamEvent =
 type Theme = "system" | "light" | "dark";
 type Conversation = { id: number; title: string; archived: boolean; pinned: boolean; project_id: number | null };
 type Project = { id: number; title: string; archived: boolean };
+type ProjectMaterial = { id: number; name: string; version: number; size: number; sha256: string };
 
 const statusLabel: Record<string, string> = {
     interrupted: "Ответ прерван",
@@ -59,6 +60,8 @@ function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
     const [projects, setProjects] = useState<Project[]>([]);
     const [projectFilter, setProjectFilter] = useState<number | null>(null);
+    const [projectMaterials, setProjectMaterials] = useState<ProjectMaterial[]>([]);
+    const [selectedMaterialIds, setSelectedMaterialIds] = useState<number[]>([]);
     const [renameTarget, setRenameTarget] = useState<{kind: "project" | "conversation"; id: number; title: string} | null>(null);
     const [conversationSearch, setConversationSearch] = useState("");
     const [searchMatches, setSearchMatches] = useState<number[] | null>(null);
@@ -145,6 +148,21 @@ function App() {
         }, 150);
         return () => { current = false; window.clearTimeout(timer); };
     }, [conversationSearch, conversations, projectFilter]);
+
+    const conversationProjectId = conversations.find((item) => item.id === conversationId)?.project_id ?? null;
+    useEffect(() => {
+        let current = true;
+        setSelectedMaterialIds([]);
+        setContextPreview(null);
+        if (conversationProjectId === null) {
+            setProjectMaterials([]);
+            return () => { current = false; };
+        }
+        invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
+            .then((items) => { if (current) setProjectMaterials(items); })
+            .catch((reason) => { if (current) setError(String(reason)); });
+        return () => { current = false; };
+    }, [conversationProjectId]);
 
     useEffect(() => {
         refreshConversations().then((items) => {
@@ -262,6 +280,18 @@ function App() {
         } catch (reason) { setError(String(reason)); }
     }
 
+    async function addProjectMaterial() {
+        if (conversationProjectId === null) return;
+        try {
+            const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
+            if (!attachment) return;
+            const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
+            setProjectMaterials((items) => [...items.filter((item) => item.id !== material.id), material]);
+            setContextPreview(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
     async function createBackup() {
         try {
             await invoke<string>("create_backup");
@@ -358,11 +388,13 @@ function App() {
 
     async function send() {
         const value = prompt.trim();
-        if (!value || busy || !contextPreview || previewSignature !== JSON.stringify([conversationId, value, pendingAttachments.map((attachment) => attachment.id), modelId, history.active_leaf_id])) return;
+        const signature = JSON.stringify([conversationId, value, pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id]);
+        if (!value || busy || !contextPreview || previewSignature !== signature) return;
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, modelId}, value)) {
+        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId}, value)) {
             setPendingAttachments((current) => current.filter((attachment) => !ids.includes(attachment.id)));
+            setSelectedMaterialIds([]);
             setContextPreview(null);
         }
     }
@@ -427,8 +459,9 @@ function App() {
         const request = ++contextRequest.current;
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
-            const signature = JSON.stringify([conversationId, prompt.trim(), ids, modelId, history.active_leaf_id]);
-            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, modelId});
+            const materialIds = selectedMaterialIds;
+            const signature = JSON.stringify([conversationId, prompt.trim(), ids, materialIds, modelId, history.active_leaf_id]);
+            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId});
             if (request !== contextRequest.current) return;
             setContextPreview(preview);
             setPreviewSignature(signature);
@@ -668,6 +701,22 @@ function App() {
                             </div>
                         ))}
                     </div>
+                    {conversationProjectId !== null && <div className="project-materials">
+                        <div className="project-materials-heading">
+                            <strong>Материалы проекта</strong>
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void addProjectMaterial()}>Добавить материал</button>
+                        </div>
+                        {projectMaterials.map((material) => <label className="project-material" key={material.id}>
+                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
+                                   onChange={(event) => {
+                                       setSelectedMaterialIds((ids) => event.target.checked ? [...ids, material.id] : ids.filter((id) => id !== material.id));
+                                       setContextPreview(null);
+                                   }}/>
+                            <span>{material.name} · версия {material.version} · {material.size} Б · SHA-256 {material.sha256.slice(0, 12)}…</span>
+                        </label>)}
+                        {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
+                    </div>}
                     {contextPreview && <details open className="context-preview">
                         <summary>Состав запроса · {contextPreview.bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
@@ -688,7 +737,7 @@ function App() {
                                         .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
                                 </optgroup>)}
                             </select>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length >= 5}
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
                             <details className="model-details">
                                 <summary>О модели</summary>
@@ -710,7 +759,7 @@ function App() {
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), modelId, history.active_leaf_id])}>Отправить
+                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id])}>Отправить
                             </button>}
                         </div>
                     </div>

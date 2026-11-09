@@ -14,6 +14,8 @@
     "allow-rename-project",
     "allow-archive-project",
     "allow-move-conversation",
+    "allow-list-project-materials",
+    "allow-save-project-material",
     "allow-create-conversation",
     "allow-rename-conversation",
     "allow-archive-conversation",

@@ -118,6 +118,15 @@ struct ProjectSummary {
 }
 
 #[derive(Serialize)]
+struct ProjectMaterialSummary {
+    id: i64,
+    name: String,
+    version: i64,
+    size: i64,
+    sha256: String,
+}
+
+#[derive(Serialize)]
 struct ArtifactVersion {
     id: i64,
     message_id: i64,
@@ -223,7 +232,11 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0011_projects.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 10 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 10 {
+        db.execute_batch(include_str!("../migrations/0012_project_materials.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 11 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -436,6 +449,46 @@ fn list_projects_in_db(db: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
     rows.collect()
 }
 
+fn list_project_materials_in_db(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<ProjectMaterialSummary>> {
+    let mut statement = db.prepare("SELECT id, name, version, size, sha256 FROM project_materials WHERE project_id=?1 ORDER BY name, version DESC")?;
+    let rows = statement.query_map([project_id], |row| Ok(ProjectMaterialSummary {
+        id: row.get(0)?, name: row.get(1)?, version: row.get(2)?, size: row.get(3)?, sha256: row.get(4)?,
+    }))?;
+    rows.collect()
+}
+
+fn save_project_material_in_db(db: &Connection, project_id: i64, draft: &PendingAttachment) -> rusqlite::Result<ProjectMaterialSummary> {
+    let active: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1 AND archived=0)", [project_id], |row| row.get(0))?;
+    if !active { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    let version: i64 = db.query_row("SELECT coalesce(max(version), 0)+1 FROM project_materials WHERE project_id=?1 AND name=?2", params![project_id, draft.name], |row| row.get(0))?;
+    let sha256 = format!("{:x}", Sha256::digest(&draft.content));
+    db.execute("INSERT INTO project_materials(project_id,name,version,size,sha256,content) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![project_id, draft.name, version, draft.content.len() as i64, sha256, draft.content])?;
+    Ok(ProjectMaterialSummary { id: db.last_insert_rowid(), name: draft.name.clone(), version, size: draft.content.len() as i64, sha256 })
+}
+
+fn selected_project_materials(db: &Connection, conversation_id: i64, material_ids: &[i64]) -> Result<Vec<PendingAttachment>, String> {
+    if material_ids.len() > 5 || material_ids.iter().enumerate().any(|(index, id)| material_ids[..index].contains(id)) {
+        return Err("Выберите не больше пяти разных материалов".into());
+    }
+    let project_id: Option<i64> = db.query_row("SELECT project_id FROM conversations WHERE id=?1 AND archived=0", [conversation_id], |row| row.get(0))
+        .map_err(|_| "Беседа не найдена или в архиве")?;
+    let Some(project_id) = project_id else {
+        if material_ids.is_empty() { return Ok(Vec::new()); }
+        return Err("У беседы нет проекта".into());
+    };
+    let mut selected = Vec::new();
+    for id in material_ids {
+        let (name, version, content): (String, i64, Vec<u8>) = db.query_row(
+            "SELECT m.name, m.version, m.content FROM project_materials m JOIN projects p ON p.id=m.project_id WHERE m.id=?1 AND m.project_id=?2 AND p.archived=0",
+            params![id, project_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|_| "Материал не найден в проекте беседы")?;
+        let preview = decode_text(&content)?;
+        selected.push(PendingAttachment { id: -*id, name: format!("{name} · версия {version}"), mime: "text/plain".into(), content, preview });
+    }
+    Ok(selected)
+}
+
 fn create_project_in_db(db: &Connection) -> rusqlite::Result<i64> {
     db.execute("INSERT INTO projects(title) VALUES('Новый проект')", [])?;
     Ok(db.last_insert_rowid())
@@ -487,6 +540,22 @@ fn search_conversations(query: String, project_filter: Option<i64>, state: State
 fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, String> {
     let db = state.db.lock().map_err(|_| "База занята")?;
     list_projects_in_db(&db).map_err(|_| "Не удалось прочитать проекты".into())
+}
+
+#[tauri::command]
+fn list_project_materials(project_id: i64, state: State<'_, AppState>) -> Result<Vec<ProjectMaterialSummary>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    list_project_materials_in_db(&db, project_id).map_err(|_| "Не удалось прочитать материалы проекта".into())
+}
+
+#[tauri::command]
+fn save_project_material(project_id: i64, attachment_id: i64, state: State<'_, AppState>) -> Result<ProjectMaterialSummary, String> {
+    let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
+    let Some(index) = drafts.iter().position(|draft| draft.id == attachment_id) else { return Err("Выбранный файл не найден".into()); };
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let material = save_project_material_in_db(&db, project_id, &drafts[index]).map_err(|_| "Не удалось сохранить материал проекта".to_string())?;
+    drafts.remove(index);
+    Ok(material)
 }
 
 #[tauri::command]
@@ -690,7 +759,7 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64, i64, i64, i64, i64)> {
+    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> {
         Ok((
             db.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
@@ -699,6 +768,8 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
             db.query_row("SELECT count(*) FROM attachments", [], |row| row.get(0))?,
             db.query_row("SELECT coalesce(sum(size), 0) FROM attachments", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM artifact_versions", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM project_materials", [], |row| row.get(0))?,
+            db.query_row("SELECT coalesce(sum(size), 0) FROM project_materials", [], |row| row.get(0))?,
             db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
         ))
     };
@@ -712,10 +783,20 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
     let check = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_keys: i64 = check.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
-    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !conversation_links_valid(&check)? {
+    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !project_materials_valid(&check)? || !conversation_links_valid(&check)? {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
+}
+
+fn project_materials_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = db.prepare("SELECT size, sha256, content FROM project_materials")?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
+    for row in rows {
+        let (size, hash, bytes) = row?;
+        if size != bytes.len() as i64 || hash != format!("{:x}", Sha256::digest(&bytes)) { return Ok(false); }
+    }
+    Ok(true)
 }
 
 fn attachments_valid(db: &Connection) -> rusqlite::Result<bool> {
@@ -769,8 +850,10 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
         let _: i64 = source.query_row("SELECT count(*) FROM projects", [], |row| row.get(0))?;
         let _: i64 = source.query_row("SELECT count(*) FROM conversations WHERE project_id IS NOT NULL", [], |row| row.get(0))?;
     }
-    if integrity != "ok" || foreign_keys != 0 || !(1..=10).contains(&version) || conversations < 1 || invalid_pins != 0
+    if version >= 11 { let _: i64 = source.query_row("SELECT count(*) FROM project_materials", [], |row| row.get(0))?; }
+    if integrity != "ok" || foreign_keys != 0 || !(1..=11).contains(&version) || conversations < 1 || invalid_pins != 0
         || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
+        || (version >= 11 && !project_materials_valid(&source)?)
         || (version >= 8 && !conversation_links_valid(&source)?) {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -996,17 +1079,19 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
 }
 
 #[tauri::command]
-fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, model_id: String, state: State<'_, AppState>) -> Result<ContextPreview, String> {
+fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, state: State<'_, AppState>) -> Result<ContextPreview, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
     let drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
-    if attachment_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
+    if attachment_ids.len() + project_material_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
         return Err("Выбранный файл не найден".into());
     }
-    let selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).collect::<Vec<_>>();
     let db = state.db.lock().map_err(|_| "База занята")?;
     let leaf_id: Option<i64> = db.query_row("SELECT c.active_leaf_id FROM conversations c WHERE c.id=?1 AND c.archived=0 AND
         (c.active_leaf_id IS NULL OR EXISTS (SELECT 1 FROM messages m WHERE m.id=c.active_leaf_id AND m.conversation_id=c.id))", [conversation_id], |row| row.get(0)).map_err(|_| "Беседа не найдена или в архиве")?;
+    let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
+    selected.extend(selected_project_materials(&db, conversation_id, &project_material_ids)?);
+    let selected = selected.iter().collect::<Vec<_>>();
     context_for(&db, conversation_id, leaf_id, Some((prompt, &selected)), &model_id)
 }
 
@@ -1152,27 +1237,27 @@ fn run_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>, cancel
 }
 
 #[tauri::command]
-fn start_mock_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_mock_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 {
         return Err("Введите от 1 до 2000 символов".into());
     }
-    start_mock(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &model_id)
+    start_mock(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id)
 }
 
 #[tauri::command]
 fn retry_mock_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_mock(&state, on_event, conversation_id, None, Some(assistant_id), &[], &model_id)
+    start_mock(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id)
 }
 
-fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], model_id: &str) -> Result<i64, String> {
+fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str) -> Result<i64, String> {
     let mut active = state.active.lock().map_err(|e| e.to_string())?;
     if active.is_some() {
         return Err("Дождитесь завершения текущего ответа".into());
     }
     let (attempt_id, prompt) = {
         let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
-        if attachment_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
+        if attachment_ids.len() + project_material_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
             return Err("Выбранный файл не найден".into());
         }
         let mut db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1180,7 +1265,9 @@ fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conve
             create_retry_for_conversation(&mut db, conversation_id, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены".to_string())?
         } else {
             let prompt = prompt.unwrap();
-            let selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).collect::<Vec<_>>();
+            let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
+            selected.extend(selected_project_materials(&db, conversation_id, project_material_ids)?);
+            let selected = selected.iter().collect::<Vec<_>>();
             let attempt_id = create_attempt_for_conversation(&mut db, conversation_id, prompt, &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов".to_string())?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             (attempt_id, prompt.to_owned())
@@ -1309,18 +1396,18 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
 }
 
 #[tauri::command]
-fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
-    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &model_id)
+    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id)
 }
 
 #[tauri::command]
 fn retry_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &model_id)
+    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id)
 }
 
-fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], model_id: &str) -> Result<i64, String> {
+fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str) -> Result<i64, String> {
     if model_id == "local-mock" { return Err("Выберите модель SimpleClaw".into()); }
     let key = {
         let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
@@ -1330,14 +1417,16 @@ fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, con
     if active.is_some() { return Err("Дождитесь завершения текущего ответа".into()); }
     let attempt_id = {
         let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
-        if attachment_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
+        if attachment_ids.len() + project_material_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
             return Err("Выбранный файл не найден".into());
         }
         let mut db = state.db.lock().map_err(|_| "База занята")?;
         if let Some(id) = retry_id {
             create_retry_for_conversation(&mut db, conversation_id, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены")?.0
         } else {
-            let selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).collect::<Vec<_>>();
+            let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
+            selected.extend(selected_project_materials(&db, conversation_id, project_material_ids)?);
+            let selected = selected.iter().collect::<Vec<_>>();
             let attempt_id = create_attempt_for_conversation(&mut db, conversation_id, prompt.unwrap(), &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов")?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             attempt_id
@@ -1377,7 +1466,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -1707,7 +1796,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -1845,7 +1934,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
@@ -2001,6 +2090,36 @@ mod tests {
         archive_project_in_db(&restored, project_id, false).unwrap();
         move_conversation_in_db(&restored, 1, None).unwrap();
         assert!(list_conversations_in_db(&restored).unwrap()[0].project_id.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn project_material_versions_are_previewed_and_saved_immutably() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-materials-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let project_id = create_project_in_db(&db).unwrap();
+        move_conversation_in_db(&db, 1, Some(project_id)).unwrap();
+        let first = PendingAttachment { id: 1, name: "notes.md".into(), mime: "text/plain".into(), content: b"original material".to_vec(), preview: "original material".into() };
+        let v1 = save_project_material_in_db(&db, project_id, &first).unwrap();
+        let second = PendingAttachment { id: 2, name: "notes.md".into(), mime: "text/plain".into(), content: b"updated material".to_vec(), preview: "updated material".into() };
+        let v2 = save_project_material_in_db(&db, project_id, &second).unwrap();
+        assert_eq!((v1.version, v2.version), (1, 2));
+        let selected = selected_project_materials(&db, 1, &[v1.id]).unwrap();
+        assert!(selected[0].name.contains("версия 1"));
+        let attempt = create_attempt_for_conversation(&mut db, 1, "question", &[&selected[0]], "local-mock").unwrap();
+        let saved: String = db.query_row("SELECT context_json FROM attempts WHERE id=?1", [attempt], |row| row.get(0)).unwrap();
+        assert!(saved.contains("original material"));
+        assert!(saved.contains(v1.sha256.as_str()));
+        assert!(!saved.contains("updated material"));
+        assert_eq!(list_project_materials_in_db(&db, project_id).unwrap().len(), 2);
+        backup_history_to(&db, &path).unwrap();
+        let backup = Connection::open(&path).unwrap();
+        assert!(project_materials_valid(&backup).unwrap());
+        let current: String = backup.query_row("SELECT context_json FROM attempts WHERE id=?1", [attempt], |row| row.get(0)).unwrap();
+        assert_eq!(current, saved);
+        drop(backup);
         std::fs::remove_file(path).unwrap();
     }
 

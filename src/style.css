@@ -441,6 +441,29 @@ h2 {
     color: var(--text);
 }
 
+.project-materials {
+    display: grid;
+    gap: 6px;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+}
+
+.project-materials-heading, .project-material {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.project-materials-heading {
+    justify-content: space-between;
+}
+
+.project-material {
+    color: var(--muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
 .context-preview, .message details {
     min-width: 0;
     max-height: 200px;

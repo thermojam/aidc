@@ -11,6 +11,8 @@ fn main() {
                 "rename_project",
                 "archive_project",
                 "move_conversation",
+                "list_project_materials",
+                "save_project_material",
                 "create_conversation",
                 "rename_conversation",
                 "archive_conversation",
