@@ -47,10 +47,12 @@ Promise.allSettled([
     invoke("set_model_category", {modelId: "synthetic-model", category: "speed"}),
     invoke("refresh_models"),
     invoke("preview_context", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "local-mock"}),
+    invoke("get_response_style"),
+    invoke("set_response_style", {style: "concise"}),
     invoke("create_artifact", {messageId: 2, kind: "html", title: "viewer", content: "<p>test</p>"}),
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все сорок команд отклонены"
+        ? "PASS: все сорок две команды отклонены"
         : "FAIL: хотя бы одна команда доступна";
 });

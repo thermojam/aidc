@@ -40,6 +40,8 @@ fn main() {
                 "set_model_category",
                 "refresh_models",
                 "preview_context",
+                "get_response_style",
+                "set_response_style",
                 "create_artifact",
                 "export_artifact",
             ]),

@@ -11,6 +11,7 @@ type PendingAttachment = { id: number; name: string; mime: string; size: number;
 type ContextMessage = { role: string; content: string; source_message_id: number | null; attachment_ids: number[] };
 type ContextPreview = {
     model_id: string;
+    response_style: "concise" | "balanced" | "detailed";
     catalog_fetched_at: number | null;
     input_rubles_per_million: number | null;
     output_rubles_per_million: number | null;
@@ -90,6 +91,7 @@ function App() {
     const [categories, setCategories] = useState<ModelCategory[]>([]);
     const [catalogError, setCatalogError] = useState("");
     const [modelId, setModelId] = useState("local-mock");
+    const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
@@ -216,6 +218,7 @@ function App() {
         refreshProjects().catch((reason) => setError(String(reason)));
         invoke<string[]>("list_backups").then(setBackups).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog | null>("list_models").then(setCatalog).catch((reason) => setCatalogError(String(reason)));
+        invoke<ContextPreview["response_style"]>("get_response_style").then(setResponseStyle).catch((reason) => setError(String(reason)));
         invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => setCatalogError(String(reason)));
         invoke<boolean>("key_status").then(setKeySaved).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog>("refresh_models").then((result) => { setCatalog(result); setContextPreview(null); setCatalogError(""); }).catch((reason) => setCatalogError(String(reason)));
@@ -266,6 +269,14 @@ function App() {
             }
             setRenameTarget(null);
             setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function updateResponseStyle(style: ContextPreview["response_style"]) {
+        try {
+            await invoke("set_response_style", {style});
+            setResponseStyle(style);
+            setContextPreview(null);
         } catch (reason) { setError(String(reason)); }
     }
 
@@ -867,7 +878,7 @@ function App() {
                         {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
                     </div>}
                     {contextPreview && <details open className="context-preview">
-                        <summary>Состав запроса · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
+                        <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
                         <p>{contextPreview.warning}</p>
                         {contextPreview.messages.map((part, index) => <pre
@@ -977,6 +988,15 @@ function App() {
                     <label htmlFor="theme">Тема</label>
                     <select id="theme" value={theme} onChange={(event) => setTheme(event.target.value as Theme)}>
                         <option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option>
+                    </select>
+                </section>
+                <section className="settings-section" aria-labelledby="response-style-title">
+                    <h3 id="response-style-title">Стиль ответа</h3>
+                    <label htmlFor="response-style">Для следующих запросов</label>
+                    <select id="response-style" value={responseStyle} disabled={busy}
+                            onChange={(event) => void updateResponseStyle(event.target.value as ContextPreview["response_style"])}>
+                        <option value="concise">Кратко</option><option value="balanced">Сбалансированно</option>
+                        <option value="detailed">Подробно</option>
                     </select>
                 </section>
                 <section className="settings-section" aria-labelledby="data-title">

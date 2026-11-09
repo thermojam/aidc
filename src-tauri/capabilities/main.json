@@ -43,6 +43,8 @@
     "allow-set-model-category",
     "allow-refresh-models",
     "allow-preview-context",
+    "allow-get-response-style",
+    "allow-set-response-style",
     "allow-create-artifact",
     "allow-export-artifact"
   ]
