@@ -27,10 +27,12 @@ type CatalogModel = {
     input_rubles_per_million: number | null;
     output_rubles_per_million: number | null;
     protocols: string[];
-    request_rubles: number | null
+    request_rubles: number | null;
+    audio_rubles_per_minute: number | null
 };
 type ModelCatalog = { fetched_at: number; models: CatalogModel[] };
 type GeneratedImage = { model_id: string; price_rubles: number; data_url: string };
+type TranscriptionResult = { text: string };
 type ModelCategory = { model_id: string; category: string; source: string; updated_at: number };
 type History = {
     messages: Message[];
@@ -104,6 +106,16 @@ function App() {
     const [imageGenerationBusy, setImageGenerationBusy] = useState(false);
     const [imageSaved, setImageSaved] = useState(false);
     const [uncertainImageSignature, setUncertainImageSignature] = useState("");
+    const [recording, setRecording] = useState(false);
+    const [recordedAudio, setRecordedAudio] = useState<{id: string; base64: string; mime: string; seconds: number} | null>(null);
+    const [transcriptionText, setTranscriptionText] = useState("");
+    const [transcribing, setTranscribing] = useState(false);
+    const [uncertainTranscription, setUncertainTranscription] = useState("");
+    const [transcriptionModelId, setTranscriptionModelId] = useState("");
+    const recorder = useRef<MediaRecorder | null>(null);
+    const recordingStream = useRef<MediaStream | null>(null);
+    const audioChunks = useRef<Blob[]>([]);
+    const audioSize = useRef(0);
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
@@ -237,6 +249,87 @@ function App() {
             const saved = await invoke<boolean>("save_generated_image", {dataUrl: generatedImage.data_url});
             setImageSaved(saved);
         } catch (reason) { setError(String(reason)); }
+    }
+
+    async function startVoiceRecording() {
+        try {
+            if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error("Запись аудио в этом окне не поддерживается");
+            const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+            recordingStream.current = stream;
+            audioChunks.current = [];
+            audioSize.current = 0;
+            const options = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? {mimeType: "audio/webm;codecs=opus"} : {};
+            const nextRecorder = new MediaRecorder(stream, options);
+            recorder.current = nextRecorder;
+            nextRecorder.ondataavailable = (event) => {
+                if (!event.data.size) return;
+                audioSize.current += event.data.size;
+                if (audioSize.current <= 25 * 1024 * 1024) audioChunks.current.push(event.data);
+                else {
+                    setError("Запись превысила 25 МиБ и удалена. Попробуйте короче.");
+                    nextRecorder.stop();
+                }
+            };
+            nextRecorder.onstop = () => {
+                stream.getTracks().forEach((track) => track.stop());
+                recordingStream.current = null;
+                setRecording(false);
+                if (audioSize.current > 25 * 1024 * 1024) { setRecordedAudio(null); return; }
+                const seconds = Math.min(600, (Date.now() - startedAt.current) / 1000);
+                void new Blob(audioChunks.current, {type: nextRecorder.mimeType}).arrayBuffer().then((buffer) => {
+                    const bytes = new Uint8Array(buffer);
+                    let binary = "";
+                    for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+                    setRecordedAudio({id: crypto.randomUUID(), base64: btoa(binary), mime: nextRecorder.mimeType.split(";")[0] || "audio/webm", seconds});
+                });
+            };
+            startedAt.current = Date.now();
+            setRecordedAudio(null);
+            setTranscriptionText("");
+            setError("");
+            nextRecorder.start(1000);
+            setRecording(true);
+            window.setTimeout(() => { if (recorder.current === nextRecorder && nextRecorder.state === "recording") nextRecorder.stop(); }, 600_000);
+        } catch (reason) { setError(`Не удалось начать запись: ${String(reason)}`); }
+    }
+
+    const startedAt = useRef(0);
+
+    useEffect(() => () => {
+        if (recorder.current?.state === "recording") recorder.current.stop();
+        recordingStream.current?.getTracks().forEach((track) => track.stop());
+    }, []);
+
+    function stopVoiceRecording() {
+        if (recorder.current?.state === "recording") recorder.current.stop();
+    }
+
+    async function transcribeVoice() {
+        if (!recordedAudio) return;
+        const model = catalog?.models.find((item) => item.id === transcriptionModelId);
+        if (!model || model.audio_rubles_per_minute === null || !model.protocols.includes("audio_transcriptions")) return;
+        const signature = recordedAudio.id;
+        if (uncertainTranscription === signature) return;
+        const estimate = (Math.ceil(recordedAudio.seconds) + 1) / 60 * model.audio_rubles_per_minute;
+        if (!window.confirm(`Отправить запись в SimpleClaw для распознавания?\nМодель: ${model.name} (${model.id})\nДлительность записи: ${recordedAudio.seconds.toFixed(1)} с\nТариф: ${model.audio_rubles_per_minute} ₽/мин\nОценка по записи с запасом 1 с: ${estimate.toFixed(2)} ₽. Сервис считает декодированную длительность; итог может отличаться. Автоповтора не будет.`)) return;
+        setTranscribing(true);
+        setError("");
+        try {
+            const result = await invoke<TranscriptionResult>("transcribe_audio", {
+                modelId: model.id, audioBase64: recordedAudio.base64, mimeType: recordedAudio.mime,
+                durationSeconds: recordedAudio.seconds, expectedRatePerMinute: model.audio_rubles_per_minute
+            });
+            setTranscriptionText(result.text);
+        } catch (reason) {
+            const message = String(reason);
+            if (message.includes("UNKNOWN") || /TRANSCRIPTION_HTTP_5\d\d/.test(message)) {
+                setUncertainTranscription(signature);
+                setError("Результат распознавания неизвестен; запрос мог быть принят и оплачен. Автоповтора нет.");
+            } else if (message.includes("Ставка изменилась")) {
+                try { setCatalog(await invoke<ModelCatalog>("refresh_models")); setError("Тариф изменился. Обновите оценку и подтвердите отправку снова."); }
+                catch (refreshReason) { setError(`Не удалось обновить тариф: ${String(refreshReason)}`); }
+            } else setError(message);
+        } finally { setTranscribing(false); }
     }
 
     async function refreshModelCatalog() {
@@ -727,6 +820,8 @@ function App() {
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
     const selectedConversation = conversations.find((item) => item.id === conversationId);
     const imageModels = catalog?.models.filter((model) => model.protocols.includes("images_generations")) ?? [];
+    const transcriptionModels = catalog?.models.filter((model) => model.protocols.includes("audio_transcriptions") && model.audio_rubles_per_minute !== null) ?? [];
+    const selectedTranscriptionModel = transcriptionModels.find((model) => model.id === transcriptionModelId) ?? transcriptionModels[0];
     const selectedProject = projects.find((item) => item.id === projectFilter && !item.archived);
     const activeProjects = projects.filter((item) => !item.archived);
     const archivedProjects = projects.filter((item) => item.archived);
@@ -906,6 +1001,36 @@ function App() {
                         setPrompt(event.target.value);
                         setContextPreview(null);
                     }}/>
+                    <section className="voice-input" aria-label="Голосовой ввод">
+                        <div className="voice-controls">
+                            {recording ? <button type="button" className="secondary-button" onClick={stopVoiceRecording}>Остановить запись</button> :
+                                <button type="button" className="secondary-button" disabled={busy || transcribing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
+                            {recording && <span role="status">Идёт запись · максимум 10 минут</span>}
+            {recordedAudio && <span>Запись: {recordedAudio.seconds.toFixed(1)} с · {(recordedAudio.base64.length * 0.75 / 1024).toFixed(0)} КБ</span>}
+                        </div>
+                        {transcriptionModels.length > 0 && <>
+                            <div className="voice-controls">
+                                <label htmlFor="transcription-model">Распознавание</label>
+                                <select id="transcription-model" value={selectedTranscriptionModel?.id ?? ""} onChange={(event) => setTranscriptionModelId(event.target.value)}>
+                                    {transcriptionModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.audio_rubles_per_minute} ₽/мин</option>)}
+                                </select>
+                                <button type="button" className="secondary-button" disabled={!recordedAudio || transcribing || !keySaved || !selectedTranscriptionModel || uncertainTranscription === recordedAudio?.id} onClick={() => void transcribeVoice()}>
+                                    {transcribing ? "Распознавание…" : "Распознать"}
+                                </button>
+                            </div>
+                            <small>SimpleClaw · тариф из каталога от {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестной даты"}. Сначала покажем оценку и запросим подтверждение. Аудио временно хранится в памяти этого окна.</small>
+                        </>}
+                        {!transcriptionModels.length && <small>Нет моделей распознавания с опубликованным тарифом.</small>}
+                        {transcriptionText && <div className="transcription-result">
+                            <label htmlFor="transcription-text">Распознанный текст — проверьте и исправьте</label>
+                            <textarea id="transcription-text" value={transcriptionText} maxLength={2000} onChange={(event) => setTranscriptionText(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!transcriptionText.trim() || prompt.length + transcriptionText.length > 2000} onClick={() => {
+                                setPrompt((current) => current ? `${current}\n${transcriptionText.trim()}` : transcriptionText.trim());
+                                setContextPreview(null);
+                                promptField.current?.focus();
+                            }}>Вставить в сообщение</button>
+                        </div>}
+                    </section>
                     <div className="attachment-controls">
                         {pendingAttachments.map((attachment) => (
                             <div className="attachment-item" key={attachment.id}>

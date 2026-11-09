@@ -35,6 +35,8 @@ struct CatalogModel {
     protocols: Vec<String>,
     #[serde(default)]
     request_rubles: Option<f64>,
+    #[serde(default)]
+    audio_rubles_per_minute: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +44,11 @@ struct GeneratedImage {
     model_id: String,
     price_rubles: f64,
     data_url: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TranscriptionResult {
+    text: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -575,6 +582,7 @@ fn parse_catalog(bytes: &[u8], fetched_at: i64) -> Result<ModelCatalog, String> 
             output_rubles_per_million: pricing.and_then(|value| value.get("outputRublesPerMillion")).and_then(|value| value.as_f64()),
             protocols: item.get("protocols").and_then(|value| value.as_array()).map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
             request_rubles: pricing.and_then(|value| value.get("requestRubles")).and_then(json_number),
+            audio_rubles_per_minute: pricing.and_then(|value| value.get("audioRublesPerMinute")).and_then(json_number),
         });
     }
     if models.is_empty() { return Err("Каталог не содержит моделей".into()); }
@@ -699,6 +707,16 @@ fn checked_image_price(catalog: &ModelCatalog, model_id: &str, expected_price_ru
     Ok(price)
 }
 
+fn checked_transcription_rate(catalog: &ModelCatalog, model_id: &str, expected_rate: f64) -> Result<f64, String> {
+    let model = catalog.models.iter().find(|model| model.id == model_id && model.protocols.iter().any(|protocol| protocol == "audio_transcriptions"))
+        .ok_or("Эта модель сейчас недоступна для распознавания речи")?;
+    let rate = model.audio_rubles_per_minute.ok_or("Ставка распознавания неизвестна; запрос заблокирован")?;
+    if !expected_rate.is_finite() || (rate - expected_rate).abs() > 0.000_001 {
+        return Err("Ставка изменилась. Обновите каталог и проверьте сумму перед запросом.".into());
+    }
+    Ok(rate)
+}
+
 #[tauri::command]
 async fn generate_image(model_id: String, prompt: String, expected_price_rubles: f64, state: State<'_, AppState>) -> Result<GeneratedImage, String> {
     let prompt = prompt.trim();
@@ -736,6 +754,44 @@ fn save_generated_image(data_url: String, app: tauri::AppHandle) -> Result<bool,
     let path = path.into_path().map_err(|_| "Выберите локальный путь")?;
     std::fs::write(path, bytes).map_err(|_| "Не удалось сохранить изображение")?;
     Ok(true)
+}
+
+#[tauri::command]
+async fn transcribe_audio(model_id: String, audio_base64: String, mime_type: String, duration_seconds: f64,
+    expected_rate_per_minute: f64, state: State<'_, AppState>) -> Result<TranscriptionResult, String> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 || duration_seconds > 600.0 {
+        return Err("Запись должна длиться не больше 10 минут".into());
+    }
+    if audio_base64.len() > 35 * 1024 * 1024 { return Err("Аудиофайл больше 25 МиБ".into()); }
+    let bytes = BASE64.decode(audio_base64).map_err(|_| "Некорректная аудиозапись")?;
+    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 { return Err("Аудиофайл больше 25 МиБ".into()); }
+    let mime = mime_type.split(';').next().unwrap_or("");
+    let extension = match mime {
+        "audio/webm" => "webm", "audio/ogg" => "ogg", "audio/mp4" => "m4a",
+        "audio/mpeg" => "mp3", "audio/wav" => "wav",
+        _ => return Err("Формат записи не поддерживается SimpleClaw".into()),
+    };
+    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(8))
+        .read_timeout(Duration::from_secs(90)).redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|_| "HTTP_CLIENT_ERROR")?;
+    let catalog = fetch_catalog(&client, "https://simple-claw.ru/v1/models").await?;
+    checked_transcription_rate(&catalog, &model_id, expected_rate_per_minute)?;
+    let key = {
+        let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
+        key_entry(&state.key_service)?.get_password().map_err(|_| "Ключ SimpleClaw не сохранён")?
+    };
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(format!("recording.{extension}"))
+        .mime_str(mime).map_err(|_| "Некорректный формат аудио")?;
+    let form = reqwest::multipart::Form::new().text("model", model_id).part("file", part);
+    let response = client.post("https://simple-claw.ru/v1/audio/transcriptions").bearer_auth(key)
+        .multipart(form).send().await.map_err(|_| "NETWORK_RESULT_UNKNOWN")?;
+    let status = response.status();
+    if !status.is_success() { return Err(format!("TRANSCRIPTION_HTTP_{}", status.as_u16())); }
+    let body = response.bytes().await.map_err(|_| "TRANSCRIPTION_RESULT_UNKNOWN")?;
+    if body.len() > 1024 * 1024 { return Err("Ответ распознавания больше 1 МиБ".into()); }
+    let result: TranscriptionResult = serde_json::from_slice(&body).map_err(|_| "TRANSCRIPTION_RESULT_UNKNOWN")?;
+    if result.text.trim().is_empty() { return Err("В записи не распознана речь".into()); }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1969,7 +2025,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, generate_image, save_generated_image, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -2064,7 +2120,7 @@ mod tests {
         init_db(&connection).unwrap();
         let catalog = ModelCatalog { fetched_at: 100, models: vec![CatalogModel {
             id: model_id.into(), name: "Test model".into(), input_rubles_per_million: None, output_rubles_per_million: None,
-            protocols: vec!["chat_completions".into()], request_rubles: None,
+            protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None,
         }] };
         connection.execute("INSERT INTO model_catalog_snapshots(fetched_at, source, data_json) VALUES(100, 'test', ?1)",
             [serde_json::to_string(&catalog).unwrap()]).unwrap();
@@ -2106,13 +2162,13 @@ mod tests {
         init_db(&connection).unwrap();
         let catalog = ModelCatalog { fetched_at: 100, models: vec![CatalogModel {
             id: "synthetic-model".into(), name: "Synthetic".into(), input_rubles_per_million: None, output_rubles_per_million: None,
-            protocols: vec!["chat_completions".into()], request_rubles: None,
+            protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None,
         }] };
         save_catalog_if_latest(&connection, &AtomicU64::new(1), 1, &catalog).unwrap();
         set_model_category_in_db(&connection, "synthetic-model", "speed").unwrap();
         let refreshed = ModelCatalog { fetched_at: 200, models: vec![CatalogModel {
             id: "synthetic-model".into(), name: "Synthetic refreshed".into(), input_rubles_per_million: Some(1.0), output_rubles_per_million: Some(2.0),
-            protocols: vec!["chat_completions".into()], request_rubles: None,
+            protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None,
         }] };
         save_catalog_if_latest(&connection, &AtomicU64::new(2), 2, &refreshed).unwrap();
         assert_eq!(cached_catalog(&connection).unwrap().unwrap().fetched_at, 200);
@@ -2201,13 +2257,14 @@ mod tests {
 
     #[test]
     fn catalog_parses_known_prices_and_keeps_unknowns() {
-        let catalog = parse_catalog(br#"{"data":[{"id":"a","display_name":"Alpha","protocols":["chat_completions"],"pricing":{"inputRublesPerMillion":6.5,"outputRublesPerMillion":30}},{"id":"image/a","display_name":"Image A","protocols":["images_generations"],"pricing":{"requestRubles":"6.000000"}},{"id":"b"}]}"#, 42).unwrap();
+        let catalog = parse_catalog(br#"{"data":[{"id":"a","display_name":"Alpha","protocols":["chat_completions"],"pricing":{"inputRublesPerMillion":6.5,"outputRublesPerMillion":30}},{"id":"image/a","display_name":"Image A","protocols":["images_generations"],"pricing":{"requestRubles":"6.000000"}},{"id":"stt/a","display_name":"STT A","protocols":["audio_transcriptions"],"pricing":{"audioRublesPerMinute":"1.000000"}},{"id":"b"}]}"#, 42).unwrap();
         assert_eq!(catalog.fetched_at, 42);
-        assert_eq!(catalog.models.len(), 3);
+        assert_eq!(catalog.models.len(), 4);
         assert_eq!(catalog.models[0].input_rubles_per_million, Some(6.5));
         assert_eq!(catalog.models[0].protocols[0], "chat_completions");
         assert_eq!(catalog.models[1].request_rubles, Some(6.0));
-        assert_eq!(catalog.models[2].output_rubles_per_million, None);
+        assert_eq!(catalog.models[2].audio_rubles_per_minute, Some(1.0));
+        assert_eq!(catalog.models[3].output_rubles_per_million, None);
         assert!(parse_catalog(br#"{"data":[]}"#, 42).is_err());
     }
 
@@ -2215,11 +2272,11 @@ mod tests {
     fn image_generation_requires_current_protocol_and_confirmed_price() {
         let catalog = ModelCatalog { fetched_at: 42, models: vec![
             CatalogModel { id: "image/model".into(), name: "Image model".into(), input_rubles_per_million: None,
-                output_rubles_per_million: None, protocols: vec!["images_generations".into()], request_rubles: Some(6.0) },
+                output_rubles_per_million: None, protocols: vec!["images_generations".into()], request_rubles: Some(6.0), audio_rubles_per_minute: None },
             CatalogModel { id: "image/unknown-price".into(), name: "Unknown price".into(), input_rubles_per_million: None,
-                output_rubles_per_million: None, protocols: vec!["images_generations".into()], request_rubles: None },
+                output_rubles_per_million: None, protocols: vec!["images_generations".into()], request_rubles: None, audio_rubles_per_minute: None },
             CatalogModel { id: "text/model".into(), name: "Text model".into(), input_rubles_per_million: None,
-                output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: Some(6.0) },
+                output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: Some(6.0), audio_rubles_per_minute: None },
         ] };
         assert_eq!(checked_image_price(&catalog, "image/model", 6.0).unwrap(), 6.0);
         assert!(checked_image_price(&catalog, "image/model", 7.0).is_err());
@@ -2233,11 +2290,26 @@ mod tests {
     }
 
     #[test]
+    fn transcription_requires_current_protocol_and_confirmed_rate() {
+        let catalog = ModelCatalog { fetched_at: 42, models: vec![
+            CatalogModel { id: "stt/model".into(), name: "STT".into(), input_rubles_per_million: None,
+                output_rubles_per_million: None, protocols: vec!["audio_transcriptions".into()], request_rubles: None, audio_rubles_per_minute: Some(1.0) },
+            CatalogModel { id: "stt/unknown".into(), name: "Unknown".into(), input_rubles_per_million: None,
+                output_rubles_per_million: None, protocols: vec!["audio_transcriptions".into()], request_rubles: None, audio_rubles_per_minute: None },
+        ] };
+        assert_eq!(checked_transcription_rate(&catalog, "stt/model", 1.0).unwrap(), 1.0);
+        assert!(checked_transcription_rate(&catalog, "stt/model", 2.0).is_err());
+        assert!(checked_transcription_rate(&catalog, "stt/model", f64::NAN).is_err());
+        assert!(checked_transcription_rate(&catalog, "stt/unknown", 1.0).is_err());
+        assert!(checked_transcription_rate(&catalog, "chat/model", 1.0).is_err());
+    }
+
+    #[test]
     fn older_catalog_response_cannot_replace_newer_snapshot() {
         let db = Connection::open_in_memory().unwrap();
         init_db(&db).unwrap();
         let latest = AtomicU64::new(2);
-        let model = CatalogModel { id: "model-a".into(), name: "Model A".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None };
+        let model = CatalogModel { id: "model-a".into(), name: "Model A".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None };
         let newer = ModelCatalog { fetched_at: 200, models: vec![model.clone()] };
         let older = ModelCatalog { fetched_at: 100, models: vec![model] };
         save_catalog_if_latest(&db, &latest, 2, &newer).unwrap();
@@ -2254,7 +2326,7 @@ mod tests {
             let catalog = ModelCatalog { fetched_at: time, models: vec![CatalogModel {
                 id: "model-a".into(), name: "Model A".into(),
                 input_rubles_per_million: Some(price), output_rubles_per_million: None,
-                protocols: vec!["chat_completions".into()], request_rubles: None,
+                protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None,
             }] };
             db.execute("INSERT INTO model_catalog_snapshots(fetched_at, source, data_json) VALUES(?1, 'test', ?2)",
                 params![time, serde_json::to_string(&catalog).unwrap()]).unwrap();
@@ -2299,8 +2371,8 @@ mod tests {
         let mut db = Connection::open_in_memory().unwrap();
         init_db(&db).unwrap();
         let catalog = ModelCatalog { fetched_at: 100, models: vec![
-            CatalogModel { id: "gpt-6-luna".into(), name: "Vision model".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None },
-            CatalogModel { id: "text-only".into(), name: "Text model".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None },
+            CatalogModel { id: "gpt-6-luna".into(), name: "Vision model".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None },
+            CatalogModel { id: "text-only".into(), name: "Text model".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None },
         ] };
         db.execute("INSERT INTO model_catalog_snapshots(fetched_at,source,data_json) VALUES(100,'test',?1)",
             [serde_json::to_string(&catalog).unwrap()]).unwrap();

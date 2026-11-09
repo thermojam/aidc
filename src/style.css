@@ -399,6 +399,46 @@ h2 {
     font-weight: 600;
 }
 
+.voice-input {
+    display: grid;
+    gap: 6px;
+    padding: 8px 0;
+    border-top: 1px solid var(--border);
+}
+
+.voice-input small, .voice-controls > span {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.voice-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.voice-controls select {
+    max-width: min(320px, 100%);
+}
+
+.transcription-result {
+    display: grid;
+    justify-items: start;
+    gap: 6px;
+}
+
+.transcription-result textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 72px;
+    resize: vertical;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 8px;
+}
+
 .attachment-controls {
     display: grid;
     justify-items: start;

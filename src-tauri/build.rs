@@ -48,6 +48,7 @@ fn main() {
                 "deny_synthetic_step",
                 "generate_image",
                 "save_generated_image",
+                "transcribe_audio",
                 "create_artifact",
                 "export_artifact",
             ]),

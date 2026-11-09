@@ -55,10 +55,11 @@ Promise.allSettled([
     invoke("deny_synthetic_step", {taskId: 1, stepId: 1}),
     invoke("generate_image", {modelId: "image-model", prompt: "viewer must fail", expectedPriceRubles: 6}),
     invoke("save_generated_image", {dataUrl: "invalid"}),
+    invoke("transcribe_audio", {modelId: "stt-model", audioBase64: "", mimeType: "audio/webm", durationSeconds: 1, expectedRatePerMinute: 1}),
     invoke("create_artifact", {messageId: 2, kind: "html", title: "viewer", content: "<p>test</p>"}),
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все сорок восемь команд отклонены"
+        ? "PASS: все сорок девять команд отклонены"
         : "FAIL: хотя бы одна команда доступна";
 });
