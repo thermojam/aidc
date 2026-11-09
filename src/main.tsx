@@ -96,10 +96,16 @@ function App() {
     const [previewSignature, setPreviewSignature] = useState("");
     const [selectedArtifactId, setSelectedArtifactId] = useState<number | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [paletteOpen, setPaletteOpen] = useState(false);
+    const [paletteQuery, setPaletteQuery] = useState("");
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const settingsButton = useRef<HTMLButtonElement>(null);
     const compactSettingsButton = useRef<HTMLButtonElement>(null);
     const settingsDialog = useRef<HTMLDialogElement>(null);
+    const paletteDialog = useRef<HTMLDialogElement>(null);
+    const paletteInput = useRef<HTMLInputElement>(null);
+    const paletteTrigger = useRef<HTMLElement | null>(null);
+    const chatSearchField = useRef<HTMLInputElement>(null);
     const artifactTrigger = useRef<HTMLElement | null>(null);
     const promptField = useRef<HTMLTextAreaElement>(null);
     const historyRequest = useRef(0);
@@ -118,6 +124,33 @@ function App() {
         if (settingsOpen) settingsDialog.current?.showModal();
         else settingsDialog.current?.close();
     }, [settingsOpen]);
+
+    useEffect(() => {
+        if (paletteOpen) {
+            paletteDialog.current?.showModal();
+            paletteInput.current?.focus();
+        } else paletteDialog.current?.close();
+    }, [paletteOpen]);
+
+    useEffect(() => {
+        function onShortcut(event: KeyboardEvent) {
+            const target = event.target;
+            const typing = target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+            if (typing || paletteOpen || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
+            event.preventDefault();
+            paletteTrigger.current = target instanceof HTMLElement ? target : null;
+            setPaletteQuery("");
+            setPaletteOpen(true);
+        }
+        window.addEventListener("keydown", onShortcut);
+        return () => window.removeEventListener("keydown", onShortcut);
+    }, [paletteOpen]);
+
+    function closePalette() {
+        if (paletteDialog.current?.open) paletteDialog.current.close();
+        setPaletteOpen(false);
+        requestAnimationFrame(() => (paletteTrigger.current?.isConnected ? paletteTrigger.current : promptField.current)?.focus());
+    }
 
     function closeSettings() {
         setSettingsOpen(false);
@@ -562,6 +595,38 @@ function App() {
         requestAnimationFrame(() => (artifactTrigger.current?.isConnected ? artifactTrigger.current : promptField.current)?.focus());
     }
 
+    function runPaletteCommand(command: string) {
+        closePalette();
+        if (command === "new") {
+            void createConversation();
+            requestAnimationFrame(() => promptField.current?.focus());
+        } else if (command === "search") {
+            setSidebarOpen(true);
+            requestAnimationFrame(() => chatSearchField.current?.focus());
+        } else if (command === "settings") {
+            setSidebarOpen(false);
+            setSettingsOpen(true);
+        } else if (command === "attach") {
+            requestAnimationFrame(() => void pickAttachment());
+        } else if (command === "attach-image") {
+            requestAnimationFrame(() => void pickImageAttachment());
+        } else if (command === "artifact") {
+            const latest = history.artifacts.at(-1);
+            if (!latest) { setError("В этой беседе пока нет результатов."); return; }
+            artifactTrigger.current = promptField.current;
+            setSelectedArtifactId(latest.id);
+        }
+    }
+
+    const paletteCommands = [
+        {id: "new", label: "Новая беседа"},
+        {id: "search", label: "Найти беседу"},
+        {id: "settings", label: "Настройки"},
+        {id: "attach", label: "Прикрепить текстовый файл"},
+        {id: "attach-image", label: "Прикрепить изображение"},
+        {id: "artifact", label: "Открыть последний результат"},
+    ].filter((command) => command.label.toLocaleLowerCase().includes(paletteQuery.trim().toLocaleLowerCase()));
+
     const byId = new Map(history.messages.map((message) => [message.id, message]));
     const activeIds = new Set<number>();
     for (let id = history.active_leaf_id; id !== null;) {
@@ -627,7 +692,7 @@ function App() {
                 <div className="sidebar-label">Беседы</div>
                 <button type="button" className="secondary-button new-chat" disabled={busy}
                         onClick={() => void createConversation()}>Новая беседа</button>
-                <input className="chat-search" type="search" aria-label="Поиск бесед" placeholder="Поиск бесед"
+                <input ref={chatSearchField} className="chat-search" type="search" aria-label="Поиск бесед" placeholder="Поиск бесед"
                        maxLength={100} value={conversationSearch} onChange={(event) => setConversationSearch(event.target.value)}/>
                 <div className="sidebar-chats">
                     {shownConversations.length === 0 && <p className="sidebar-empty">Ничего не найдено</p>}
@@ -861,6 +926,36 @@ function App() {
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}
                                                  onExport={(id) => void exportArtifact(id)} onError={setError}/>}
+            <dialog ref={paletteDialog} className="command-palette" aria-labelledby="command-palette-title"
+                    onCancel={(event) => { event.preventDefault(); closePalette(); }}>
+                <h2 id="command-palette-title">Команды</h2>
+                <input ref={paletteInput} type="search" aria-label="Поиск команд" placeholder="Введите команду…"
+                       value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)}
+                       onKeyDown={(event) => {
+                           const buttons = paletteDialog.current?.querySelectorAll<HTMLButtonElement>(".command-list button");
+                           if (event.key === "ArrowDown" && buttons?.length) { event.preventDefault(); buttons[0].focus(); }
+                           else if (event.key === "Enter" && paletteCommands.length === 1) { event.preventDefault(); runPaletteCommand(paletteCommands[0].id); }
+                       }}/>
+                <div className="command-list">
+                    {paletteCommands.map((command) => <button key={command.id} type="button" className="secondary-button"
+                        disabled={busy && ["new", "attach", "attach-image"].includes(command.id)}
+                        onKeyDown={(event) => {
+                            const buttons = Array.from(event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+                            const index = buttons.indexOf(event.currentTarget);
+                            if (event.key === "ArrowDown") {
+                                event.preventDefault();
+                                buttons[(index + 1) % buttons.length]?.focus();
+                            } else if (event.key === "ArrowUp") {
+                                event.preventDefault();
+                                if (index === 0) paletteInput.current?.focus();
+                                else buttons[index - 1]?.focus();
+                            }
+                        }}
+                        onClick={() => runPaletteCommand(command.id)}>{command.label}</button>)}
+                    {!paletteCommands.length && <p>Команды не найдены.</p>}
+                </div>
+                <p className="palette-hint">↑ ↓ выбрать · Enter открыть · Esc закрыть · ⌘K / Ctrl+K</p>
+            </dialog>
             <dialog ref={settingsDialog} className="settings-dialog" aria-labelledby="settings-title"
                     onCancel={(event) => { event.preventDefault(); closeSettings(); }}>
                 <header className="settings-header"><h2 id="settings-title">Настройки</h2>

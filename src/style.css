@@ -615,6 +615,48 @@ textarea::placeholder {
     background: rgba(0, 0, 0, .45);
 }
 
+.command-palette {
+    width: min(520px, calc(100% - 32px));
+    max-height: calc(100% - 32px);
+    padding: 16px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+}
+
+.command-palette::backdrop {
+    background: rgba(0, 0, 0, .45);
+}
+
+.command-palette h2, .command-palette p {
+    margin: 0 0 12px;
+}
+
+.command-palette input {
+    width: 100%;
+    padding: 10px;
+    color: var(--text);
+    background: var(--background);
+    border: 1px solid var(--border);
+}
+
+.command-list {
+    display: grid;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.command-list button {
+    width: 100%;
+    text-align: left;
+}
+
+.palette-hint {
+    margin: 12px 0 0 !important;
+    color: var(--muted);
+    font-size: 12px;
+}
+
 .settings-header {
     display: flex;
     align-items: center;
