@@ -759,9 +759,13 @@ function App() {
         }
     }
 
+    function contextSignature() {
+        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false]);
+    }
+
     async function send() {
         const value = prompt.trim();
-        const signature = JSON.stringify([conversationId, value, pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false]);
+        const signature = contextSignature();
         if (!value || busy || !contextPreview || previewSignature !== signature) return;
         const tools = conversationProjectId !== null && projectFolderView ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
         if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
@@ -883,7 +887,7 @@ function App() {
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
             const materialIds = selectedMaterialIds;
-            const signature = JSON.stringify([conversationId, prompt.trim(), ids, materialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false]);
+            const signature = contextSignature();
             const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId, agentMode});
             if (request !== contextRequest.current) return;
             setContextPreview(preview);

@@ -2583,6 +2583,7 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
             .build().map_err(|_| "HTTP_CLIENT_ERROR")?;
         let mut payload = payload;
         let mut total_usage = None;
+        let mut seq = 0;
         for turn in 0..=1 {
             if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
             let mut response = client.post(url).bearer_auth(&key).json(&payload)
@@ -2609,7 +2610,6 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
                     .unwrap_or_else(|| format!("HTTP_{status_code}")));
             }
             let mut parser = SseParser::default();
-            let mut seq = 0;
             let mut total = 0usize;
             let mut calls = PendingToolCalls { calls: BTreeMap::new(), usage: total_usage.take() };
             let mut last_data = std::time::Instant::now();
@@ -2647,8 +2647,8 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
                     Err(code) => { status = "failed"; return Err(code); }
                 },
                 "search_project" if project_search_enabled => {
-                    let arguments: serde_json::Value = serde_json::from_str(&call.arguments).map_err(|_| "INVALID_TOOL_ARGUMENTS")?;
-                    let query = arguments.get("query").and_then(serde_json::Value::as_str).ok_or("INVALID_TOOL_ARGUMENTS")?;
+                    let arguments: serde_json::Value = serde_json::from_str(&call.arguments).map_err(|_| { status = "failed"; "INVALID_TOOL_ARGUMENTS" })?;
+                    let query = arguments.get("query").and_then(serde_json::Value::as_str).ok_or_else(|| { status = "failed"; "INVALID_TOOL_ARGUMENTS" })?;
                     let (files_read, sources) = {
                         let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
                         let conversation_id: i64 = connection.query_row("SELECT conversation_id FROM attempts WHERE id=?1", [attempt_id], |row| row.get(0)).map_err(|_| "DATABASE_ERROR")?;
@@ -3065,7 +3065,7 @@ mod tests {
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
-        let first = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-search\",\"type\":\"function\",\"function\":{\"name\":\"search_project\",\"arguments\":\"{\\\"query\\\":\\\"release date\\\"}\"}}]}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\ndata: [DONE]\n\n";
+        let first = "data: {\"choices\":[{\"delta\":{\"content\":\"Checking. \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-search\",\"type\":\"function\",\"function\":{\"name\":\"search_project\",\"arguments\":\"{\\\"query\\\":\\\"release date\\\"}\"}}]}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\ndata: [DONE]\n\n";
         let second = "data: {\"choices\":[{\"delta\":{\"content\":\"The release date is 2030-01-02.\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":8,\"total_tokens\":28}}\n\ndata: [DONE]\n\n";
         let server = std::thread::spawn(move || {
             for (turn, body) in [first, second].into_iter().enumerate() {
@@ -3085,11 +3085,11 @@ mod tests {
             VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, Channel::new(|_| Ok(()))));
         server.join().unwrap();
         let connection = db.lock().unwrap();
-        let (content, status, usage): (String, String, String) = connection.query_row(
-            "SELECT m.content,a.status,a.usage_json FROM messages m JOIN attempts a ON a.assistant_id=m.id WHERE a.id=?1", [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        let (content, status, usage, last_seq): (String, String, String, i64) = connection.query_row(
+            "SELECT m.content,a.status,a.usage_json,a.last_seq FROM messages m JOIN attempts a ON a.assistant_id=m.id WHERE a.id=?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
-        assert_eq!((content.as_str(), status.as_str()), ("The release date is 2030-01-02.", "completed"));
+        assert_eq!((content.as_str(), status.as_str(), last_seq), ("Checking. The release date is 2030-01-02.", "completed", 2));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&usage).unwrap()["total_tokens"], 42);
         let sources: String = connection.query_row("SELECT context_json FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
         let context: ContextPreview = serde_json::from_str(&sources).unwrap();
@@ -3097,6 +3097,26 @@ mod tests {
         assert_eq!(context.agent_sources[0].excerpt, "The release date is 2030-01-02.");
         drop(connection);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_agent_search_arguments_fail_attempt() {
+        let (db, id) = http_attempt_for(VERIFIED_TOOL_MODEL_ID);
+        {
+            let connection = db.lock().unwrap();
+            let project_id = create_project_in_db(&connection).unwrap();
+            move_conversation_in_db(&connection, 1, Some(project_id)).unwrap();
+            connection.execute("INSERT INTO project_folders(project_id,path) VALUES(?1,?2)",
+                params![project_id, std::env::temp_dir().canonicalize().unwrap().to_str().unwrap()]).unwrap();
+        }
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-search\",\"type\":\"function\",\"function\":{\"name\":\"search_project\",\"arguments\":\"{\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let (url, server) = local_response("200 OK", body);
+        tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
+            VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, Channel::new(|_| Ok(()))));
+        server.join().unwrap();
+        let result: (String, Option<String>) = db.lock().unwrap().query_row(
+            "SELECT status,error_code FROM attempts WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(result, ("failed".into(), Some("INVALID_TOOL_ARGUMENTS".into())));
     }
 
     #[cfg(target_os = "macos")]
