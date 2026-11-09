@@ -25,9 +25,12 @@ type CatalogModel = {
     id: string;
     name: string;
     input_rubles_per_million: number | null;
-    output_rubles_per_million: number | null
+    output_rubles_per_million: number | null;
+    protocols: string[];
+    request_rubles: number | null
 };
 type ModelCatalog = { fetched_at: number; models: CatalogModel[] };
+type GeneratedImage = { model_id: string; price_rubles: number; data_url: string };
 type ModelCategory = { model_id: string; category: string; source: string; updated_at: number };
 type History = {
     messages: Message[];
@@ -95,6 +98,12 @@ function App() {
     const [modelId, setModelId] = useState("local-mock");
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
     const [syntheticTasks, setSyntheticTasks] = useState<SyntheticTask[]>([]);
+    const [imagePrompt, setImagePrompt] = useState("");
+    const [imageModelId, setImageModelId] = useState("");
+    const [generatedImage, setGeneratedImage] = useState<GeneratedImage | null>(null);
+    const [imageGenerationBusy, setImageGenerationBusy] = useState(false);
+    const [imageSaved, setImageSaved] = useState(false);
+    const [uncertainImageSignature, setUncertainImageSignature] = useState("");
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
@@ -190,6 +199,52 @@ function App() {
             await invoke(decision === "approve" ? "approve_synthetic_step" : "deny_synthetic_step", {taskId, stepId});
             await refreshSyntheticTasks();
         } catch (reason) { setError(String(reason)); }
+    }
+
+    async function generateImage() {
+        const selectedImageModelId = imageModelId || imageModels[0]?.id || "";
+        const model = catalog?.models.find((item) => item.id === selectedImageModelId);
+        if (!model || !model.protocols.includes("images_generations") || model.request_rubles === null) return;
+        const signature = JSON.stringify([selectedImageModelId, imagePrompt.trim()]);
+        if (uncertainImageSignature === signature) return;
+        if (!window.confirm(`Отправить запрос в SimpleClaw?\nМодель: ${model.name} (${model.id})\nЦена: ${model.request_rubles} ₽ за успешный запрос. Автоповтора не будет.`)) return;
+        setImageGenerationBusy(true);
+        setGeneratedImage(null);
+        setImageSaved(false);
+        setError("");
+        try {
+            setGeneratedImage(await invoke<GeneratedImage>("generate_image", {
+                modelId: selectedImageModelId, prompt: imagePrompt, expectedPriceRubles: model.request_rubles
+            }));
+        } catch (reason) {
+            const message = String(reason);
+            if (message.includes("NETWORK_RESULT_UNKNOWN") || message.includes("GENERATION_RESULT_UNKNOWN") || /GENERATION_HTTP_5\d\d/.test(message)) {
+                setUncertainImageSignature(signature);
+                setError("Результат генерации неизвестен; запрос мог быть принят и оплачен. Для продолжения измените описание или модель, чтобы не повторить тот же запрос.");
+            } else if (message.includes("Цена изменилась")) {
+                try {
+                    setCatalog(await invoke<ModelCatalog>("refresh_models"));
+                    setError("Цена каталога изменилась. Проверьте новую сумму, затем подтвердите запрос ещё раз.");
+                } catch (refreshReason) { setError(`Не удалось обновить цену: ${String(refreshReason)}`); }
+            } else setError(message);
+        }
+        finally { setImageGenerationBusy(false); }
+    }
+
+    async function saveGeneratedImage() {
+        if (!generatedImage) return;
+        try {
+            const saved = await invoke<boolean>("save_generated_image", {dataUrl: generatedImage.data_url});
+            setImageSaved(saved);
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function refreshModelCatalog() {
+        setCatalogError("");
+        try {
+            setCatalog(await invoke<ModelCatalog>("refresh_models"));
+            setContextPreview(null);
+        } catch (reason) { setCatalogError(String(reason)); }
     }
 
     async function refreshProjects() {
@@ -671,6 +726,7 @@ function App() {
     const visible = history.messages.filter((message) => activeIds.has(message.id) && (!busy || message.status !== "streaming"));
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
     const selectedConversation = conversations.find((item) => item.id === conversationId);
+    const imageModels = catalog?.models.filter((model) => model.protocols.includes("images_generations")) ?? [];
     const selectedProject = projects.find((item) => item.id === projectFilter && !item.archived);
     const activeProjects = projects.filter((item) => !item.archived);
     const archivedProjects = projects.filter((item) => item.archived);
@@ -915,7 +971,8 @@ function App() {
                             }}>
                                 <option value="local-mock">Локальный тест</option>
                                 {categoryOrder.map((category) => <optgroup key={category} label={categoryLabel[category]}>
-                                    {catalog?.models.filter((model) => (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
+                                    {catalog?.models.filter((model) => (!model.protocols.length || model.protocols.includes("chat_completions"))
+                                        && (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
                                         .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
                                 </optgroup>)}
                             </select>
@@ -970,6 +1027,35 @@ function App() {
                             </div>}
                         </div>)}
                     </article>)}
+                </details>
+                <details className="image-generation-panel">
+                    <summary>Генерация изображения</summary>
+                    <p>Поставщик: SimpleClaw. Один запрос создаёт одно изображение. Перед каждым платным запросом потребуется подтверждение.</p>
+                    <label htmlFor="image-generation-model">Модель</label>
+                    <select id="image-generation-model" value={imageModelId || imageModels[0]?.id || ""} disabled={imageGenerationBusy}
+                            onChange={(event) => setImageModelId(event.target.value)}>
+                        {imageModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
+                    </select>
+                    {imageModels.length > 0 && <p>Цена: {imageModels.find((model) => model.id === (imageModelId || imageModels[0]?.id))?.request_rubles == null
+                        ? "неизвестна — запрос заблокирован"
+                        : `${imageModels.find((model) => model.id === (imageModelId || imageModels[0]?.id))?.request_rubles} ₽ за успешный запрос`}.
+                        Источник и дата: <a href="https://simple-claw.ru/v1/models" target="_blank" rel="noreferrer">публичный каталог моделей</a>, {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестны"}.
+                    </p>}
+                    <button type="button" className="secondary-button" disabled={imageGenerationBusy} onClick={() => void refreshModelCatalog()}>Обновить каталог и цену</button>
+                    {!imageModels.length && <p>В сохранённом каталоге нет подтверждённых моделей генерации.</p>}
+                    <label htmlFor="image-generation-prompt">Описание изображения</label>
+                    <textarea id="image-generation-prompt" maxLength={32_000} value={imagePrompt} disabled={imageGenerationBusy}
+                              onChange={(event) => setImagePrompt(event.target.value)} placeholder="Опишите изображение"/>
+                    <button type="button" disabled={imageGenerationBusy || !imagePrompt.trim() || uncertainImageSignature === JSON.stringify([imageModelId || imageModels[0]?.id || "", imagePrompt.trim()]) || !imageModels.some((model) => model.id === (imageModelId || imageModels[0]?.id) && model.request_rubles !== null)}
+                            onClick={() => void generateImage()}>{imageGenerationBusy ? "Запрос выполняется…" : "Проверить цену и сгенерировать"}</button>
+                    {uncertainImageSignature === JSON.stringify([imageModelId || imageModels[0]?.id || "", imagePrompt.trim()]) && <p role="alert">Результат предыдущего запроса неизвестен; повтор этого же запроса заблокирован.</p>}
+                    {generatedImage && <div className="generated-image-result">
+                        <img src={generatedImage.data_url} alt={`Результат ${generatedImage.model_id}`}/>
+                        <p>{generatedImage.model_id} · {generatedImage.price_rubles} ₽ за успешный запрос</p>
+                        <button type="button" className="secondary-button" onClick={() => void saveGeneratedImage()}>
+                            {imageSaved ? "Файл сохранён" : "Сохранить PNG…"}
+                        </button>
+                    </div>}
                 </details>
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}

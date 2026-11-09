@@ -46,6 +46,8 @@ fn main() {
                 "list_synthetic_tasks",
                 "approve_synthetic_step",
                 "deny_synthetic_step",
+                "generate_image",
+                "save_generated_image",
                 "create_artifact",
                 "export_artifact",
             ]),

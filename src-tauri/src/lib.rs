@@ -31,6 +31,17 @@ struct CatalogModel {
     name: String,
     input_rubles_per_million: Option<f64>,
     output_rubles_per_million: Option<f64>,
+    #[serde(default)]
+    protocols: Vec<String>,
+    #[serde(default)]
+    request_rubles: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct GeneratedImage {
+    model_id: String,
+    price_rubles: f64,
+    data_url: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -562,10 +573,16 @@ fn parse_catalog(bytes: &[u8], fetched_at: i64) -> Result<ModelCatalog, String> 
             name: item.get("display_name").and_then(|value| value.as_str()).unwrap_or(id).to_owned(),
             input_rubles_per_million: pricing.and_then(|value| value.get("inputRublesPerMillion")).and_then(|value| value.as_f64()),
             output_rubles_per_million: pricing.and_then(|value| value.get("outputRublesPerMillion")).and_then(|value| value.as_f64()),
+            protocols: item.get("protocols").and_then(|value| value.as_array()).map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+            request_rubles: pricing.and_then(|value| value.get("requestRubles")).and_then(json_number),
         });
     }
     if models.is_empty() { return Err("Каталог не содержит моделей".into()); }
     Ok(ModelCatalog { fetched_at, models })
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 fn cached_catalog(db: &Connection) -> rusqlite::Result<Option<ModelCatalog>> {
@@ -653,6 +670,72 @@ async fn fetch_catalog(client: &reqwest::Client, url: &str) -> Result<ModelCatal
     let fetched_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "Не удалось определить время каталога")?.as_secs() as i64;
     parse_catalog(&bytes, fetched_at)
+}
+
+fn validate_generated_png(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 { return Err("Результат больше 25 МиБ".into()); }
+    let reader = ImageReader::with_format(std::io::Cursor::new(bytes), ImageFormat::Png);
+    let (width, height) = reader.into_dimensions().map_err(|_| "Сервис вернул некорректное изображение")?;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || u64::from(width) * u64::from(height) > 16_000_000 {
+        return Err("Размер результата превышает предел 16 мегапикселей".into());
+    }
+    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), ImageFormat::Png);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(|_| "Сервис вернул повреждённое изображение")?;
+    Ok(())
+}
+
+fn checked_image_price(catalog: &ModelCatalog, model_id: &str, expected_price_rubles: f64) -> Result<f64, String> {
+    let model = catalog.models.iter().find(|model| model.id == model_id && model.protocols.iter().any(|protocol| protocol == "images_generations"))
+        .ok_or("Эта модель сейчас недоступна для генерации изображений")?;
+    let price = model.request_rubles.ok_or("Цена запроса неизвестна; генерация заблокирована")?;
+    if !expected_price_rubles.is_finite() || (expected_price_rubles - price).abs() > 0.000_001 {
+        return Err("Цена изменилась. Проверьте обновлённую сумму перед запросом.".into());
+    }
+    Ok(price)
+}
+
+#[tauri::command]
+async fn generate_image(model_id: String, prompt: String, expected_price_rubles: f64, state: State<'_, AppState>) -> Result<GeneratedImage, String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() || prompt.chars().count() > 32_000 { return Err("Введите описание до 32000 символов".into()); }
+    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(8))
+        .read_timeout(Duration::from_secs(90)).redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|_| "HTTP_CLIENT_ERROR")?;
+    let catalog = fetch_catalog(&client, "https://simple-claw.ru/v1/models").await?;
+    let price = checked_image_price(&catalog, &model_id, expected_price_rubles)?;
+    let key = {
+        let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
+        key_entry(&state.key_service)?.get_password().map_err(|_| "Ключ SimpleClaw не сохранён")?
+    };
+    let response = client.post("https://simple-claw.ru/v1/images/generations").bearer_auth(key)
+        .json(&serde_json::json!({"model": model_id, "prompt": prompt, "n": 1, "size": "1024x1024", "quality": "low", "response_format": "b64_json", "output_format": "png"}))
+        .send().await.map_err(|_| "NETWORK_RESULT_UNKNOWN")?;
+    let status = response.status();
+    if !status.is_success() { return Err(format!("GENERATION_HTTP_{}", status.as_u16())); }
+    let body = response.bytes().await.map_err(|_| "GENERATION_RESULT_UNKNOWN")?;
+    if body.len() > 35 * 1024 * 1024 { return Err("Ответ сервиса больше 35 МиБ".into()); }
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| "GENERATION_RESULT_UNKNOWN")?;
+    let encoded = value.pointer("/data/0/b64_json").and_then(|value| value.as_str()).ok_or("Сервис не вернул встроенный PNG")?;
+    let bytes = BASE64.decode(encoded).map_err(|_| "Сервис вернул некорректный PNG")?;
+    validate_generated_png(&bytes)?;
+    Ok(GeneratedImage { model_id, price_rubles: price, data_url: format!("data:image/png;base64,{encoded}") })
+}
+
+#[tauri::command]
+fn save_generated_image(data_url: String, app: tauri::AppHandle) -> Result<bool, String> {
+    let encoded = data_url.strip_prefix("data:image/png;base64,").ok_or("Некорректное изображение")?;
+    if encoded.len() > 35 * 1024 * 1024 { return Err("Изображение больше допустимого размера".into()); }
+    let bytes = BASE64.decode(encoded).map_err(|_| "Некорректное изображение")?;
+    validate_generated_png(&bytes)?;
+    let Some(path) = app.dialog().file().set_file_name("generated-image.png").blocking_save_file() else { return Ok(false); };
+    let path = path.into_path().map_err(|_| "Выберите локальный путь")?;
+    std::fs::write(path, bytes).map_err(|_| "Не удалось сохранить изображение")?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1412,6 +1495,9 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
         Some(catalog.as_ref().and_then(|catalog| catalog.models.iter().find(|model| model.id == model_id))
             .ok_or("Модель отсутствует в сохранённом каталоге")?)
     };
+    if model.is_some_and(|model| !model.protocols.is_empty() && !model.protocols.iter().any(|protocol| protocol == "chat_completions")) {
+        return Err("Модель недоступна для текстового чата".into());
+    }
     let mut statement = db.prepare(
         "WITH RECURSIVE path(id, parent_id, role, content, status, depth) AS (
            SELECT id, parent_id, role, content, status, 0 FROM messages WHERE id=?1 AND conversation_id=?2
@@ -1883,7 +1969,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, generate_image, save_generated_image, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -1978,6 +2064,7 @@ mod tests {
         init_db(&connection).unwrap();
         let catalog = ModelCatalog { fetched_at: 100, models: vec![CatalogModel {
             id: model_id.into(), name: "Test model".into(), input_rubles_per_million: None, output_rubles_per_million: None,
+            protocols: vec!["chat_completions".into()], request_rubles: None,
         }] };
         connection.execute("INSERT INTO model_catalog_snapshots(fetched_at, source, data_json) VALUES(100, 'test', ?1)",
             [serde_json::to_string(&catalog).unwrap()]).unwrap();
@@ -2019,11 +2106,13 @@ mod tests {
         init_db(&connection).unwrap();
         let catalog = ModelCatalog { fetched_at: 100, models: vec![CatalogModel {
             id: "synthetic-model".into(), name: "Synthetic".into(), input_rubles_per_million: None, output_rubles_per_million: None,
+            protocols: vec!["chat_completions".into()], request_rubles: None,
         }] };
         save_catalog_if_latest(&connection, &AtomicU64::new(1), 1, &catalog).unwrap();
         set_model_category_in_db(&connection, "synthetic-model", "speed").unwrap();
         let refreshed = ModelCatalog { fetched_at: 200, models: vec![CatalogModel {
             id: "synthetic-model".into(), name: "Synthetic refreshed".into(), input_rubles_per_million: Some(1.0), output_rubles_per_million: Some(2.0),
+            protocols: vec!["chat_completions".into()], request_rubles: None,
         }] };
         save_catalog_if_latest(&connection, &AtomicU64::new(2), 2, &refreshed).unwrap();
         assert_eq!(cached_catalog(&connection).unwrap().unwrap().fetched_at, 200);
@@ -2112,12 +2201,35 @@ mod tests {
 
     #[test]
     fn catalog_parses_known_prices_and_keeps_unknowns() {
-        let catalog = parse_catalog(br#"{"data":[{"id":"a","display_name":"Alpha","pricing":{"inputRublesPerMillion":6.5,"outputRublesPerMillion":30}},{"id":"b"}]}"#, 42).unwrap();
+        let catalog = parse_catalog(br#"{"data":[{"id":"a","display_name":"Alpha","protocols":["chat_completions"],"pricing":{"inputRublesPerMillion":6.5,"outputRublesPerMillion":30}},{"id":"image/a","display_name":"Image A","protocols":["images_generations"],"pricing":{"requestRubles":"6.000000"}},{"id":"b"}]}"#, 42).unwrap();
         assert_eq!(catalog.fetched_at, 42);
-        assert_eq!(catalog.models.len(), 2);
+        assert_eq!(catalog.models.len(), 3);
         assert_eq!(catalog.models[0].input_rubles_per_million, Some(6.5));
-        assert_eq!(catalog.models[1].output_rubles_per_million, None);
+        assert_eq!(catalog.models[0].protocols[0], "chat_completions");
+        assert_eq!(catalog.models[1].request_rubles, Some(6.0));
+        assert_eq!(catalog.models[2].output_rubles_per_million, None);
         assert!(parse_catalog(br#"{"data":[]}"#, 42).is_err());
+    }
+
+    #[test]
+    fn image_generation_requires_current_protocol_and_confirmed_price() {
+        let catalog = ModelCatalog { fetched_at: 42, models: vec![
+            CatalogModel { id: "image/model".into(), name: "Image model".into(), input_rubles_per_million: None,
+                output_rubles_per_million: None, protocols: vec!["images_generations".into()], request_rubles: Some(6.0) },
+            CatalogModel { id: "image/unknown-price".into(), name: "Unknown price".into(), input_rubles_per_million: None,
+                output_rubles_per_million: None, protocols: vec!["images_generations".into()], request_rubles: None },
+            CatalogModel { id: "text/model".into(), name: "Text model".into(), input_rubles_per_million: None,
+                output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: Some(6.0) },
+        ] };
+        assert_eq!(checked_image_price(&catalog, "image/model", 6.0).unwrap(), 6.0);
+        assert!(checked_image_price(&catalog, "image/model", 7.0).is_err());
+        assert!(checked_image_price(&catalog, "image/unknown-price", 6.0).is_err());
+        assert!(checked_image_price(&catalog, "text/model", 6.0).is_err());
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png).write_image(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8).unwrap();
+        validate_generated_png(&png).unwrap();
+        assert!(validate_generated_png(b"not a png").is_err());
     }
 
     #[test]
@@ -2125,7 +2237,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         init_db(&db).unwrap();
         let latest = AtomicU64::new(2);
-        let model = CatalogModel { id: "model-a".into(), name: "Model A".into(), input_rubles_per_million: None, output_rubles_per_million: None };
+        let model = CatalogModel { id: "model-a".into(), name: "Model A".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None };
         let newer = ModelCatalog { fetched_at: 200, models: vec![model.clone()] };
         let older = ModelCatalog { fetched_at: 100, models: vec![model] };
         save_catalog_if_latest(&db, &latest, 2, &newer).unwrap();
@@ -2142,6 +2254,7 @@ mod tests {
             let catalog = ModelCatalog { fetched_at: time, models: vec![CatalogModel {
                 id: "model-a".into(), name: "Model A".into(),
                 input_rubles_per_million: Some(price), output_rubles_per_million: None,
+                protocols: vec!["chat_completions".into()], request_rubles: None,
             }] };
             db.execute("INSERT INTO model_catalog_snapshots(fetched_at, source, data_json) VALUES(?1, 'test', ?2)",
                 params![time, serde_json::to_string(&catalog).unwrap()]).unwrap();
@@ -2186,8 +2299,8 @@ mod tests {
         let mut db = Connection::open_in_memory().unwrap();
         init_db(&db).unwrap();
         let catalog = ModelCatalog { fetched_at: 100, models: vec![
-            CatalogModel { id: "gpt-6-luna".into(), name: "Vision model".into(), input_rubles_per_million: None, output_rubles_per_million: None },
-            CatalogModel { id: "text-only".into(), name: "Text model".into(), input_rubles_per_million: None, output_rubles_per_million: None },
+            CatalogModel { id: "gpt-6-luna".into(), name: "Vision model".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None },
+            CatalogModel { id: "text-only".into(), name: "Text model".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec!["chat_completions".into()], request_rubles: None },
         ] };
         db.execute("INSERT INTO model_catalog_snapshots(fetched_at,source,data_json) VALUES(100,'test',?1)",
             [serde_json::to_string(&catalog).unwrap()]).unwrap();

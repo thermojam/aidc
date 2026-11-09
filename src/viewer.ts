@@ -53,10 +53,12 @@ Promise.allSettled([
     invoke("list_synthetic_tasks"),
     invoke("approve_synthetic_step", {taskId: 1, stepId: 1}),
     invoke("deny_synthetic_step", {taskId: 1, stepId: 1}),
+    invoke("generate_image", {modelId: "image-model", prompt: "viewer must fail", expectedPriceRubles: 6}),
+    invoke("save_generated_image", {dataUrl: "invalid"}),
     invoke("create_artifact", {messageId: 2, kind: "html", title: "viewer", content: "<p>test</p>"}),
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все сорок шесть команд отклонены"
+        ? "PASS: все сорок восемь команд отклонены"
         : "FAIL: хотя бы одна команда доступна";
 });

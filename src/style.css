@@ -679,6 +679,37 @@ textarea::placeholder {
     padding-left: 12px;
 }
 
+.image-generation-panel {
+    display: grid;
+    gap: 8px;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+}
+
+.image-generation-panel summary {
+    cursor: pointer;
+}
+
+.image-generation-panel > p {
+    margin: 4px 0;
+    color: var(--muted);
+}
+
+.image-generation-panel select, .image-generation-panel textarea {
+    width: 100%;
+    padding: 9px;
+    color: var(--text);
+    background: var(--background);
+    border: 1px solid var(--border);
+}
+
+.generated-image-result img {
+    display: block;
+    max-width: min(100%, 512px);
+    max-height: 512px;
+    object-fit: contain;
+}
+
 .settings-header {
     display: flex;
     align-items: center;

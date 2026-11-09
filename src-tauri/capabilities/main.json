@@ -49,6 +49,8 @@
     "allow-list-synthetic-tasks",
     "allow-approve-synthetic-step",
     "allow-deny-synthetic-step",
+    "allow-generate-image",
+    "allow-save-generated-image",
     "allow-create-artifact",
     "allow-export-artifact"
   ]
