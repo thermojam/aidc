@@ -458,6 +458,31 @@ h2 {
     justify-content: space-between;
 }
 
+.project-folder-heading, .project-folder-file {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 12px;
+}
+
+.project-folder-heading span, .project-folder-file span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.folder-preview {
+    display: grid;
+    gap: 6px;
+}
+
+.folder-preview pre {
+    max-height: 180px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .project-material {
     color: var(--muted);
     font-size: 12px;

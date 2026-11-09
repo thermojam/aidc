@@ -44,6 +44,8 @@ type Theme = "system" | "light" | "dark";
 type Conversation = { id: number; title: string; archived: boolean; pinned: boolean; project_id: number | null };
 type Project = { id: number; title: string; archived: boolean };
 type ProjectMaterial = { id: number; name: string; version: number; size: number; sha256: string };
+type ProjectFolderFile = { relative_path: string; size: number | null; blocked_reason: string | null };
+type ProjectFolderView = { folder_name: string; max_entries: number; max_file_bytes: number; files: ProjectFolderFile[] };
 
 const statusLabel: Record<string, string> = {
     interrupted: "Ответ прерван",
@@ -61,6 +63,8 @@ function App() {
     const [projects, setProjects] = useState<Project[]>([]);
     const [projectFilter, setProjectFilter] = useState<number | null>(null);
     const [projectMaterials, setProjectMaterials] = useState<ProjectMaterial[]>([]);
+    const [projectFolderView, setProjectFolderView] = useState<ProjectFolderView | null>(null);
+    const [folderPreview, setFolderPreview] = useState<PendingAttachment | null>(null);
     const [selectedMaterialIds, setSelectedMaterialIds] = useState<number[]>([]);
     const [renameTarget, setRenameTarget] = useState<{kind: "project" | "conversation"; id: number; title: string} | null>(null);
     const [conversationSearch, setConversationSearch] = useState("");
@@ -154,12 +158,17 @@ function App() {
         let current = true;
         setSelectedMaterialIds([]);
         setContextPreview(null);
+        setFolderPreview(null);
         if (conversationProjectId === null) {
             setProjectMaterials([]);
+            setProjectFolderView(null);
             return () => { current = false; };
         }
         invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
             .then((items) => { if (current) setProjectMaterials(items); })
+            .catch((reason) => { if (current) setError(String(reason)); });
+        invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
+            .then((folder) => { if (current) setProjectFolderView(folder); })
             .catch((reason) => { if (current) setError(String(reason)); });
         return () => { current = false; };
     }, [conversationProjectId]);
@@ -288,6 +297,37 @@ function App() {
             const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
             setProjectMaterials((items) => [...items.filter((item) => item.id !== material.id), material]);
             setContextPreview(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function chooseProjectFolder() {
+        if (conversationProjectId === null) return;
+        try {
+            const chosen = await invoke<string | null>("choose_project_folder", {projectId: conversationProjectId});
+            if (chosen) setProjectFolderView(await invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId}));
+            setFolderPreview(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function previewProjectFile(relativePath: string) {
+        if (conversationProjectId === null) return;
+        try {
+            setFolderPreview(null);
+            setFolderPreview(await invoke<PendingAttachment>("preview_project_file", {projectId: conversationProjectId, relativePath}));
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function saveFolderPreview() {
+        if (conversationProjectId === null || !folderPreview) return;
+        try {
+            const material = await invoke<ProjectMaterial>("save_project_folder_material", {
+                projectId: conversationProjectId, relativePath: folderPreview.name, expectedSha256: folderPreview.sha256
+            });
+            setProjectMaterials((items) => [...items, material]);
+            setFolderPreview(null);
             setError("");
         } catch (reason) { setError(String(reason)); }
     }
@@ -707,6 +747,25 @@ function App() {
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void addProjectMaterial()}>Добавить материал</button>
                         </div>
+                        <div className="project-folder-heading">
+                            <span>{projectFolderView ? `Папка: ${projectFolderView.folder_name} · только первый уровень · максимум ${projectFolderView.max_entries} элементов, ${Math.round(projectFolderView.max_file_bytes / 1024)} КБ на файл` : "Папка проекта не выбрана"}</span>
+                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void chooseProjectFolder()}>
+                                {projectFolderView ? "Сменить папку" : "Выбрать папку"}
+                            </button>
+                        </div>
+                        {projectFolderView?.files.map((file) => <div className="project-folder-file" key={file.relative_path}>
+                            <span>{file.relative_path} · {file.size === null ? "размер неизвестен" : `${file.size} Б`}{file.blocked_reason ? ` · ${file.blocked_reason}` : ""}</span>
+                            {file.blocked_reason === null && <button type="button" className="secondary-button" disabled={busy}
+                                    onClick={() => void previewProjectFile(file.relative_path)}>Просмотр</button>}
+                        </div>)}
+                        {projectFolderView && !projectFolderView.files.length && <p>Поддерживаемых файлов в корне папки нет.</p>}
+                        {folderPreview && <details open className="folder-preview">
+                            <summary>{folderPreview.name} · {folderPreview.size} Б · SHA-256 {folderPreview.sha256}</summary>
+                            <pre>{folderPreview.preview}</pre>
+                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void saveFolderPreview()}>
+                                Добавить эту версию в материалы
+                            </button>
+                        </details>}
                         {projectMaterials.map((material) => <label className="project-material" key={material.id}>
                             <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
                                    onChange={(event) => {

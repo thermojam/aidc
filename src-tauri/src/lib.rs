@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -127,6 +127,21 @@ struct ProjectMaterialSummary {
 }
 
 #[derive(Serialize)]
+struct ProjectFolderFile {
+    relative_path: String,
+    size: Option<u64>,
+    blocked_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProjectFolderView {
+    folder_name: String,
+    max_entries: usize,
+    max_file_bytes: usize,
+    files: Vec<ProjectFolderFile>,
+}
+
+#[derive(Serialize)]
 struct ArtifactVersion {
     id: i64,
     message_id: i64,
@@ -236,7 +251,11 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0012_project_materials.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 11 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 11 {
+        db.execute_batch(include_str!("../migrations/0013_project_folders.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 12 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -257,7 +276,7 @@ fn decode_text(bytes: &[u8]) -> Result<String, String> {
     }
 }
 
-fn prepare_attachment(path: &Path, id: i64) -> Result<PendingAttachment, String> {
+fn attachment_metadata(path: &Path) -> Result<(String, u64), String> {
     if path.symlink_metadata().map_err(|_| "Файл не найден")?.file_type().is_symlink() {
         return Err("Символические ссылки не поддерживаются".into());
     }
@@ -272,10 +291,18 @@ fn prepare_attachment(path: &Path, id: i64) -> Result<PendingAttachment, String>
     if !["txt", "md", "csv", "json", "yaml", "yml", "toml", "xml", "html", "css", "js", "jsx", "ts", "tsx", "rs", "py", "sql", "svg"].contains(&extension.as_str()) {
         return Err("Поддерживаются только выбранные текстовые форматы".into());
     }
-    let file = std::fs::File::open(&path).map_err(|_| "Не удалось открыть файл")?;
-    if !file.metadata().map_err(|_| "Не удалось проверить файл")?.is_file() {
+    let metadata = std::fs::metadata(&path).map_err(|_| "Не удалось проверить файл")?;
+    if !metadata.is_file() {
         return Err("Выберите обычный файл".into());
     }
+    if metadata.len() > 256 * 1024 { return Err("Файл больше 256 КБ".into()); }
+    Ok((name, metadata.len()))
+}
+
+fn prepare_attachment(path: &Path, id: i64) -> Result<PendingAttachment, String> {
+    let (name, _) = attachment_metadata(path)?;
+    let path = path.canonicalize().map_err(|_| "Файл не найден")?;
+    let file = std::fs::File::open(&path).map_err(|_| "Не удалось открыть файл")?;
     let mut content = Vec::new();
     file.take(256 * 1024 + 1).read_to_end(&mut content).map_err(|_| "Не удалось прочитать файл")?;
     if content.len() > 256 * 1024 { return Err("Файл больше 256 КБ".into()); }
@@ -489,6 +516,35 @@ fn selected_project_materials(db: &Connection, conversation_id: i64, material_id
     Ok(selected)
 }
 
+fn project_folder_path(db: &Connection, project_id: i64) -> Result<PathBuf, String> {
+    let path: String = db.query_row(
+        "SELECT f.path FROM project_folders f JOIN projects p ON p.id=f.project_id WHERE f.project_id=?1 AND p.archived=0",
+        [project_id], |row| row.get(0),
+    ).map_err(|_| "Для проекта не выбрана папка")?;
+    let stored = PathBuf::from(path);
+    let canonical = stored.canonicalize().map_err(|_| "Выбранная папка недоступна")?;
+    if canonical != stored { return Err("Путь к папке проекта изменился. Выберите папку заново".into()); }
+    if !canonical.is_dir() { return Err("Выберите папку проекта".into()); }
+    Ok(canonical)
+}
+
+fn project_folder_file(db: &Connection, project_id: i64, relative_path: &str) -> Result<PathBuf, String> {
+    if relative_path.is_empty() || relative_path.contains('/') || relative_path.contains('\\')
+        || Path::new(relative_path).components().count() != 1
+        || !matches!(Path::new(relative_path).components().next(), Some(std::path::Component::Normal(_))) {
+        return Err("Путь должен указывать на файл первого уровня папки".into());
+    }
+    let root = project_folder_path(db, project_id)?;
+    let path = root.join(relative_path);
+    if path.symlink_metadata().map_err(|_| "Файл не найден")?.file_type().is_symlink() {
+        return Err("Символические ссылки не поддерживаются".into());
+    }
+    let path = path.canonicalize().map_err(|_| "Файл не найден")?;
+    if !path.starts_with(&root) { return Err("Путь вышел за границы выбранной папки".into()); }
+    attachment_metadata(&path)?;
+    Ok(path)
+}
+
 fn create_project_in_db(db: &Connection) -> rusqlite::Result<i64> {
     db.execute("INSERT INTO projects(title) VALUES('Новый проект')", [])?;
     Ok(db.last_insert_rowid())
@@ -556,6 +612,65 @@ fn save_project_material(project_id: i64, attachment_id: i64, state: State<'_, A
     let material = save_project_material_in_db(&db, project_id, &drafts[index]).map_err(|_| "Не удалось сохранить материал проекта".to_string())?;
     drafts.remove(index);
     Ok(material)
+}
+
+#[tauri::command]
+async fn choose_project_folder(project_id: i64, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let Some(selected) = app.dialog().file().blocking_pick_folder() else { return Ok(None); };
+    let selected = selected.into_path().map_err(|_| "Выберите локальную папку")?.canonicalize().map_err(|_| "Папка недоступна")?;
+    if !selected.is_dir() { return Err("Выберите папку проекта".into()); }
+    let path = selected.to_str().ok_or("Путь к папке должен быть в UTF-8")?;
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let changed = db.execute(
+        "INSERT INTO project_folders(project_id,path) SELECT id,?1 FROM projects WHERE id=?2 AND archived=0
+         ON CONFLICT(project_id) DO UPDATE SET path=excluded.path",
+        params![path, project_id],
+    ).map_err(|_| "Не удалось сохранить папку проекта")?;
+    if changed == 0 { return Err("Проект не найден или архивирован".into()); }
+    Ok(selected.file_name().and_then(|name| name.to_str()).map(str::to_owned))
+}
+
+#[tauri::command]
+fn list_project_folder(project_id: i64, state: State<'_, AppState>) -> Result<Option<ProjectFolderView>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let configured: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM project_folders WHERE project_id=?1)", [project_id], |row| row.get(0))?;
+    if !configured { return Ok(None); }
+    let root = project_folder_path(&db, project_id)?;
+    let mut files = Vec::new();
+    for (index, entry) in std::fs::read_dir(&root).map_err(|_| "Не удалось прочитать выбранную папку")?.enumerate() {
+        if index >= 500 { return Err("В выбранной папке больше 500 элементов".into()); }
+        let entry = entry.map_err(|_| "Не удалось прочитать элемент папки")?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue; };
+        let file_type = entry.file_type().map_err(|_| "Не удалось проверить элемент папки")?;
+        if file_type.is_dir() { continue; }
+        let size = entry.path().symlink_metadata().ok().filter(|metadata| metadata.is_file()).map(|metadata| metadata.len());
+        let result = if file_type.is_symlink() { Err("Символические ссылки не поддерживаются".to_string()) }
+            else if !file_type.is_file() { Err("Поддерживаются только обычные файлы".to_string()) }
+            else { project_folder_file(&db, project_id, &name).and_then(|path| attachment_metadata(&path).map(|(_, size)| size)) };
+        let (size, blocked_reason) = match result { Ok(size) => (Some(size), None), Err(reason) => (size, Some(reason)) };
+        files.push(ProjectFolderFile { relative_path: name, size, blocked_reason });
+    }
+    let folder_name = root.file_name().and_then(|name| name.to_str()).unwrap_or("Выбранная папка").to_owned();
+    Ok(Some(ProjectFolderView { folder_name, max_entries: 500, max_file_bytes: 256 * 1024, files }))
+}
+
+#[tauri::command]
+fn preview_project_file(project_id: i64, relative_path: String, state: State<'_, AppState>) -> Result<AttachmentPreview, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let path = project_folder_file(&db, project_id, &relative_path)?;
+    let draft = prepare_attachment(&path, 0)?;
+    Ok(attachment_preview(&draft))
+}
+
+#[tauri::command]
+fn save_project_folder_material(project_id: i64, relative_path: String, expected_sha256: String, state: State<'_, AppState>) -> Result<ProjectMaterialSummary, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let path = project_folder_file(&db, project_id, &relative_path)?;
+    let draft = prepare_attachment(&path, 0)?;
+    if format!("{:x}", Sha256::digest(&draft.content)) != expected_sha256 {
+        return Err("Файл изменился после предпросмотра. Просмотрите его заново".into());
+    }
+    save_project_material_in_db(&db, project_id, &draft).map_err(|_| "Не удалось сохранить материал проекта".into())
 }
 
 #[tauri::command]
@@ -759,7 +874,7 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> {
+    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> {
         Ok((
             db.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
@@ -770,6 +885,7 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
             db.query_row("SELECT count(*) FROM artifact_versions", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM project_materials", [], |row| row.get(0))?,
             db.query_row("SELECT coalesce(sum(size), 0) FROM project_materials", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM project_folders", [], |row| row.get(0))?,
             db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
         ))
     };
@@ -783,7 +899,7 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
     let check = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_keys: i64 = check.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
-    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !project_materials_valid(&check)? || !conversation_links_valid(&check)? {
+    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !project_materials_valid(&check)? || !project_folders_valid(&check)? || !conversation_links_valid(&check)? {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
@@ -797,6 +913,11 @@ fn project_materials_valid(db: &Connection) -> rusqlite::Result<bool> {
         if size != bytes.len() as i64 || hash != format!("{:x}", Sha256::digest(&bytes)) { return Ok(false); }
     }
     Ok(true)
+}
+
+fn project_folders_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let invalid: i64 = db.query_row("SELECT count(*) FROM project_folders WHERE path=''", [], |row| row.get(0))?;
+    Ok(invalid == 0)
 }
 
 fn attachments_valid(db: &Connection) -> rusqlite::Result<bool> {
@@ -851,9 +972,11 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
         let _: i64 = source.query_row("SELECT count(*) FROM conversations WHERE project_id IS NOT NULL", [], |row| row.get(0))?;
     }
     if version >= 11 { let _: i64 = source.query_row("SELECT count(*) FROM project_materials", [], |row| row.get(0))?; }
-    if integrity != "ok" || foreign_keys != 0 || !(1..=11).contains(&version) || conversations < 1 || invalid_pins != 0
+    if version >= 12 { let _: i64 = source.query_row("SELECT count(*) FROM project_folders", [], |row| row.get(0))?; }
+    if integrity != "ok" || foreign_keys != 0 || !(1..=12).contains(&version) || conversations < 1 || invalid_pins != 0
         || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
         || (version >= 11 && !project_materials_valid(&source)?)
+        || (version >= 12 && !project_folders_valid(&source)?)
         || (version >= 8 && !conversation_links_valid(&source)?) {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -1466,7 +1589,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -1796,7 +1919,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 12);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -1934,7 +2057,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 12);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
@@ -2121,6 +2244,34 @@ mod tests {
         assert_eq!(current, saved);
         drop(backup);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_folder_reads_only_safe_direct_children() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("ai-desktop-folder-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("ai-desktop-outside-{}.md", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("README.md"), "safe text").unwrap();
+        std::fs::write(root.join(".env"), "secret text").unwrap();
+        std::fs::write(root.join("large.md"), vec![b'x'; 256 * 1024 + 1]).unwrap();
+        std::fs::write(&outside, "outside").unwrap();
+        symlink(&outside, root.join("linked.md")).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let project_id = create_project_in_db(&db).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        db.execute("INSERT INTO project_folders(project_id,path) VALUES(?1,?2)", params![project_id, canonical_root.to_str().unwrap()]).unwrap();
+        assert_eq!(prepare_attachment(&project_folder_file(&db, project_id, "README.md").unwrap(), 1).unwrap().preview, "safe text");
+        assert!(project_folder_file(&db, project_id, "../ai-desktop-outside.md").is_err());
+        assert!(project_folder_file(&db, project_id, "linked.md").is_err());
+        assert!(project_folder_file(&db, project_id, ".env").is_err());
+        assert!(project_folder_file(&db, project_id, "large.md").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
     }
 
     #[test]
