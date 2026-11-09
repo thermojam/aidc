@@ -6,8 +6,8 @@ import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
 import "./style.css";
 
 type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
-type Attachment = { message_id: number; name: string; size: number; sha256: string };
-type PendingAttachment = { id: number; name: string; size: number; sha256: string; preview: string };
+type Attachment = { message_id: number; name: string; mime: string; size: number; sha256: string };
+type PendingAttachment = { id: number; name: string; mime: string; size: number; sha256: string; preview: string };
 type ContextMessage = { role: string; content: string; source_message_id: number | null; attachment_ids: number[] };
 type ContextPreview = {
     model_id: string;
@@ -17,6 +17,7 @@ type ContextPreview = {
     messages: ContextMessage[];
     omitted_exchanges: number;
     bytes: number;
+    request_bytes: number;
     warning: string
 };
 type CatalogModel = {
@@ -452,6 +453,28 @@ function App() {
         }
     }
 
+    async function pickImageAttachment() {
+        try {
+            const attachment = await invoke<PendingAttachment | null>("pick_image_attachment");
+            if (attachment) {
+                const image = new Image();
+                image.src = attachment.preview;
+                try { await image.decode(); }
+                catch {
+                    await invoke("remove_text_attachment", {id: attachment.id});
+                    throw new Error("Не удалось декодировать изображение");
+                }
+                if (image.naturalWidth > 8192 || image.naturalHeight > 8192 || image.naturalWidth * image.naturalHeight > 16_000_000) {
+                    await invoke("remove_text_attachment", {id: attachment.id});
+                    throw new Error("Изображение превышает локальный предел 16 мегапикселей");
+                }
+                setPendingAttachments((current) => [...current, attachment]);
+                setContextPreview(null);
+            }
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
     async function removeAttachment(id: number) {
         try {
             await invoke("remove_text_attachment", {id});
@@ -558,6 +581,8 @@ function App() {
     const activeConversations = shownConversations.filter((item) => !item.archived);
     const archivedConversations = shownConversations.filter((item) => item.archived);
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
+    const hasImage = pendingAttachments.some((attachment) => attachment.mime.startsWith("image/"));
+    const imageModelSupported = modelId === "gpt-6-luna";
     const selectedCategory = categories.find((item) => item.model_id === modelId);
     function follows(message: Message, ancestorId: number): boolean {
         for (let parentId = message.parent_id; parentId !== null;) {
@@ -662,7 +687,7 @@ function App() {
                                 <p>{message.content}</p>}
                             {history.attachments.filter((attachment) => attachment.message_id === message.id).map((attachment) => (
                                 <small
-                                    key={attachment.sha256 + attachment.name}>Файл: {attachment.name} · {attachment.size} Б
+                                    key={attachment.sha256 + attachment.name}>{attachment.mime.startsWith("image/") ? "Изображение" : "Файл"}: {attachment.name} · {attachment.size} Б
                                     · SHA-256 {attachment.sha256.slice(0, 12)}…</small>
                             ))}
                             {message.role !== "assistant" && message.status !== "completed" &&
@@ -734,10 +759,10 @@ function App() {
                                 <button type="button" className="secondary-button" disabled={busy}
                                         onClick={() => void removeAttachment(attachment.id)}>Убрать
                                 </button>
-                                <details>
+                                {attachment.mime.startsWith("image/") ? <img className="image-attachment-preview" src={attachment.preview} alt={attachment.name}/> : <details>
                                     <summary>Содержимое</summary>
                                     <pre>{attachment.preview}</pre>
-                                </details>
+                                </details>}
                             </div>
                         ))}
                     </div>
@@ -777,7 +802,7 @@ function App() {
                         {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
                     </div>}
                     {contextPreview && <details open className="context-preview">
-                        <summary>Состав запроса · {contextPreview.bytes} Б · пропущено завершённых
+                        <summary>Состав запроса · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
                         <p>{contextPreview.warning}</p>
                         {contextPreview.messages.map((part, index) => <pre
@@ -798,12 +823,15 @@ function App() {
                             </select>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void pickImageAttachment()}>Прикрепить изображение</button>
                             <details className="model-details">
                                 <summary>О модели</summary>
                                 <p>{catalog ? `Каталог: ${new Date(catalog.fetched_at * 1000).toLocaleString()}` : "Каталог ещё не загружен"}</p>
                                 {catalogError && <p role="alert">Ошибка обновления каталога: {catalogError}. {catalog ? "Сохранённый каталог доступен." : "Каталог недоступен."}</p>}
                                 {modelId !== "local-mock" && <>
                                     <p>Цена: {selectedModel?.input_rubles_per_million ?? "неизвестна"} ₽/млн входных; {selectedModel?.output_rubles_per_million ?? "неизвестна"} ₽/млн выходных. Лимит контекста и пригодность для текстового чата не подтверждены.</p>
+                                    <p>Изображения: подтверждена поддержка только у gpt-6-luna по документации SimpleClaw.</p>
                                     <label htmlFor="model-category">Ваша категория модели</label>
                                     <select id="model-category" value={selectedCategory?.category ?? "other"} onChange={(event) => void changeCategory(event.target.value)}>
                                         <option value="other">Остальные</option><option value="thinking">Мышление</option>
@@ -818,11 +846,12 @@ function App() {
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id])}>Отправить
+                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id])}>Отправить
                             </button>}
                         </div>
                     </div>
                     <p className="send-warning">{modelId === "local-mock" ? "Локальный тест · без сети" : "Отправка в SimpleClaw может стоить денег. Расход при обрыве неизвестен."}</p>
+                    {hasImage && !imageModelSupported && <p role="alert">Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение.</p>}
                     {modelId !== "local-mock" && !keySaved && <p role="alert">Ключ SimpleClaw не сохранён. Откройте настройки.</p>}
                     {catalogError && <p role="alert">Ошибка обновления каталога. {catalog ? "Сохранённый каталог доступен." : "Каталог недоступен."}</p>}
                     {error && <p role="alert">{error}</p>}

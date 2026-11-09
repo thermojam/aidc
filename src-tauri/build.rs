@@ -33,6 +33,7 @@ fn main() {
                 "list_backups",
                 "restore_backup",
                 "pick_text_attachment",
+                "pick_image_attachment",
                 "remove_text_attachment",
                 "list_models",
                 "list_model_categories",

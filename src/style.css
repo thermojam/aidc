@@ -441,6 +441,13 @@ h2 {
     color: var(--text);
 }
 
+.image-attachment-preview {
+    display: block;
+    max-width: min(100%, 420px);
+    max-height: 280px;
+    object-fit: contain;
+}
+
 .project-materials {
     display: grid;
     gap: 6px;

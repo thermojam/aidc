@@ -36,6 +36,7 @@
     "allow-list-backups",
     "allow-restore-backup",
     "allow-pick-text-attachment",
+    "allow-pick-image-attachment",
     "allow-remove-text-attachment",
     "allow-list-models",
     "allow-list-model-categories",

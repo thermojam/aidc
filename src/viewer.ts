@@ -40,6 +40,7 @@ Promise.allSettled([
     invoke("list_backups"),
     invoke("restore_backup", {name: "history-missing.sqlite"}),
     invoke("pick_text_attachment"),
+    invoke("pick_image_attachment"),
     invoke("remove_text_attachment", {id: 1}),
     invoke("list_models"),
     invoke("list_model_categories"),
@@ -50,6 +51,6 @@ Promise.allSettled([
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все тридцать девять команд отклонены"
+        ? "PASS: все сорок команд отклонены"
         : "FAIL: хотя бы одна команда доступна";
 });

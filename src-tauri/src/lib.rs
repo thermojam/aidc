@@ -1,3 +1,5 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use image::{ImageFormat, ImageReader, Limits};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,9 +64,12 @@ struct ContextPreview {
     messages: Vec<ContextMessage>,
     omitted_exchanges: usize,
     bytes: usize,
+    #[serde(default)]
+    request_bytes: usize,
     warning: String,
 }
 
+#[derive(Clone)]
 struct PendingAttachment {
     id: i64,
     name: String,
@@ -77,6 +82,7 @@ struct PendingAttachment {
 struct AttachmentPreview {
     id: i64,
     name: String,
+    mime: String,
     size: usize,
     sha256: String,
     preview: String,
@@ -174,6 +180,7 @@ struct SavedContext {
 struct AttachmentMeta {
     message_id: i64,
     name: String,
+    mime: String,
     size: i64,
     sha256: String,
 }
@@ -311,14 +318,93 @@ fn prepare_attachment(path: &Path, id: i64) -> Result<PendingAttachment, String>
     Ok(PendingAttachment { id, name, mime: "text/plain".into(), content, preview })
 }
 
+fn prepare_image_attachment(path: &Path, id: i64) -> Result<PendingAttachment, String> {
+    if path.symlink_metadata().map_err(|_| "Файл не найден")?.file_type().is_symlink() { return Err("Символические ссылки не поддерживаются".into()); }
+    let path = path.canonicalize().map_err(|_| "Файл не найден")?;
+    let name = path.file_name().and_then(|part| part.to_str()).ok_or("Некорректное имя файла")?.to_owned();
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") || ["id_rsa", "id_ed25519", "credentials", "secrets"].contains(&lower.as_str()) {
+        return Err("Файл с возможными секретами нельзя прикрепить".into());
+    }
+    let extension = path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase();
+    let metadata = std::fs::metadata(&path).map_err(|_| "Не удалось проверить файл")?;
+    if !metadata.is_file() { return Err("Выберите обычный файл".into()); }
+    if metadata.len() > 3 * 1024 * 1024 { return Err("Изображение больше 3 МиБ".into()); }
+    let mut content = Vec::new();
+    std::fs::File::open(&path).map_err(|_| "Не удалось открыть изображение")?.take(3 * 1024 * 1024 + 1)
+        .read_to_end(&mut content).map_err(|_| "Не удалось прочитать изображение")?;
+    if content.len() > 3 * 1024 * 1024 { return Err("Изображение больше 3 МиБ".into()); }
+    let mime = if extension == "png" && content.starts_with(b"\x89PNG\r\n\x1a\n") { "image/png" }
+        else if (extension == "jpg" || extension == "jpeg") && content.starts_with(&[0xff, 0xd8, 0xff]) { "image/jpeg" }
+        else if extension == "webp" && content.len() >= 12 && &content[0..4] == b"RIFF" && &content[8..12] == b"WEBP" { "image/webp" }
+        else { return Err("Выберите корректное изображение PNG, JPEG или WebP".into()); };
+    let format = match mime { "image/png" => ImageFormat::Png, "image/jpeg" => ImageFormat::Jpeg, "image/webp" => ImageFormat::WebP, _ => return Err("Некорректное изображение".into()) };
+    let dimensions = ImageReader::with_format(std::io::Cursor::new(&content), format).into_dimensions()
+        .map_err(|_| "Не удалось прочитать изображение")?;
+    let (width, height) = dimensions;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || u64::from(width) * u64::from(height) > 16_000_000 {
+        return Err("Размер изображения превышает локальный предел 16 мегапикселей".into());
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    let mut reader = ImageReader::with_format(std::io::Cursor::new(&content), format);
+    reader.limits(limits);
+    reader.decode().map_err(|_| "Файл изображения повреждён")?;
+    let preview = format!("data:{mime};base64,{}", BASE64.encode(&content));
+    Ok(PendingAttachment { id, name, mime: mime.into(), content, preview })
+}
+
 fn attachment_preview(draft: &PendingAttachment) -> AttachmentPreview {
     AttachmentPreview {
         id: draft.id,
         name: draft.name.clone(),
+        mime: draft.mime.clone(),
         size: draft.content.len(),
         sha256: format!("{:x}", Sha256::digest(&draft.content)),
         preview: draft.preview.clone(),
     }
+}
+
+fn supports_image_input(model_id: &str) -> bool { model_id == "gpt-6-luna" }
+
+fn is_supported_image_mime(mime: &str) -> bool { ["image/png", "image/jpeg", "image/webp"].contains(&mime) }
+
+fn context_attachment(db: &Connection, tail: Option<(&str, &[&PendingAttachment])>, id: i64) -> Result<(String, Vec<u8>), String> {
+    if let Some((_, drafts)) = tail {
+        if let Some(draft) = drafts.iter().find(|draft| draft.id == id) {
+            return Ok((draft.mime.clone(), draft.content.clone()));
+        }
+    }
+    db.query_row("SELECT mime, content FROM attachments WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|_| "Не удалось прочитать вложение".to_owned())
+}
+
+fn chat_payload(db: &Connection, context: &ContextPreview, tail: Option<(&str, &[&PendingAttachment])>) -> Result<serde_json::Value, String> {
+    let mut image_count = 0;
+    let mut messages = Vec::new();
+    for message in &context.messages {
+        let mut parts = vec![serde_json::json!({"type": "text", "text": message.content})];
+        if message.role == "user" {
+            for id in &message.attachment_ids {
+                let (mime, content) = context_attachment(db, tail, *id)?;
+                if !mime.starts_with("image/") { continue; }
+                if !is_supported_image_mime(&mime) { return Err("Формат изображения не поддерживается".into()); }
+                image_count += 1;
+                if image_count > 8 { return Err("В одном запросе можно использовать не больше восьми изображений".into()); }
+                if !supports_image_input(&context.model_id) { return Err("Для изображения выберите gpt-6-luna: это единственная модель с подтверждённой поддержкой".into()); }
+                let url = format!("data:{mime};base64,{}", BASE64.encode(content));
+                parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url, "detail": "high"}}));
+            }
+        }
+        let content = if parts.len() == 1 { serde_json::Value::String(message.content.clone()) } else { serde_json::Value::Array(parts) };
+        messages.push(serde_json::json!({"role": message.role, "content": content}));
+    }
+    let payload = serde_json::json!({"model": context.model_id, "messages": messages, "max_tokens": 1024, "stream": true});
+    let request_bytes = serde_json::to_vec(&payload).map_err(|_| "Не удалось собрать запрос")?.len();
+    if request_bytes > 5 * 1024 * 1024 { return Err("Запрос превышает предел 5 МиБ".into()); }
+    Ok(payload)
 }
 
 fn parse_catalog(bytes: &[u8], fetched_at: i64) -> Result<ModelCatalog, String> {
@@ -441,6 +527,20 @@ async fn pick_text_attachment(app: tauri::AppHandle, state: State<'_, AppState>)
 }
 
 #[tauri::command]
+async fn pick_image_attachment(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Option<AttachmentPreview>, String> {
+    let Some(path) = app.dialog().file().blocking_pick_file() else { return Ok(None); };
+    let path = path.into_path().map_err(|_| "Выберите локальное изображение")?;
+    let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
+    if drafts.len() >= 5 { return Err("Можно выбрать не больше пяти вложений".into()); }
+    if drafts.iter().filter(|draft| draft.mime.starts_with("image/")).count() >= 8 { return Err("В одном запросе можно использовать не больше восьми изображений".into()); }
+    let id = drafts.last().map_or(1, |draft| draft.id + 1);
+    let draft = prepare_image_attachment(&path, id)?;
+    let preview = attachment_preview(&draft);
+    drafts.push(draft);
+    Ok(Some(preview))
+}
+
+#[tauri::command]
 fn remove_text_attachment(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
     drafts.retain(|draft| draft.id != id);
@@ -485,6 +585,7 @@ fn list_project_materials_in_db(db: &Connection, project_id: i64) -> rusqlite::R
 }
 
 fn save_project_material_in_db(db: &Connection, project_id: i64, draft: &PendingAttachment) -> rusqlite::Result<ProjectMaterialSummary> {
+    if draft.mime != "text/plain" { return Err(rusqlite::Error::InvalidQuery); }
     let active: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1 AND archived=0)", [project_id], |row| row.get(0))?;
     if !active { return Err(rusqlite::Error::QueryReturnedNoRows); }
     let version: i64 = db.query_row("SELECT coalesce(max(version), 0)+1 FROM project_materials WHERE project_id=?1 AND name=?2", params![project_id, draft.name], |row| row.get(0))?;
@@ -633,7 +734,8 @@ async fn choose_project_folder(project_id: i64, app: tauri::AppHandle, state: St
 #[tauri::command]
 fn list_project_folder(project_id: i64, state: State<'_, AppState>) -> Result<Option<ProjectFolderView>, String> {
     let db = state.db.lock().map_err(|_| "База занята")?;
-    let configured: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM project_folders WHERE project_id=?1)", [project_id], |row| row.get(0))?;
+    let configured: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM project_folders WHERE project_id=?1)", [project_id], |row| row.get(0))
+        .map_err(|_| "Не удалось проверить папку проекта")?;
     if !configured { return Ok(None); }
     let root = project_folder_path(&db, project_id)?;
     let mut files = Vec::new();
@@ -757,10 +859,10 @@ fn history_for(db: &Connection, conversation_id: i64) -> Result<History, String>
         .map_err(|e| e.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
-    let mut statement = db.prepare("SELECT a.message_id, a.name, a.size, a.sha256 FROM attachments a JOIN messages m ON m.id=a.message_id WHERE m.conversation_id=?1 ORDER BY a.id")
+    let mut statement = db.prepare("SELECT a.message_id, a.name, a.mime, a.size, a.sha256 FROM attachments a JOIN messages m ON m.id=a.message_id WHERE m.conversation_id=?1 ORDER BY a.id")
         .map_err(|e| e.to_string())?;
     let attachments = statement.query_map([conversation_id], |row| Ok(AttachmentMeta {
-        message_id: row.get(0)?, name: row.get(1)?, size: row.get(2)?, sha256: row.get(3)?,
+        message_id: row.get(0)?, name: row.get(1)?, mime: row.get(2)?, size: row.get(3)?, sha256: row.get(4)?,
     })).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
     let mut statement = db.prepare("SELECT a.id, a.message_id, a.previous_version_id, a.kind, a.title, a.content, a.sha256, a.created_at FROM artifact_versions a JOIN messages m ON m.id=a.message_id WHERE m.conversation_id=?1 ORDER BY a.id")
         .map_err(|_| "Не удалось прочитать Artifacts")?;
@@ -1155,13 +1257,17 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
         if role == "assistant" && status != "completed" { continue; }
         let mut attachment_ids = Vec::new();
         if role == "user" {
-            let mut files = db.prepare("SELECT id, name, sha256, content FROM attachments WHERE message_id=?1 ORDER BY id")
+            let mut files = db.prepare("SELECT id, name, mime, size, sha256, content FROM attachments WHERE message_id=?1 ORDER BY id")
                 .map_err(|_| "Не удалось собрать вложения")?;
-            let attached = files.query_map([id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))
+            let attached = files.query_map([id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, Vec<u8>>(5)?)))
                 .map_err(|_| "Не удалось собрать вложения")?;
             for file in attached {
-                let (file_id, name, hash, bytes) = file.map_err(|_| "Не удалось собрать вложения")?;
-                content.push_str(&format!("\n\n[Файл: {name}; SHA-256: {hash}]\n{}", decode_text(&bytes)?));
+                let (file_id, name, mime, size, hash, data) = file.map_err(|_| "Не удалось собрать вложения")?;
+                if mime.starts_with("image/") {
+                    content.push_str(&format!("\n\n[Изображение: {name}; {size} Б; SHA-256: {hash}]"));
+                } else {
+                    content.push_str(&format!("\n\n[Файл: {name}; SHA-256: {hash}]\n{}", decode_text(&data)?));
+                }
                 attachment_ids.push(file_id);
             }
         }
@@ -1171,7 +1277,11 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
         let mut content = prompt.to_owned();
         let mut attachment_ids = Vec::new();
         for draft in drafts {
-            content.push_str(&format!("\n\n[Файл: {}; SHA-256: {:x}]\n{}", draft.name, Sha256::digest(&draft.content), draft.preview));
+            if draft.mime.starts_with("image/") {
+                content.push_str(&format!("\n\n[Изображение: {}; {} Б; SHA-256: {:x}]", draft.name, draft.content.len(), Sha256::digest(&draft.content)));
+            } else {
+                content.push_str(&format!("\n\n[Файл: {}; SHA-256: {:x}]\n{}", draft.name, Sha256::digest(&draft.content), draft.preview));
+            }
             attachment_ids.push(draft.id);
         }
         messages.push(ContextMessage { role: "user".into(), content, source_message_id: None, attachment_ids });
@@ -1191,14 +1301,17 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
         omitted_exchanges += 1;
     }
     messages.insert(0, system);
-    Ok(ContextPreview {
+    let mut preview = ContextPreview {
         model_id: model_id.to_owned(),
         catalog_fetched_at: model.map(|_| catalog.as_ref().unwrap().fetched_at),
         input_rubles_per_million: model.and_then(|model| model.input_rubles_per_million),
         output_rubles_per_million: model.and_then(|model| model.output_rubles_per_million),
-        messages, omitted_exchanges, bytes,
+        messages, omitted_exchanges, bytes, request_bytes: 0,
         warning: "Предел контекста и токенизатор не подтверждены; размер в байтах не гарантирует, что запрос поместится в модель.".into(),
-    })
+    };
+    preview.request_bytes = serde_json::to_vec(&chat_payload(db, &preview, tail)?)
+        .map_err(|_| "Не удалось собрать запрос")?.len();
+    Ok(preview)
 }
 
 #[tauri::command]
@@ -1453,13 +1566,17 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
         let context_json: String = db.lock().map_err(|_| "DATABASE_ERROR")?
             .query_row("SELECT context_json FROM attempts WHERE id=?1", [attempt_id], |row| row.get(0)).map_err(|_| "DATABASE_ERROR")?;
         let context: ContextPreview = serde_json::from_str(&context_json).map_err(|_| "DATABASE_ERROR")?;
+        if context.model_id != model_id { return Err("MODEL_SNAPSHOT_MISMATCH".into()); }
         if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
-        let messages = context.messages.iter().map(|message| serde_json::json!({"role": message.role, "content": message.content})).collect::<Vec<_>>();
+        let payload = {
+            let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
+            chat_payload(&connection, &context, None)?
+        };
         let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(8))
             .read_timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none())
             .build().map_err(|_| "HTTP_CLIENT_ERROR")?;
         let mut response = client.post(url).bearer_auth(key)
-            .json(&serde_json::json!({"model": model_id, "messages": messages, "max_tokens": 1024, "stream": true}))
+            .json(&payload)
             .send().await.map_err(|_| "NETWORK_RESULT_UNKNOWN")?;
         http_status = Some(response.status().as_u16());
         if let Ok(db) = db.lock() {
@@ -1589,7 +1706,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -1812,6 +1929,67 @@ mod tests {
         assert_eq!(parts[3]["attachment_ids"][0], 1);
         assert!(!saved.contains("Локальный тестовый ответ"));
         assert!(context_for(&db, 1, Some(4), None, "missing-model").is_err());
+    }
+
+    #[test]
+    fn image_preview_and_saved_request_keep_the_selected_image() {
+        let backup_path = std::env::temp_dir().join(format!("ai-desktop-image-backup-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&backup_path);
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let catalog = ModelCatalog { fetched_at: 100, models: vec![
+            CatalogModel { id: "gpt-6-luna".into(), name: "Vision model".into(), input_rubles_per_million: None, output_rubles_per_million: None },
+            CatalogModel { id: "text-only".into(), name: "Text model".into(), input_rubles_per_million: None, output_rubles_per_million: None },
+        ] };
+        db.execute("INSERT INTO model_catalog_snapshots(fetched_at,source,data_json) VALUES(100,'test',?1)",
+            [serde_json::to_string(&catalog).unwrap()]).unwrap();
+        let bytes = BASE64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lnsAAAAASUVORK5CYII=").unwrap();
+        let image = PendingAttachment { id: 1, name: "pixel.png".into(), mime: "image/png".into(), content: bytes.clone(), preview: format!("data:image/png;base64,{}", BASE64.encode(&bytes)) };
+        let preview = context_for(&db, 1, None, Some(("describe", &[&image])), "gpt-6-luna").unwrap();
+        let payload = chat_payload(&db, &preview, Some(("describe", &[&image]))).unwrap();
+        assert!(payload["messages"][1]["content"][1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert_eq!(preview.request_bytes, serde_json::to_vec(&payload).unwrap().len());
+        assert!(context_for(&db, 1, None, Some(("describe", &[&image])), "text-only").is_err());
+        let attempt = create_attempt_for_conversation(&mut db, 1, "describe", &[&image], "gpt-6-luna").unwrap();
+        let saved: String = db.query_row("SELECT context_json FROM attempts WHERE id=?1", [attempt], |row| row.get(0)).unwrap();
+        let saved: ContextPreview = serde_json::from_str(&saved).unwrap();
+        let payload = chat_payload(&db, &saved, None).unwrap();
+        assert_eq!(payload["messages"][1]["content"][1]["image_url"]["url"], format!("data:image/png;base64,{}", BASE64.encode(&bytes)));
+        assert_eq!(attachments_valid(&db).unwrap(), true);
+        backup_history_to(&db, &backup_path).unwrap();
+        let backup = Connection::open(&backup_path).unwrap();
+        let (mime, saved_bytes): (String, Vec<u8>) = backup.query_row("SELECT mime, content FROM attachments", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((mime.as_str(), saved_bytes.as_slice()), ("image/png", bytes.as_slice()));
+        drop(backup);
+        std::fs::remove_file(backup_path).unwrap();
+    }
+
+    #[test]
+    fn image_attachment_rejects_unknown_format_and_large_file() {
+        let directory = std::env::temp_dir().join(format!("ai-desktop-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let invalid = directory.join("invalid.png");
+        std::fs::write(&invalid, b"not an image").unwrap();
+        assert!(prepare_image_attachment(&invalid, 1).is_err());
+        let truncated = directory.join("truncated.png");
+        std::fs::write(&truncated, b"\x89PNG\r\n\x1a\n").unwrap();
+        assert!(prepare_image_attachment(&truncated, 2).is_err());
+        let huge_dimensions = directory.join("huge.png");
+        let mut header = vec![0; 33];
+        header[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        header[8..12].copy_from_slice(&13u32.to_be_bytes());
+        header[12..16].copy_from_slice(b"IHDR");
+        header[16..20].copy_from_slice(&16_384u32.to_be_bytes());
+        header[20..24].copy_from_slice(&2u32.to_be_bytes());
+        std::fs::write(&huge_dimensions, header).unwrap();
+        assert!(prepare_image_attachment(&huge_dimensions, 3).is_err());
+        let large = directory.join("large.png");
+        let mut large_bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        large_bytes.resize(3 * 1024 * 1024 + 1, 0);
+        std::fs::write(&large, large_bytes).unwrap();
+        assert!(prepare_image_attachment(&large, 4).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
