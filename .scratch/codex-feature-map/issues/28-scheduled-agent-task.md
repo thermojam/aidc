@@ -4,9 +4,11 @@
 
 **Blocked by:** 16 — Подключить агентный цикл к SimpleClaw.
 
-**Status:** in progress — local schedule and confirmation are implemented; agent result, system notification and live UI check remain blocked by issue 16 and runtime access
+**Status:** in progress — local schedule, confirmation and opt-in notification for a due task are implemented; agent result and live UI check remain blocked by issue 16 and runtime access
 
 - [x] Расписание можно остановить; пропущенный запуск не дублируется после перезапуска (Rust-тест с повторным открытием БД и backup/restore).
 - [x] Расписание готовит только черновик; платный запрос требует нового явного действия пользователя.
 - [ ] Результат агентной задачи открывается из системного уведомления.
 - [ ] Подтверждение, остановка и уведомление проверены в запущенном приложении.
+
+**Дополнение, 9 November 2026:** При явно включённых уведомлениях наступившая задача показывает системное уведомление без текста задачи. Нажатие открывает её блок подтверждения, если ОС доставила событие в работающее приложение. На macOS прошли `npm ci`, `npm run typecheck`, `npm run build` и `cargo test` (44 успешных, 2 штатно пропущенных). Экранная проверка уведомления и перехода остаётся открытой. Результата агентной задачи пока нет, поэтому критерий открытия результата не закрыт.

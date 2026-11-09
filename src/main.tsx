@@ -1,6 +1,8 @@
 import {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {Channel, invoke} from "@tauri-apps/api/core";
+import {getCurrentWindow} from "@tauri-apps/api/window";
+import {isPermissionGranted, onAction, requestPermission, sendNotification} from "@tauri-apps/plugin-notification";
 import MarkdownMessage from "./MarkdownMessage";
 import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
 import "./style.css";
@@ -116,6 +118,10 @@ function App() {
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
     const [syntheticTasks, setSyntheticTasks] = useState<SyntheticTask[]>([]);
     const [scheduledTasks, setScheduledTasks] = useState<ScheduledAgentTask[]>([]);
+    const [scheduleNotificationsEnabled, setScheduleNotificationsEnabled] = useState(localStorage.getItem("scheduleNotifications") === "enabled");
+    const [notificationListenerReady, setNotificationListenerReady] = useState(false);
+    const [notificationTaskId, setNotificationTaskId] = useState<number | null>(null);
+    const notifiedDueTasks = useRef(new Set<string>());
     const [scheduleTitle, setScheduleTitle] = useState("");
     const [schedulePrompt, setSchedulePrompt] = useState("");
     const [scheduleInterval, setScheduleInterval] = useState("60");
@@ -226,6 +232,15 @@ function App() {
 
     async function refreshScheduledTasks() {
         setScheduledTasks(await invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks"));
+    }
+
+    async function enableScheduleNotifications() {
+        try {
+            const granted = await isPermissionGranted() || await requestPermission() === "granted";
+            if (!granted) { setError("Уведомления запрещены в настройках системы."); return; }
+            localStorage.setItem("scheduleNotifications", "enabled");
+            setScheduleNotificationsEnabled(true);
+        } catch (reason) { setError(String(reason)); }
     }
 
     async function createScheduledTask() {
@@ -506,6 +521,47 @@ function App() {
         }, 30_000);
         return () => window.clearInterval(timer);
     }, []);
+
+    useEffect(() => {
+        let active = true;
+        let listener: Awaited<ReturnType<typeof onAction>> | null = null;
+        onAction((event) => {
+            if (event.actionId !== "tap") return;
+            const taskId = event.notification?.extra?.scheduledTaskId;
+            if (typeof taskId === "number") {
+                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => setError(String(reason)));
+                setNotificationTaskId(taskId);
+            }
+        }).then((registered) => {
+            if (!active) void registered.unregister();
+            else { listener = registered; setNotificationListenerReady(true); }
+        }).catch((reason) => setError(String(reason)));
+        return () => { active = false; if (listener) void listener.unregister(); };
+    }, []);
+
+    useEffect(() => {
+        if (!scheduleNotificationsEnabled || !notificationListenerReady) return;
+        let active = true;
+        isPermissionGranted().then((granted) => {
+            if (!active || !granted) return;
+            for (const task of scheduledTasks) {
+                if (task.status !== "awaiting_confirmation" || task.due_at === null) continue;
+                const key = `${task.id}:${task.due_at}`;
+                if (notifiedDueTasks.current.has(key)) continue;
+                notifiedDueTasks.current.add(key);
+                sendNotification({title: "Пора подтвердить задачу", body: "Откройте приложение, чтобы просмотреть её.", extra: {scheduledTaskId: task.id}});
+            }
+        }).catch((reason) => setError(String(reason)));
+        return () => { active = false; };
+    }, [scheduledTasks, scheduleNotificationsEnabled, notificationListenerReady]);
+
+    useEffect(() => {
+        if (notificationTaskId === null || !scheduledTasks.some((task) => task.id === notificationTaskId && task.status === "awaiting_confirmation")) return;
+        const notice = document.getElementById(`scheduled-task-${notificationTaskId}`);
+        notice?.scrollIntoView({block: "center"});
+        notice?.querySelector<HTMLButtonElement>("button")?.focus();
+        setNotificationTaskId(null);
+    }, [notificationTaskId, scheduledTasks]);
 
     useEffect(() => {
         reload(conversationId).catch((reason) => setError(String(reason)));
@@ -1070,7 +1126,7 @@ function App() {
                     <button ref={compactSettingsButton} type="button" className="secondary-button compact-settings"
                             onClick={() => setSettingsOpen(true)}>Настройки</button>
                 </header>
-                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" key={task.id}>
+                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" id={`scheduled-task-${task.id}`} key={task.id}>
                     <strong>По расписанию наступила задача: {task.title}</strong>
                     <p>Автоматический запуск не выполнялся. После подтверждения текст попадёт в черновик; платный запрос потребует обычной проверки контекста и отдельного подтверждения.</p>
                     <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
@@ -1372,7 +1428,10 @@ function App() {
                 </details>
                 <details className="scheduled-task-panel" open={scheduledTasks.some((task) => task.conversation_id === conversationId && task.status === "awaiting_confirmation")}>
                     <summary>Расписание агентных задач</summary>
-                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Закрытое приложение не создаёт уведомления в ОС и не выполняет задачи. Отправка всегда остаётся ручной.</p>
+                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Уведомление ведёт к ожидающей задаче. Закрытое приложение не выполняет задачи. Отправка всегда остаётся ручной.</p>
+                    {scheduleNotificationsEnabled ?
+                        <button type="button" className="secondary-button" onClick={() => { localStorage.removeItem("scheduleNotifications"); setScheduleNotificationsEnabled(false); }}>Выключить уведомления</button> :
+                        <button type="button" className="secondary-button" onClick={() => void enableScheduleNotifications()}>Включить уведомления</button>}
                     <label>Название<input value={scheduleTitle} maxLength={120} onChange={(event) => setScheduleTitle(event.target.value)}/></label>
                     <label>Текст задачи<textarea value={schedulePrompt} maxLength={2000} rows={2} onChange={(event) => setSchedulePrompt(event.target.value)}/></label>
                     <label>Повторять каждые, минут<input type="number" min={1} max={10080} value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value)}/></label>
