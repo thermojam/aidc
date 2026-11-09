@@ -6,26 +6,34 @@ import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
 import "./style.css";
 
 type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
-type Attachment = { message_id: number; name: string; size: number; sha256: string };
-type PendingAttachment = { id: number; name: string; size: number; sha256: string; preview: string };
+type Attachment = { message_id: number; name: string; mime: string; size: number; sha256: string };
+type PendingAttachment = { id: number; name: string; mime: string; size: number; sha256: string; preview: string };
 type ContextMessage = { role: string; content: string; source_message_id: number | null; attachment_ids: number[] };
 type ContextPreview = {
     model_id: string;
+    response_style: "concise" | "balanced" | "detailed";
     catalog_fetched_at: number | null;
     input_rubles_per_million: number | null;
     output_rubles_per_million: number | null;
     messages: ContextMessage[];
     omitted_exchanges: number;
     bytes: number;
+    request_bytes: number;
     warning: string
 };
 type CatalogModel = {
     id: string;
     name: string;
     input_rubles_per_million: number | null;
-    output_rubles_per_million: number | null
+    output_rubles_per_million: number | null;
+    protocols: string[];
+    request_rubles: number | null;
+    audio_rubles_per_minute: number | null
 };
 type ModelCatalog = { fetched_at: number; models: CatalogModel[] };
+type GeneratedImage = { model_id: string; price_rubles: number; data_url: string };
+type CapturedSnapshot = { mime: string; size: number; sha256: string; preview: string };
+type TranscriptionResult = { text: string };
 type ModelCategory = { model_id: string; category: string; source: string; updated_at: number };
 type History = {
     messages: Message[];
@@ -41,7 +49,13 @@ type StreamEvent =
     | { event: "delta"; data: { attempt_id: number; seq: number; text: string } }
     | { event: "end"; data: { attempt_id: number; status: string; error_code: string | null; request_id: string | null; http_status: number | null } };
 type Theme = "system" | "light" | "dark";
-type Conversation = { id: number; title: string; archived: boolean };
+type Conversation = { id: number; title: string; archived: boolean; pinned: boolean; project_id: number | null };
+type Project = { id: number; title: string; archived: boolean };
+type ProjectMaterial = { id: number; name: string; version: number; size: number; sha256: string };
+type ProjectFolderFile = { relative_path: string; size: number | null; blocked_reason: string | null };
+type ProjectFolderView = { folder_name: string; max_entries: number; max_file_bytes: number; files: ProjectFolderFile[] };
+type SyntheticTask = { id: number; title: string; status: "awaiting_approval" | "completed" | "denied"; created_at: number;
+    steps: { id: number; ordinal: number; action: string; decision: "pending" | "approved" | "denied"; result: string | null }[] };
 
 const statusLabel: Record<string, string> = {
     interrupted: "Ответ прерван",
@@ -56,6 +70,15 @@ const categoryOrder = ["thinking", "speed", "economy", "other"];
 
 function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
+    const [projects, setProjects] = useState<Project[]>([]);
+    const [projectFilter, setProjectFilter] = useState<number | null>(null);
+    const [projectMaterials, setProjectMaterials] = useState<ProjectMaterial[]>([]);
+    const [projectFolderView, setProjectFolderView] = useState<ProjectFolderView | null>(null);
+    const [folderPreview, setFolderPreview] = useState<PendingAttachment | null>(null);
+    const [selectedMaterialIds, setSelectedMaterialIds] = useState<number[]>([]);
+    const [renameTarget, setRenameTarget] = useState<{kind: "project" | "conversation"; id: number; title: string} | null>(null);
+    const [conversationSearch, setConversationSearch] = useState("");
+    const [searchMatches, setSearchMatches] = useState<number[] | null>(null);
     const [conversationId, setConversationId] = useState(1);
     const [history, setHistory] = useState<History>({
         messages: [],
@@ -76,16 +99,41 @@ function App() {
     const [categories, setCategories] = useState<ModelCategory[]>([]);
     const [catalogError, setCatalogError] = useState("");
     const [modelId, setModelId] = useState("local-mock");
+    const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
+    const [syntheticTasks, setSyntheticTasks] = useState<SyntheticTask[]>([]);
+    const [imagePrompt, setImagePrompt] = useState("");
+    const [imageModelId, setImageModelId] = useState("");
+    const [generatedImage, setGeneratedImage] = useState<GeneratedImage | null>(null);
+    const [imageGenerationBusy, setImageGenerationBusy] = useState(false);
+    const [imageSaved, setImageSaved] = useState(false);
+    const [uncertainImageSignature, setUncertainImageSignature] = useState("");
+    const [recording, setRecording] = useState(false);
+    const [recordedAudio, setRecordedAudio] = useState<{id: string; base64: string; mime: string; seconds: number} | null>(null);
+    const [transcriptionText, setTranscriptionText] = useState("");
+    const [transcribing, setTranscribing] = useState(false);
+    const [uncertainTranscription, setUncertainTranscription] = useState("");
+    const [capturedSnapshot, setCapturedSnapshot] = useState<CapturedSnapshot | null>(null);
+    const [transcriptionModelId, setTranscriptionModelId] = useState("");
+    const recorder = useRef<MediaRecorder | null>(null);
+    const recordingStream = useRef<MediaStream | null>(null);
+    const audioChunks = useRef<Blob[]>([]);
+    const audioSize = useRef(0);
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
     const [previewSignature, setPreviewSignature] = useState("");
     const [selectedArtifactId, setSelectedArtifactId] = useState<number | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [paletteOpen, setPaletteOpen] = useState(false);
+    const [paletteQuery, setPaletteQuery] = useState("");
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const settingsButton = useRef<HTMLButtonElement>(null);
     const compactSettingsButton = useRef<HTMLButtonElement>(null);
     const settingsDialog = useRef<HTMLDialogElement>(null);
+    const paletteDialog = useRef<HTMLDialogElement>(null);
+    const paletteInput = useRef<HTMLInputElement>(null);
+    const paletteTrigger = useRef<HTMLElement | null>(null);
+    const chatSearchField = useRef<HTMLInputElement>(null);
     const artifactTrigger = useRef<HTMLElement | null>(null);
     const promptField = useRef<HTMLTextAreaElement>(null);
     const historyRequest = useRef(0);
@@ -105,6 +153,33 @@ function App() {
         else settingsDialog.current?.close();
     }, [settingsOpen]);
 
+    useEffect(() => {
+        if (paletteOpen) {
+            paletteDialog.current?.showModal();
+            paletteInput.current?.focus();
+        } else paletteDialog.current?.close();
+    }, [paletteOpen]);
+
+    useEffect(() => {
+        function onShortcut(event: KeyboardEvent) {
+            const target = event.target;
+            const typing = target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+            if (typing || paletteOpen || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
+            event.preventDefault();
+            paletteTrigger.current = target instanceof HTMLElement ? target : null;
+            setPaletteQuery("");
+            setPaletteOpen(true);
+        }
+        window.addEventListener("keydown", onShortcut);
+        return () => window.removeEventListener("keydown", onShortcut);
+    }, [paletteOpen]);
+
+    function closePalette() {
+        if (paletteDialog.current?.open) paletteDialog.current.close();
+        setPaletteOpen(false);
+        requestAnimationFrame(() => (paletteTrigger.current?.isConnected ? paletteTrigger.current : promptField.current)?.focus());
+    }
+
     function closeSettings() {
         setSettingsOpen(false);
         requestAnimationFrame(() => (compactSettingsButton.current?.offsetParent ? compactSettingsButton.current : settingsButton.current)?.focus());
@@ -122,16 +197,203 @@ function App() {
         return items;
     }
 
+    async function refreshSyntheticTasks() {
+        setSyntheticTasks(await invoke<SyntheticTask[]>("list_synthetic_tasks"));
+    }
+
+    async function startSyntheticTask() {
+        try {
+            await invoke("start_synthetic_task");
+            await refreshSyntheticTasks();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function decideSyntheticStep(taskId: number, stepId: number, decision: "approve" | "deny") {
+        try {
+            await invoke(decision === "approve" ? "approve_synthetic_step" : "deny_synthetic_step", {taskId, stepId});
+            await refreshSyntheticTasks();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function generateImage() {
+        const selectedImageModelId = imageModelId || imageModels[0]?.id || "";
+        const model = catalog?.models.find((item) => item.id === selectedImageModelId);
+        if (!model || !model.protocols.includes("images_generations") || model.request_rubles === null) return;
+        const signature = JSON.stringify([selectedImageModelId, imagePrompt.trim()]);
+        if (uncertainImageSignature === signature) return;
+        if (!window.confirm(`Отправить запрос в SimpleClaw?\nМодель: ${model.name} (${model.id})\nЦена: ${model.request_rubles} ₽ за успешный запрос. Автоповтора не будет.`)) return;
+        setImageGenerationBusy(true);
+        setGeneratedImage(null);
+        setImageSaved(false);
+        setError("");
+        try {
+            setGeneratedImage(await invoke<GeneratedImage>("generate_image", {
+                modelId: selectedImageModelId, prompt: imagePrompt, expectedPriceRubles: model.request_rubles
+            }));
+        } catch (reason) {
+            const message = String(reason);
+            if (message.includes("NETWORK_RESULT_UNKNOWN") || message.includes("GENERATION_RESULT_UNKNOWN") || /GENERATION_HTTP_5\d\d/.test(message)) {
+                setUncertainImageSignature(signature);
+                setError("Результат генерации неизвестен; запрос мог быть принят и оплачен. Для продолжения измените описание или модель, чтобы не повторить тот же запрос.");
+            } else if (message.includes("Цена изменилась")) {
+                try {
+                    setCatalog(await invoke<ModelCatalog>("refresh_models"));
+                    setError("Цена каталога изменилась. Проверьте новую сумму, затем подтвердите запрос ещё раз.");
+                } catch (refreshReason) { setError(`Не удалось обновить цену: ${String(refreshReason)}`); }
+            } else setError(message);
+        }
+        finally { setImageGenerationBusy(false); }
+    }
+
+    async function saveGeneratedImage() {
+        if (!generatedImage) return;
+        try {
+            const saved = await invoke<boolean>("save_generated_image", {dataUrl: generatedImage.data_url});
+            setImageSaved(saved);
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function startVoiceRecording() {
+        try {
+            if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error("Запись аудио в этом окне не поддерживается");
+            const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+            recordingStream.current = stream;
+            audioChunks.current = [];
+            audioSize.current = 0;
+            const options = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? {mimeType: "audio/webm;codecs=opus"} : {};
+            const nextRecorder = new MediaRecorder(stream, options);
+            recorder.current = nextRecorder;
+            nextRecorder.ondataavailable = (event) => {
+                if (!event.data.size) return;
+                audioSize.current += event.data.size;
+                if (audioSize.current <= 25 * 1024 * 1024) audioChunks.current.push(event.data);
+                else {
+                    setError("Запись превысила 25 МиБ и удалена. Попробуйте короче.");
+                    if (nextRecorder.state === "recording") nextRecorder.stop();
+                }
+            };
+            nextRecorder.onstop = () => {
+                stream.getTracks().forEach((track) => track.stop());
+                recordingStream.current = null;
+                setRecording(false);
+                if (audioSize.current > 25 * 1024 * 1024) { setRecordedAudio(null); return; }
+                const seconds = Math.min(600, (Date.now() - startedAt.current) / 1000);
+                void new Blob(audioChunks.current, {type: nextRecorder.mimeType}).arrayBuffer().then((buffer) => {
+                    const bytes = new Uint8Array(buffer);
+                    let binary = "";
+                    for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+                    setRecordedAudio({id: crypto.randomUUID(), base64: btoa(binary), mime: nextRecorder.mimeType.split(";")[0] || "audio/webm", seconds});
+                });
+            };
+            startedAt.current = Date.now();
+            setRecordedAudio(null);
+            setTranscriptionText("");
+            setError("");
+            nextRecorder.start(1000);
+            setRecording(true);
+            window.setTimeout(() => { if (recorder.current === nextRecorder && nextRecorder.state === "recording") nextRecorder.stop(); }, 600_000);
+        } catch (reason) { setError(`Не удалось начать запись: ${String(reason)}`); }
+    }
+
+    const startedAt = useRef(0);
+
+    useEffect(() => () => {
+        if (recorder.current?.state === "recording") recorder.current.stop();
+        recordingStream.current?.getTracks().forEach((track) => track.stop());
+    }, []);
+
+    function stopVoiceRecording() {
+        if (recorder.current?.state === "recording") recorder.current.stop();
+    }
+
+    async function transcribeVoice() {
+        if (!recordedAudio) return;
+        const model = selectedTranscriptionModel;
+        if (!model || model.audio_rubles_per_minute === null || !model.protocols.includes("audio_transcriptions")) return;
+        const signature = recordedAudio.id;
+        if (uncertainTranscription === signature) return;
+        const estimate = (Math.ceil(recordedAudio.seconds) + 1) / 60 * model.audio_rubles_per_minute;
+        if (!window.confirm(`Отправить запись в SimpleClaw для распознавания?\nМодель: ${model.name} (${model.id})\nДлительность записи: ${recordedAudio.seconds.toFixed(1)} с\nТариф: ${model.audio_rubles_per_minute} ₽/мин\nОценка по записи с запасом 1 с: ${estimate.toFixed(2)} ₽. Сервис считает декодированную длительность; итог может отличаться. Автоповтора не будет.`)) return;
+        setTranscribing(true);
+        setError("");
+        try {
+            const result = await invoke<TranscriptionResult>("transcribe_audio", {
+                modelId: model.id, audioBase64: recordedAudio.base64, mimeType: recordedAudio.mime,
+                durationSeconds: recordedAudio.seconds, expectedRatePerMinute: model.audio_rubles_per_minute
+            });
+            setTranscriptionText(result.text);
+            setRecordedAudio(null);
+        } catch (reason) {
+            const message = String(reason);
+            if (message.includes("UNKNOWN") || /TRANSCRIPTION_HTTP_5\d\d/.test(message)) {
+                setUncertainTranscription(signature);
+                setError("Результат распознавания неизвестен; запрос мог быть принят и оплачен. Автоповтора нет.");
+            } else if (message.includes("Ставка изменилась")) {
+                try { setCatalog(await invoke<ModelCatalog>("refresh_models")); setError("Тариф изменился. Обновите оценку и подтвердите отправку снова."); }
+                catch (refreshReason) { setError(`Не удалось обновить тариф: ${String(refreshReason)}`); }
+            } else setError(message);
+        } finally { setTranscribing(false); }
+    }
+
+    async function refreshModelCatalog() {
+        setCatalogError("");
+        try {
+            setCatalog(await invoke<ModelCatalog>("refresh_models"));
+            setContextPreview(null);
+        } catch (reason) { setCatalogError(String(reason)); }
+    }
+
+    async function refreshProjects() {
+        const items = await invoke<Project[]>("list_projects");
+        setProjects(items);
+        return items;
+    }
+
+    useEffect(() => {
+        const query = conversationSearch.trim();
+        if (!query) { setSearchMatches(null); return; }
+        let current = true;
+        const timer = window.setTimeout(() => {
+            invoke<Conversation[]>("search_conversations", {query, projectFilter})
+                .then((items) => { if (current) setSearchMatches(items.map((item) => item.id)); })
+                .catch((reason) => { if (current) setError(String(reason)); });
+        }, 150);
+        return () => { current = false; window.clearTimeout(timer); };
+    }, [conversationSearch, conversations, projectFilter]);
+
+    const conversationProjectId = conversations.find((item) => item.id === conversationId)?.project_id ?? null;
+    useEffect(() => {
+        let current = true;
+        setSelectedMaterialIds([]);
+        setContextPreview(null);
+        setFolderPreview(null);
+        if (conversationProjectId === null) {
+            setProjectMaterials([]);
+            setProjectFolderView(null);
+            return () => { current = false; };
+        }
+        invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
+            .then((items) => { if (current) setProjectMaterials(items); })
+            .catch((reason) => { if (current) setError(String(reason)); });
+        invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
+            .then((folder) => { if (current) setProjectFolderView(folder); })
+            .catch((reason) => { if (current) setError(String(reason)); });
+        return () => { current = false; };
+    }, [conversationProjectId]);
+
     useEffect(() => {
         refreshConversations().then((items) => {
             if (!items.some((item) => item.id === conversationId && !item.archived)) {
                 setConversationId(items.find((item) => !item.archived)?.id ?? items[0]?.id ?? 1);
             }
         }).catch((reason) => setError(String(reason)));
+        refreshProjects().catch((reason) => setError(String(reason)));
         invoke<string[]>("list_backups").then(setBackups).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog | null>("list_models").then(setCatalog).catch((reason) => setCatalogError(String(reason)));
+        invoke<ContextPreview["response_style"]>("get_response_style").then(setResponseStyle).catch((reason) => setError(String(reason)));
         invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => setCatalogError(String(reason)));
         invoke<boolean>("key_status").then(setKeySaved).catch((reason) => setError(String(reason)));
+        invoke<SyntheticTask[]>("list_synthetic_tasks").then(setSyntheticTasks).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog>("refresh_models").then((result) => { setCatalog(result); setContextPreview(null); setCatalogError(""); }).catch((reason) => setCatalogError(String(reason)));
     }, []);
 
@@ -162,18 +424,32 @@ function App() {
         if ((prompt.trim() || pendingAttachments.length) && !window.confirm("Создать беседу? Черновик и выбранные файлы будут убраны.")) return;
         try {
             const id = await invoke<number>("create_conversation");
+            if (projectFilter && projectFilter > 0) await invoke("move_conversation", {conversationId: id, projectId: projectFilter});
             await refreshConversations();
             await switchConversation(id, true);
         } catch (reason) { setError(String(reason)); }
     }
 
-    async function renameConversation(item: Conversation) {
-        const title = window.prompt("Название беседы", item.title);
-        if (title === null) return;
+    async function saveRename() {
+        if (!renameTarget) return;
         try {
-            await invoke("rename_conversation", {conversationId: item.id, title});
-            await refreshConversations();
+            if (renameTarget.kind === "conversation") {
+                await invoke("rename_conversation", {conversationId: renameTarget.id, title: renameTarget.title});
+                await refreshConversations();
+            } else {
+                await invoke("rename_project", {id: renameTarget.id, title: renameTarget.title});
+                await refreshProjects();
+            }
+            setRenameTarget(null);
             setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function updateResponseStyle(style: ContextPreview["response_style"]) {
+        try {
+            await invoke("set_response_style", {style});
+            setResponseStyle(style);
+            setContextPreview(null);
         } catch (reason) { setError(String(reason)); }
     }
 
@@ -196,6 +472,84 @@ function App() {
         } catch (reason) { setError(String(reason)); }
     }
 
+    async function togglePin(item: Conversation) {
+        try {
+            await invoke("set_conversation_pinned", {conversationId: item.id, pinned: !item.pinned});
+            await refreshConversations();
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function createProject() {
+        try {
+            const id = await invoke<number>("create_project");
+            await refreshProjects();
+            setProjectFilter(id);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function archiveProject(item: Project) {
+        try {
+            await invoke("archive_project", {id: item.id, archived: !item.archived});
+            await refreshProjects();
+            if (!item.archived && projectFilter === item.id) setProjectFilter(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function moveConversation(projectId: number | null) {
+        try {
+            await invoke("move_conversation", {conversationId, projectId});
+            await refreshConversations();
+            setProjectFilter(projectId ?? 0);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function addProjectMaterial() {
+        if (conversationProjectId === null) return;
+        try {
+            const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
+            if (!attachment) return;
+            const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
+            setProjectMaterials((items) => [...items.filter((item) => item.id !== material.id), material]);
+            setContextPreview(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function chooseProjectFolder() {
+        if (conversationProjectId === null) return;
+        try {
+            const chosen = await invoke<string | null>("choose_project_folder", {projectId: conversationProjectId});
+            if (chosen) setProjectFolderView(await invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId}));
+            setFolderPreview(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function previewProjectFile(relativePath: string) {
+        if (conversationProjectId === null) return;
+        try {
+            setFolderPreview(null);
+            setFolderPreview(await invoke<PendingAttachment>("preview_project_file", {projectId: conversationProjectId, relativePath}));
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function saveFolderPreview() {
+        if (conversationProjectId === null || !folderPreview) return;
+        try {
+            const material = await invoke<ProjectMaterial>("save_project_folder_material", {
+                projectId: conversationProjectId, relativePath: folderPreview.name, expectedSha256: folderPreview.sha256
+            });
+            setProjectMaterials((items) => [...items, material]);
+            setFolderPreview(null);
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
     async function createBackup() {
         try {
             await invoke<string>("create_backup");
@@ -211,6 +565,8 @@ function App() {
         try {
             await invoke("restore_backup", {name: selectedBackup});
             const items = await refreshConversations();
+            setProjects(await invoke<Project[]>("list_projects"));
+            setProjectFilter(null);
             const nextId = items.some((item) => item.id === conversationId && !item.archived)
                 ? conversationId : items.find((item) => !item.archived)?.id ?? items[0]?.id ?? 1;
             setConversationId(nextId);
@@ -290,11 +646,13 @@ function App() {
 
     async function send() {
         const value = prompt.trim();
-        if (!value || busy || !contextPreview || previewSignature !== JSON.stringify([conversationId, value, pendingAttachments.map((attachment) => attachment.id), modelId, history.active_leaf_id])) return;
+        const signature = JSON.stringify([conversationId, value, pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id]);
+        if (!value || busy || !contextPreview || previewSignature !== signature) return;
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, modelId}, value)) {
+        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId}, value)) {
             setPendingAttachments((current) => current.filter((attachment) => !ids.includes(attachment.id)));
+            setSelectedMaterialIds([]);
             setContextPreview(null);
         }
     }
@@ -310,6 +668,46 @@ function App() {
         } catch (reason) {
             setError(String(reason));
         }
+    }
+
+    async function pickImageAttachment() {
+        try {
+            const attachment = await invoke<PendingAttachment | null>("pick_image_attachment");
+            if (attachment) {
+                const image = new Image();
+                image.src = attachment.preview;
+                try { await image.decode(); }
+                catch {
+                    await invoke("remove_text_attachment", {id: attachment.id});
+                    throw new Error("Не удалось декодировать изображение");
+                }
+                if (image.naturalWidth > 8192 || image.naturalHeight > 8192 || image.naturalWidth * image.naturalHeight > 16_000_000) {
+                    await invoke("remove_text_attachment", {id: attachment.id});
+                    throw new Error("Изображение превышает локальный предел 16 мегапикселей");
+                }
+                setPendingAttachments((current) => [...current, attachment]);
+                setContextPreview(null);
+            }
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function captureWindowSnapshot() {
+        setCapturedSnapshot(null);
+        try {
+            setCapturedSnapshot(await invoke<CapturedSnapshot>("capture_window_snapshot"));
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function attachCapturedSnapshot() {
+        if (!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
+        try {
+            const attachment = await invoke<PendingAttachment>("add_captured_snapshot", {dataUrl: capturedSnapshot.preview});
+            setPendingAttachments((current) => [...current, attachment]);
+            setCapturedSnapshot(null);
+            setContextPreview(null);
+        } catch (reason) { setError(String(reason)); }
     }
 
     async function removeAttachment(id: number) {
@@ -359,8 +757,9 @@ function App() {
         const request = ++contextRequest.current;
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
-            const signature = JSON.stringify([conversationId, prompt.trim(), ids, modelId, history.active_leaf_id]);
-            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, modelId});
+            const materialIds = selectedMaterialIds;
+            const signature = JSON.stringify([conversationId, prompt.trim(), ids, materialIds, modelId, history.active_leaf_id]);
+            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId});
             if (request !== contextRequest.current) return;
             setContextPreview(preview);
             setPreviewSignature(signature);
@@ -398,6 +797,38 @@ function App() {
         requestAnimationFrame(() => (artifactTrigger.current?.isConnected ? artifactTrigger.current : promptField.current)?.focus());
     }
 
+    function runPaletteCommand(command: string) {
+        closePalette();
+        if (command === "new") {
+            void createConversation();
+            requestAnimationFrame(() => promptField.current?.focus());
+        } else if (command === "search") {
+            setSidebarOpen(true);
+            requestAnimationFrame(() => chatSearchField.current?.focus());
+        } else if (command === "settings") {
+            setSidebarOpen(false);
+            setSettingsOpen(true);
+        } else if (command === "attach") {
+            requestAnimationFrame(() => void pickAttachment());
+        } else if (command === "attach-image") {
+            requestAnimationFrame(() => void pickImageAttachment());
+        } else if (command === "artifact") {
+            const latest = history.artifacts.at(-1);
+            if (!latest) { setError("В этой беседе пока нет результатов."); return; }
+            artifactTrigger.current = promptField.current;
+            setSelectedArtifactId(latest.id);
+        }
+    }
+
+    const paletteCommands = [
+        {id: "new", label: "Новая беседа"},
+        {id: "search", label: "Найти беседу"},
+        {id: "settings", label: "Настройки"},
+        {id: "attach", label: "Прикрепить текстовый файл"},
+        {id: "attach-image", label: "Прикрепить изображение"},
+        {id: "artifact", label: "Открыть последний результат"},
+    ].filter((command) => command.label.toLocaleLowerCase().includes(paletteQuery.trim().toLocaleLowerCase()));
+
     const byId = new Map(history.messages.map((message) => [message.id, message]));
     const activeIds = new Set<number>();
     for (let id = history.active_leaf_id; id !== null;) {
@@ -409,9 +840,19 @@ function App() {
     const visible = history.messages.filter((message) => activeIds.has(message.id) && (!busy || message.status !== "streaming"));
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
     const selectedConversation = conversations.find((item) => item.id === conversationId);
-    const activeConversations = conversations.filter((item) => !item.archived);
-    const archivedConversations = conversations.filter((item) => item.archived);
+    const imageModels = catalog?.models.filter((model) => model.protocols.includes("images_generations")) ?? [];
+    const transcriptionModels = catalog?.models.filter((model) => model.protocols.includes("audio_transcriptions") && model.audio_rubles_per_minute !== null) ?? [];
+    const selectedTranscriptionModel = transcriptionModels.find((model) => model.id === transcriptionModelId) ?? transcriptionModels[0];
+    const selectedProject = projects.find((item) => item.id === projectFilter && !item.archived);
+    const activeProjects = projects.filter((item) => !item.archived);
+    const archivedProjects = projects.filter((item) => item.archived);
+    const shownConversations = (searchMatches === null ? conversations : conversations.filter((item) => searchMatches.includes(item.id)))
+        .filter((item) => projectFilter === null || item.project_id === (projectFilter || null));
+    const activeConversations = shownConversations.filter((item) => !item.archived);
+    const archivedConversations = shownConversations.filter((item) => item.archived);
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
+    const hasImage = pendingAttachments.some((attachment) => attachment.mime.startsWith("image/"));
+    const imageModelSupported = modelId === "gpt-6-luna";
     const selectedCategory = categories.find((item) => item.model_id === modelId);
     function follows(message: Message, ancestorId: number): boolean {
         for (let parentId = message.parent_id; parentId !== null;) {
@@ -427,24 +868,57 @@ function App() {
                     <button type="button" className="secondary-button sidebar-close" aria-label="Закрыть список чатов"
                             onClick={() => setSidebarOpen(false)}>×</button>
                 </div>
+                <div className="sidebar-label">Проекты</div>
+                <div className="project-controls">
+                    <select aria-label="Выбранный проект" value={projectFilter ?? -1}
+                            onChange={(event) => { setProjectFilter(Number(event.target.value) === -1 ? null : Number(event.target.value)); setSearchMatches(null); }}>
+                        <option value={-1}>Все беседы</option><option value={0}>Без проекта</option>
+                        {activeProjects.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
+                    </select>
+                    <button type="button" className="secondary-button" aria-label="Создать проект" onClick={() => void createProject()}>+</button>
+                </div>
+                {selectedProject && <div className="project-actions">
+                    <button type="button" className="secondary-button" onClick={() => setRenameTarget({kind: "project", id: selectedProject.id, title: selectedProject.title})}>Переименовать</button>
+                    <button type="button" className="secondary-button" onClick={() => void archiveProject(selectedProject)}>Архивировать</button>
+                </div>}
+                {archivedProjects.length > 0 && <details className="archived-chats"><summary>Архив проектов</summary>
+                    {archivedProjects.map((item) => <div className="project-archived" key={item.id}>
+                        <span>{item.title}</span><button type="button" className="chat-action" onClick={() => void archiveProject(item)}>Вернуть</button>
+                    </div>)}
+                </details>}
+                {renameTarget && <form className="rename-form" onSubmit={(event) => { event.preventDefault(); void saveRename(); }}>
+                    <label htmlFor="rename-title">Название {renameTarget.kind === "project" ? "проекта" : "беседы"}</label>
+                    <input id="rename-title" autoFocus maxLength={80} value={renameTarget.title}
+                           onChange={(event) => setRenameTarget({...renameTarget, title: event.target.value})}
+                           onKeyDown={(event) => { if (event.key === "Escape") setRenameTarget(null); }}/>
+                    <div><button type="submit" disabled={!renameTarget.title.trim()}>Сохранить</button>
+                        <button type="button" onClick={() => setRenameTarget(null)}>Отмена</button></div>
+                </form>}
                 <div className="sidebar-label">Беседы</div>
                 <button type="button" className="secondary-button new-chat" disabled={busy}
                         onClick={() => void createConversation()}>Новая беседа</button>
+                <input ref={chatSearchField} className="chat-search" type="search" aria-label="Поиск бесед" placeholder="Поиск бесед"
+                       maxLength={100} value={conversationSearch} onChange={(event) => setConversationSearch(event.target.value)}/>
                 <div className="sidebar-chats">
+                    {shownConversations.length === 0 && <p className="sidebar-empty">Ничего не найдено</p>}
                     {activeConversations.map((item) => <div className="chat-item" key={item.id}>
                         <button type="button" className="chat-item-title chat-select" title={item.title}
                                 aria-current={item.id === conversationId ? "page" : undefined} disabled={busy}
                                 onClick={() => void switchConversation(item.id)}>{item.title}</button>
+                        <button type="button" className="chat-action" aria-label={`${item.pinned ? "Открепить" : "Закрепить"} ${item.title}`}
+                                aria-pressed={item.pinned} onClick={() => void togglePin(item)}>{item.pinned ? "★" : "☆"}</button>
                         <button type="button" className="chat-action" aria-label={`Переименовать ${item.title}`} disabled={busy}
-                                onClick={() => void renameConversation(item)}>✎</button>
+                                onClick={() => setRenameTarget({kind: "conversation", id: item.id, title: item.title})}>✎</button>
                         <button type="button" className="chat-action" aria-label={`Архивировать ${item.title}`}
                                 disabled={busy}
                                 onClick={() => void archiveConversation(item)}>▤</button>
                     </div>)}
-                    {archivedConversations.length > 0 && <details className="archived-chats">
+                    {archivedConversations.length > 0 && <details key={conversationSearch.trim() ? "search" : "browse"} className="archived-chats" open={!!conversationSearch.trim()}>
                         <summary>Архив</summary>
                         {archivedConversations.map((item) => <div className="chat-item" key={item.id}>
                             <span className="chat-item-title" title={item.title}>{item.title}</span>
+                            <button type="button" className="chat-action" aria-label={`${item.pinned ? "Открепить" : "Закрепить"} ${item.title}`}
+                                    aria-pressed={item.pinned} onClick={() => void togglePin(item)}>{item.pinned ? "★" : "☆"}</button>
                             <button type="button" className="chat-action" aria-label={`Вернуть ${item.title} из архива`} disabled={busy}
                                     onClick={() => void archiveConversation(item)}>↩</button>
                         </div>)}
@@ -458,6 +932,12 @@ function App() {
                     <button type="button" className="secondary-button sidebar-toggle" aria-label="Открыть список чатов" aria-expanded={sidebarOpen}
                             onClick={() => setSidebarOpen((open) => !open)}>☰</button>
                     <h1>{selectedConversation?.title ?? "Беседа"}</h1>
+                    <select className="conversation-project" aria-label="Проект беседы" value={selectedConversation?.project_id ?? 0}
+                            disabled={busy || !selectedConversation} onChange={(event) => void moveConversation(Number(event.target.value) || null)}>
+                        <option value={0}>Без проекта</option>
+                        {projects.filter((item) => !item.archived || item.id === selectedConversation?.project_id)
+                            .map((item) => <option key={item.id} value={item.id}>{item.title}{item.archived ? " (архив)" : ""}</option>)}
+                    </select>
                     <button ref={compactSettingsButton} type="button" className="secondary-button compact-settings"
                             onClick={() => setSettingsOpen(true)}>Настройки</button>
                 </header>
@@ -477,7 +957,7 @@ function App() {
                                 <p>{message.content}</p>}
                             {history.attachments.filter((attachment) => attachment.message_id === message.id).map((attachment) => (
                                 <small
-                                    key={attachment.sha256 + attachment.name}>Файл: {attachment.name} · {attachment.size} Б
+                                    key={attachment.sha256 + attachment.name}>{attachment.mime.startsWith("image/") ? "Изображение" : "Файл"}: {attachment.name} · {attachment.size} Б
                                     · SHA-256 {attachment.sha256.slice(0, 12)}…</small>
                             ))}
                             {message.role !== "assistant" && message.status !== "completed" &&
@@ -542,22 +1022,103 @@ function App() {
                         setPrompt(event.target.value);
                         setContextPreview(null);
                     }}/>
+                    <section className="voice-input" aria-label="Голосовой ввод">
+                        <div className="voice-controls">
+                            {recording ? <button type="button" className="secondary-button" onClick={stopVoiceRecording}>Остановить запись</button> :
+                                <button type="button" className="secondary-button" disabled={busy || transcribing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
+                            {recording && <span role="status">Идёт запись · максимум 10 минут</span>}
+            {recordedAudio && <span>Запись: {recordedAudio.seconds.toFixed(1)} с · {(recordedAudio.base64.length * 0.75 / 1024).toFixed(0)} КБ</span>}
+                        </div>
+                        {transcriptionModels.length > 0 && <>
+                            <div className="voice-controls">
+                                <label htmlFor="transcription-model">Распознавание</label>
+                                <select id="transcription-model" value={selectedTranscriptionModel?.id ?? ""} onChange={(event) => setTranscriptionModelId(event.target.value)}>
+                                    {transcriptionModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.audio_rubles_per_minute} ₽/мин</option>)}
+                                </select>
+                                <button type="button" className="secondary-button" disabled={!recordedAudio || transcribing || !keySaved || !selectedTranscriptionModel || uncertainTranscription === recordedAudio?.id} onClick={() => void transcribeVoice()}>
+                                    {transcribing ? "Распознавание…" : "Распознать"}
+                                </button>
+                                {recordedAudio && <button type="button" className="secondary-button" disabled={transcribing} onClick={() => setRecordedAudio(null)}>Удалить запись</button>}
+                            </div>
+                            <small>SimpleClaw · тариф из <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">Provider API</a>, каталог от {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестной даты"}. Сначала покажем оценку и запросим подтверждение. Аудио временно хранится в памяти этого окна.</small>
+                        </>}
+                        {!transcriptionModels.length && <small>Нет моделей распознавания с опубликованным тарифом.</small>}
+                        {transcriptionText && <div className="transcription-result">
+                            <label htmlFor="transcription-text">Распознанный текст — проверьте и исправьте</label>
+                            <textarea id="transcription-text" value={transcriptionText} maxLength={2000} onChange={(event) => setTranscriptionText(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!transcriptionText.trim() || prompt.length + transcriptionText.trim().length + (prompt ? 1 : 0) > 2000} onClick={() => {
+                                setPrompt((current) => current ? `${current}\n${transcriptionText.trim()}` : transcriptionText.trim());
+                                setContextPreview(null);
+                                promptField.current?.focus();
+                            }}>Вставить в сообщение</button>
+                        </div>}
+                    </section>
                     <div className="attachment-controls">
+                        <div className="snapshot-controls">
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void captureWindowSnapshot()}>Снимок выбранного окна…</button>
+                            <small>macOS откроет системный выбор окна и при необходимости запросит разрешение «Запись экрана».</small>
+                        </div>
+                        {capturedSnapshot && <div className="snapshot-preview">
+                            <img src={capturedSnapshot.preview} alt="Предпросмотр снимка окна"/>
+                            <div><strong>Снимок пока не прикреплён</strong>
+                                <small>{capturedSnapshot.size} Б · SHA-256 {capturedSnapshot.sha256.slice(0, 12)}…</small>
+                                <div className="actions">
+                                    <button type="button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => void attachCapturedSnapshot()}>Прикрепить снимок</button>
+                                    <button type="button" className="secondary-button" onClick={() => setCapturedSnapshot(null)}>Удалить снимок</button>
+                                </div>
+                            </div>
+                        </div>}
                         {pendingAttachments.map((attachment) => (
                             <div className="attachment-item" key={attachment.id}>
                                 <span title={attachment.name}>{attachment.name} · {attachment.size} Б · SHA-256 {attachment.sha256.slice(0, 12)}…</span>
                                 <button type="button" className="secondary-button" disabled={busy}
                                         onClick={() => void removeAttachment(attachment.id)}>Убрать
                                 </button>
-                                <details>
+                                {attachment.mime.startsWith("image/") ? <img className="image-attachment-preview" src={attachment.preview} alt={attachment.name}/> : <details>
                                     <summary>Содержимое</summary>
                                     <pre>{attachment.preview}</pre>
-                                </details>
+                                </details>}
                             </div>
                         ))}
                     </div>
+                    {conversationProjectId !== null && <div className="project-materials">
+                        <div className="project-materials-heading">
+                            <strong>Материалы проекта</strong>
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void addProjectMaterial()}>Добавить материал</button>
+                        </div>
+                        <div className="project-folder-heading">
+                            <span>{projectFolderView ? `Папка: ${projectFolderView.folder_name} · только первый уровень · максимум ${projectFolderView.max_entries} элементов, ${Math.round(projectFolderView.max_file_bytes / 1024)} КБ на файл` : "Папка проекта не выбрана"}</span>
+                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void chooseProjectFolder()}>
+                                {projectFolderView ? "Сменить папку" : "Выбрать папку"}
+                            </button>
+                        </div>
+                        {projectFolderView?.files.map((file) => <div className="project-folder-file" key={file.relative_path}>
+                            <span>{file.relative_path} · {file.size === null ? "размер неизвестен" : `${file.size} Б`}{file.blocked_reason ? ` · ${file.blocked_reason}` : ""}</span>
+                            {file.blocked_reason === null && <button type="button" className="secondary-button" disabled={busy}
+                                    onClick={() => void previewProjectFile(file.relative_path)}>Просмотр</button>}
+                        </div>)}
+                        {projectFolderView && !projectFolderView.files.length && <p>Поддерживаемых файлов в корне папки нет.</p>}
+                        {folderPreview && <details open className="folder-preview">
+                            <summary>{folderPreview.name} · {folderPreview.size} Б · SHA-256 {folderPreview.sha256}</summary>
+                            <pre>{folderPreview.preview}</pre>
+                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void saveFolderPreview()}>
+                                Добавить эту версию в материалы
+                            </button>
+                        </details>}
+                        {projectMaterials.map((material) => <label className="project-material" key={material.id}>
+                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
+                                   onChange={(event) => {
+                                       setSelectedMaterialIds((ids) => event.target.checked ? [...ids, material.id] : ids.filter((id) => id !== material.id));
+                                       setContextPreview(null);
+                                   }}/>
+                            <span>{material.name} · версия {material.version} · {material.size} Б · SHA-256 {material.sha256.slice(0, 12)}…</span>
+                        </label>)}
+                        {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
+                    </div>}
                     {contextPreview && <details open className="context-preview">
-                        <summary>Состав запроса · {contextPreview.bytes} Б · пропущено завершённых
+                        <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
                         <p>{contextPreview.warning}</p>
                         {contextPreview.messages.map((part, index) => <pre
@@ -572,18 +1133,23 @@ function App() {
                             }}>
                                 <option value="local-mock">Локальный тест</option>
                                 {categoryOrder.map((category) => <optgroup key={category} label={categoryLabel[category]}>
-                                    {catalog?.models.filter((model) => (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
+                                    {catalog?.models.filter((model) => (!model.protocols.length || model.protocols.includes("chat_completions"))
+                                        && (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
                                         .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
                                 </optgroup>)}
                             </select>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length >= 5}
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void pickImageAttachment()}>Прикрепить изображение</button>
                             <details className="model-details">
                                 <summary>О модели</summary>
                                 <p>{catalog ? `Каталог: ${new Date(catalog.fetched_at * 1000).toLocaleString()}` : "Каталог ещё не загружен"}</p>
                                 {catalogError && <p role="alert">Ошибка обновления каталога: {catalogError}. {catalog ? "Сохранённый каталог доступен." : "Каталог недоступен."}</p>}
                                 {modelId !== "local-mock" && <>
-                                    <p>Цена: {selectedModel?.input_rubles_per_million ?? "неизвестна"} ₽/млн входных; {selectedModel?.output_rubles_per_million ?? "неизвестна"} ₽/млн выходных. Лимит контекста и пригодность для текстового чата не подтверждены.</p>
+                                    <p>Цена: {selectedModel?.input_rubles_per_million ?? "неизвестна"} ₽/млн входных; {selectedModel?.output_rubles_per_million ?? "неизвестна"} ₽/млн выходных. Источник и дата каталога: <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">Provider API, GET /v1/models</a>, {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестны"}.</p>
+                                    <p>Окно контекста и токенизатор: неизвестны — каталог их не сообщает. Возможность работы с текстом отдельно для этой модели не подтверждена.</p>
+                                    <p>Изображения: пример с gpt-6-luna опубликован в <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">документации Provider API</a>, проверено 9 ноября 2026. Для остальных моделей поддержка неизвестна.</p>
                                     <label htmlFor="model-category">Ваша категория модели</label>
                                     <select id="model-category" value={selectedCategory?.category ?? "other"} onChange={(event) => void changeCategory(event.target.value)}>
                                         <option value="other">Остальные</option><option value="thinking">Мышление</option>
@@ -598,19 +1164,95 @@ function App() {
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), modelId, history.active_leaf_id])}>Отправить
+                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id])}>Отправить
                             </button>}
                         </div>
                     </div>
-                    <p className="send-warning">{modelId === "local-mock" ? "Локальный тест · без сети" : "Отправка в SimpleClaw может стоить денег. Расход при обрыве неизвестен."}</p>
+                    <p className="send-warning">{modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
+                    {hasImage && !imageModelSupported && <p role="alert">Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение.</p>}
                     {modelId !== "local-mock" && !keySaved && <p role="alert">Ключ SimpleClaw не сохранён. Откройте настройки.</p>}
                     {catalogError && <p role="alert">Ошибка обновления каталога. {catalog ? "Сохранённый каталог доступен." : "Каталог недоступен."}</p>}
                     {error && <p role="alert">{error}</p>}
                 </form>
+                <details className="synthetic-task-panel" open={syntheticTasks.some((task) => task.status === "awaiting_approval")}>
+                    <summary>Локальная демонстрация многошаговых действий</summary>
+                    <p>Синтетические шаги работают только в SQLite. Здесь нет сетевых запросов, файловых команд или внешних инструментов.</p>
+                    <button type="button" className="secondary-button" onClick={() => void startSyntheticTask()}>Создать демонстрацию</button>
+                    {syntheticTasks.map((task) => <article className="synthetic-task" key={task.id}>
+                        <h2>{task.title} · {task.status === "awaiting_approval" ? "ожидает решения" : task.status === "completed" ? "завершена" : "отклонена"}</h2>
+                        {task.steps.map((step) => <div className="synthetic-task-step" key={step.id}>
+                            <p>{step.ordinal + 1}. {step.action} · {step.decision === "pending" ? "ожидает разрешения" : step.decision === "approved" ? "разрешено" : "отклонено"}</p>
+                            {step.result && <p>{step.result}</p>}
+                            {step.decision === "pending" && <div className="actions">
+                                <button type="button" onClick={() => void decideSyntheticStep(task.id, step.id, "approve")}>Разрешить и выполнить</button>
+                                <button type="button" className="secondary-button" onClick={() => void decideSyntheticStep(task.id, step.id, "deny")}>Отклонить</button>
+                            </div>}
+                        </div>)}
+                    </article>)}
+                </details>
+                <details className="image-generation-panel">
+                    <summary>Генерация изображения</summary>
+                    <p>Поставщик: SimpleClaw. Один запрос создаёт одно изображение. Перед каждым платным запросом потребуется подтверждение.</p>
+                    <label htmlFor="image-generation-model">Модель</label>
+                    <select id="image-generation-model" value={imageModelId || imageModels[0]?.id || ""} disabled={imageGenerationBusy}
+                            onChange={(event) => setImageModelId(event.target.value)}>
+                        {imageModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
+                    </select>
+                    {imageModels.length > 0 && <p>Цена: {imageModels.find((model) => model.id === (imageModelId || imageModels[0]?.id))?.request_rubles == null
+                        ? "неизвестна — запрос заблокирован"
+                        : `${imageModels.find((model) => model.id === (imageModelId || imageModels[0]?.id))?.request_rubles} ₽ за успешный запрос`}.
+                        Источник и дата: <a href="https://simple-claw.ru/v1/models" target="_blank" rel="noreferrer">публичный каталог моделей</a>, {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестны"}.
+                    </p>}
+                    <button type="button" className="secondary-button" disabled={imageGenerationBusy} onClick={() => void refreshModelCatalog()}>Обновить каталог и цену</button>
+                    {!imageModels.length && <p>В сохранённом каталоге нет подтверждённых моделей генерации.</p>}
+                    <label htmlFor="image-generation-prompt">Описание изображения</label>
+                    <textarea id="image-generation-prompt" maxLength={32_000} value={imagePrompt} disabled={imageGenerationBusy}
+                              onChange={(event) => setImagePrompt(event.target.value)} placeholder="Опишите изображение"/>
+                    <button type="button" disabled={imageGenerationBusy || !imagePrompt.trim() || uncertainImageSignature === JSON.stringify([imageModelId || imageModels[0]?.id || "", imagePrompt.trim()]) || !imageModels.some((model) => model.id === (imageModelId || imageModels[0]?.id) && model.request_rubles !== null)}
+                            onClick={() => void generateImage()}>{imageGenerationBusy ? "Запрос выполняется…" : "Проверить цену и сгенерировать"}</button>
+                    {uncertainImageSignature === JSON.stringify([imageModelId || imageModels[0]?.id || "", imagePrompt.trim()]) && <p role="alert">Результат предыдущего запроса неизвестен; повтор этого же запроса заблокирован.</p>}
+                    {generatedImage && <div className="generated-image-result">
+                        <img src={generatedImage.data_url} alt={`Результат ${generatedImage.model_id}`}/>
+                        <p>{generatedImage.model_id} · {generatedImage.price_rubles} ₽ за успешный запрос</p>
+                        <button type="button" className="secondary-button" onClick={() => void saveGeneratedImage()}>
+                            {imageSaved ? "Файл сохранён" : "Сохранить PNG…"}
+                        </button>
+                    </div>}
+                </details>
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}
                                                  onExport={(id) => void exportArtifact(id)} onError={setError}/>}
+            <dialog ref={paletteDialog} className="command-palette" aria-labelledby="command-palette-title"
+                    onCancel={(event) => { event.preventDefault(); closePalette(); }}>
+                <h2 id="command-palette-title">Команды</h2>
+                <input ref={paletteInput} type="search" aria-label="Поиск команд" placeholder="Введите команду…"
+                       value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)}
+                       onKeyDown={(event) => {
+                           const buttons = paletteDialog.current?.querySelectorAll<HTMLButtonElement>(".command-list button");
+                           if (event.key === "ArrowDown" && buttons?.length) { event.preventDefault(); buttons[0].focus(); }
+                           else if (event.key === "Enter" && paletteCommands.length === 1) { event.preventDefault(); runPaletteCommand(paletteCommands[0].id); }
+                       }}/>
+                <div className="command-list">
+                    {paletteCommands.map((command) => <button key={command.id} type="button" className="secondary-button"
+                        disabled={busy && ["new", "attach", "attach-image"].includes(command.id)}
+                        onKeyDown={(event) => {
+                            const buttons = Array.from(event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+                            const index = buttons.indexOf(event.currentTarget);
+                            if (event.key === "ArrowDown") {
+                                event.preventDefault();
+                                buttons[(index + 1) % buttons.length]?.focus();
+                            } else if (event.key === "ArrowUp") {
+                                event.preventDefault();
+                                if (index === 0) paletteInput.current?.focus();
+                                else buttons[index - 1]?.focus();
+                            }
+                        }}
+                        onClick={() => runPaletteCommand(command.id)}>{command.label}</button>)}
+                    {!paletteCommands.length && <p>Команды не найдены.</p>}
+                </div>
+                <p className="palette-hint">↑ ↓ выбрать · Enter открыть · Esc закрыть · ⌘K / Ctrl+K</p>
+            </dialog>
             <dialog ref={settingsDialog} className="settings-dialog" aria-labelledby="settings-title"
                     onCancel={(event) => { event.preventDefault(); closeSettings(); }}>
                 <header className="settings-header"><h2 id="settings-title">Настройки</h2>
@@ -632,6 +1274,15 @@ function App() {
                     <label htmlFor="theme">Тема</label>
                     <select id="theme" value={theme} onChange={(event) => setTheme(event.target.value as Theme)}>
                         <option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option>
+                    </select>
+                </section>
+                <section className="settings-section" aria-labelledby="response-style-title">
+                    <h3 id="response-style-title">Стиль ответа</h3>
+                    <label htmlFor="response-style">Для следующих запросов</label>
+                    <select id="response-style" value={responseStyle} disabled={busy}
+                            onChange={(event) => void updateResponseStyle(event.target.value as ContextPreview["response_style"])}>
+                        <option value="concise">Кратко</option><option value="balanced">Сбалансированно</option>
+                        <option value="detailed">Подробно</option>
                     </select>
                 </section>
                 <section className="settings-section" aria-labelledby="data-title">
