@@ -672,6 +672,18 @@ textarea::placeholder {
     margin: 6px 0;
 }
 
+.agent-sources {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.agent-sources pre {
+    margin: 4px 0 8px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .settings-dialog {
     width: min(440px, calc(100% - 32px));
     max-height: calc(100% - 32px);
@@ -752,6 +764,88 @@ textarea::placeholder {
 
 .synthetic-task-step {
     padding-left: 12px;
+}
+
+.agent-board-panel {
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+}
+
+.agent-board-panel > p, .agent-board-panel section > p {
+    color: var(--muted);
+}
+
+.agent-board-panel section {
+    margin-top: 14px;
+}
+
+.agent-board-panel h2 {
+    font-size: 14px;
+}
+
+.agent-board-entry, .agent-board-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0;
+}
+
+.agent-board-entry input {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 8px;
+    color: var(--text);
+    background: var(--field);
+    border: 1px solid var(--border);
+}
+
+.agent-board-item span {
+    flex: 1;
+    overflow-wrap: anywhere;
+}
+
+.agent-skill-picker {
+    display: grid;
+    gap: 6px;
+    margin-top: 14px;
+}
+
+.agent-skill-picker h3 {
+    margin: 0;
+    font-size: 14px;
+}
+
+.agent-skill-picker p, .agent-skill-picker small {
+    color: var(--muted);
+}
+
+.agent-skill-picker select {
+    min-width: 0;
+    padding: 6px 8px;
+    color: var(--text);
+    background: var(--field);
+    border: 1px solid var(--border);
+}
+
+.agent-skill-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.scheduled-task-notice, .scheduled-task-panel {
+    padding: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.scheduled-task-notice { background: var(--surface-muted); }
+.scheduled-task-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
+.scheduled-task-panel label { display: grid; gap: 4px; margin: 8px 0; }
+
+.agent-skill-picker pre {
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
 }
 
 .image-generation-panel {

@@ -3,7 +3,7 @@ use image::{ImageFormat, ImageReader, Limits};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -15,6 +15,51 @@ use tauri::{ipc::Channel, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 type Db = Arc<Mutex<Connection>>;
+const VERIFIED_TOOL_MODEL_ID: &str = "gpt-oss-20b";
+
+#[derive(Default)]
+struct PendingToolCalls {
+    calls: BTreeMap<usize, PendingToolCall>,
+    usage: Option<serde_json::Value>,
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+fn calculator_tool() -> serde_json::Value {
+    serde_json::json!({"type":"function","function":{"name":"calculate","description":"Вычисляет два числа локально.","parameters":{"type":"object","properties":{"operation":{"type":"string","enum":["add","subtract","multiply","divide"]},"a":{"type":"number"},"b":{"type":"number"}},"required":["operation","a","b"],"additionalProperties":false}}})
+}
+
+fn project_search_tool() -> serde_json::Value {
+    serde_json::json!({"type":"function","function":{"name":"search_project","description":"Ищет буквальную фразу только в поддерживаемых текстовых файлах первого уровня выбранной папки проекта. Вернёт короткие фрагменты с путями и номерами строк.","parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":200}},"required":["query"],"additionalProperties":false}}})
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct AgentSource {
+    relative_path: String,
+    line: usize,
+    excerpt: String,
+}
+
+fn run_calculator_tool(arguments: &str) -> Result<serde_json::Value, String> {
+    let input: serde_json::Value = serde_json::from_str(arguments).map_err(|_| "INVALID_TOOL_ARGUMENTS")?;
+    let a = input.get("a").and_then(serde_json::Value::as_f64).ok_or("INVALID_TOOL_ARGUMENTS")?;
+    let b = input.get("b").and_then(serde_json::Value::as_f64).ok_or("INVALID_TOOL_ARGUMENTS")?;
+    let result = match input.get("operation").and_then(serde_json::Value::as_str) {
+        Some("add") => a + b,
+        Some("subtract") => a - b,
+        Some("multiply") => a * b,
+        Some("divide") if b != 0.0 => a / b,
+        Some("divide") => return Err("DIVISION_BY_ZERO".into()),
+        _ => return Err("INVALID_TOOL_ARGUMENTS".into()),
+    };
+    if !result.is_finite() { return Err("INVALID_TOOL_RESULT".into()); }
+    Ok(serde_json::json!({"result": result}))
+}
 
 struct AppState {
     db: Db,
@@ -86,7 +131,24 @@ struct ContextPreview {
     bytes: usize,
     #[serde(default)]
     request_bytes: usize,
+    #[serde(default)]
+    agent_sources: Vec<AgentSource>,
+    #[serde(default)]
+    agent_files_read: Vec<String>,
+    #[serde(default)]
+    agent_skill: Option<AgentSkill>,
     warning: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AgentSkill {
+    material_id: i64,
+    name: String,
+    version: i64,
+    size: i64,
+    sha256: String,
+    instructions: String,
+    enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -105,6 +167,40 @@ struct AgentTask {
     status: String,
     created_at: i64,
     steps: Vec<AgentTaskStep>,
+}
+
+#[derive(Serialize)]
+struct ScheduledAgentTask {
+    id: i64,
+    conversation_id: i64,
+    title: String,
+    prompt: String,
+    interval_minutes: i64,
+    next_run_at: i64,
+    status: String,
+    due_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct AgentPlanStep {
+    id: i64,
+    ordinal: i64,
+    action: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct AgentBoardItem {
+    id: i64,
+    text: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct AgentBoard {
+    plan: Vec<AgentPlanStep>,
+    queue: Vec<AgentBoardItem>,
+    steering: Vec<AgentBoardItem>,
 }
 
 #[derive(Clone)]
@@ -316,7 +412,19 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0015_durable_tasks.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 14 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 14 {
+        db.execute_batch(include_str!("../migrations/0016_agent_board.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 15 {
+        db.execute_batch(include_str!("../migrations/0017_agent_skills.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 16 {
+        db.execute_batch(include_str!("../migrations/0018_scheduled_agent_tasks.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 17 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -394,6 +502,95 @@ fn list_synthetic_tasks(state: State<'_, AppState>) -> Result<Vec<AgentTask>, St
 }
 
 #[tauri::command]
+fn list_scheduled_agent_tasks(state: State<'_, AppState>) -> Result<Vec<ScheduledAgentTask>, String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    list_scheduled_agent_tasks_in_db(&mut db, now_unix())
+}
+
+fn now_unix() -> i64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
+
+fn list_scheduled_agent_tasks_in_db(db: &mut Connection, now: i64) -> Result<Vec<ScheduledAgentTask>, String> {
+    let tx = db.transaction().map_err(|_| "Не удалось проверить расписание")?;
+    let due = {
+        let mut query = tx.prepare("SELECT id, interval_minutes, next_run_at FROM scheduled_agent_tasks WHERE status='active' AND next_run_at<=?1")
+            .map_err(|_| "Не удалось прочитать расписание")?;
+        let rows = query.query_map([now], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
+            .map_err(|_| "Не удалось прочитать расписание")?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать расписание")?;
+        rows
+    };
+    for (id, interval_minutes, scheduled_at) in due {
+        let period = interval_minutes * 60;
+        let next = scheduled_at + ((now - scheduled_at) / period + 1) * period;
+        tx.execute("UPDATE scheduled_agent_tasks SET status='awaiting_confirmation', due_at=?1, next_run_at=?2 WHERE id=?3 AND status='active'",
+            params![now, next, id]).map_err(|_| "Не удалось отметить задачу")?;
+    }
+    let mut query = tx.prepare("SELECT id, conversation_id, title, prompt, interval_minutes, next_run_at, status, due_at FROM scheduled_agent_tasks ORDER BY id DESC")
+        .map_err(|_| "Не удалось прочитать расписание")?;
+    let tasks = query.query_map([], |row| Ok(ScheduledAgentTask {
+        id: row.get(0)?, conversation_id: row.get(1)?, title: row.get(2)?, prompt: row.get(3)?, interval_minutes: row.get(4)?,
+        next_run_at: row.get(5)?, status: row.get(6)?, due_at: row.get(7)?,
+    })).map_err(|_| "Не удалось прочитать расписание")?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать расписание")?;
+    drop(query);
+    tx.commit().map_err(|_| "Не удалось сохранить состояние расписания")?;
+    Ok(tasks)
+}
+
+#[tauri::command]
+fn create_scheduled_agent_task(conversation_id: i64, title: String, prompt: String, interval_minutes: i64, state: State<'_, AppState>) -> Result<i64, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    create_scheduled_agent_task_in_db(&db, conversation_id, &title, &prompt, interval_minutes, now_unix())
+}
+
+fn create_scheduled_agent_task_in_db(db: &Connection, conversation_id: i64, title: &str, prompt: &str, interval_minutes: i64, now: i64) -> Result<i64, String> {
+    let title = title.trim();
+    let prompt = prompt.trim();
+    if title.is_empty() || title.chars().count() > 120 || prompt.is_empty() || prompt.chars().count() > 2000 || !(1..=10080).contains(&interval_minutes) {
+        return Err("Укажите название, задачу до 2000 символов и период от 1 минуты до 7 дней".into());
+    }
+    let existing: Vec<String> = {
+        let mut query = db.prepare("SELECT prompt FROM scheduled_agent_tasks WHERE conversation_id=?1 AND status IN ('active','awaiting_confirmation')")
+            .map_err(|_| "Не удалось проверить повторы")?;
+        let rows = query.query_map([conversation_id], |row| row.get(0)).map_err(|_| "Не удалось проверить повторы")?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось проверить повторы")?;
+        rows
+    };
+    let normalized = normalize_board_text(prompt);
+    if existing.iter().any(|item| normalize_board_text(item) == normalized) { return Err("Такая задача уже есть в активном расписании".into()); }
+    db.execute("INSERT INTO scheduled_agent_tasks(conversation_id,title,prompt,interval_minutes,next_run_at,status) VALUES(?1,?2,?3,?4,?5,'active')",
+        params![conversation_id, title, prompt, interval_minutes, now + interval_minutes * 60])
+        .map(|_| db.last_insert_rowid()).map_err(|_| "Не удалось сохранить расписание".into())
+}
+
+#[tauri::command]
+fn stop_scheduled_agent_task(task_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    stop_scheduled_agent_task_in_db(&db, task_id)
+}
+
+fn stop_scheduled_agent_task_in_db(db: &Connection, task_id: i64) -> Result<(), String> {
+    let changed = db.execute("UPDATE scheduled_agent_tasks SET status='stopped', due_at=NULL WHERE id=?1 AND status!='stopped'", [task_id])
+        .map_err(|_| "Не удалось остановить расписание")?;
+    if changed == 0 { return Err("Активное расписание не найдено".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn prepare_scheduled_agent_task(task_id: i64, state: State<'_, AppState>) -> Result<String, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    prepare_scheduled_agent_task_in_db(&db, task_id)
+}
+
+fn prepare_scheduled_agent_task_in_db(db: &Connection, task_id: i64) -> Result<String, String> {
+    let changed = db.execute("UPDATE scheduled_agent_tasks SET status='active', due_at=NULL WHERE id=?1 AND status='awaiting_confirmation'", [task_id])
+        .map_err(|_| "Не удалось подтвердить задачу")?;
+    if changed == 0 { return Err("Задача уже подтверждена или остановлена".into()); }
+    db.query_row("SELECT prompt FROM scheduled_agent_tasks WHERE id=?1", [task_id], |row| row.get(0))
+        .map_err(|_| "Не удалось прочитать задачу".into())
+}
+
+#[tauri::command]
 fn approve_synthetic_step(task_id: i64, step_id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let mut db = state.db.lock().map_err(|_| "База занята")?;
     approve_synthetic_step_in_db(&mut db, task_id, step_id)
@@ -434,6 +631,139 @@ fn deny_synthetic_step_in_db(db: &mut Connection, task_id: i64, step_id: i64) ->
     Ok(())
 }
 
+fn normalize_board_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn validate_board_text(text: &str, limit: usize) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > limit { return Err("Введите текст в пределах допустимой длины".into()); }
+    Ok(text.into())
+}
+
+fn get_agent_board_in_db(db: &Connection, conversation_id: i64) -> Result<AgentBoard, String> {
+    let mut plan_query = db.prepare("SELECT id, ordinal, action, status FROM agent_plan_steps WHERE conversation_id=?1 ORDER BY ordinal")
+        .map_err(|_| "Не удалось прочитать план")?;
+    let plan = plan_query.query_map([conversation_id], |row| Ok(AgentPlanStep { id: row.get(0)?, ordinal: row.get(1)?, action: row.get(2)?, status: row.get(3)? }))
+        .map_err(|_| "Не удалось прочитать план")?.collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать план")?;
+    let mut queue_query = db.prepare("SELECT id, request, status FROM agent_queue_items WHERE conversation_id=?1 ORDER BY id")
+        .map_err(|_| "Не удалось прочитать очередь")?;
+    let queue = queue_query.query_map([conversation_id], |row| Ok(AgentBoardItem { id: row.get(0)?, text: row.get(1)?, status: row.get(2)? }))
+        .map_err(|_| "Не удалось прочитать очередь")?.collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать очередь")?;
+    let mut steering_query = db.prepare("SELECT id, note, status FROM agent_steering_notes WHERE conversation_id=?1 ORDER BY id")
+        .map_err(|_| "Не удалось прочитать уточнения")?;
+    let steering = steering_query.query_map([conversation_id], |row| Ok(AgentBoardItem { id: row.get(0)?, text: row.get(1)?, status: row.get(2)? }))
+        .map_err(|_| "Не удалось прочитать уточнения")?.collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать уточнения")?;
+    Ok(AgentBoard { plan, queue, steering })
+}
+
+fn board_conversation_is_active(db: &Connection, conversation_id: i64) -> Result<(), String> {
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?1 AND archived=0)", [conversation_id], |row| row.get(0))
+        .map_err(|_| "Не удалось проверить беседу")?;
+    if exists { Ok(()) } else { Err("Беседа не найдена или находится в архиве".into()) }
+}
+
+fn add_agent_plan_step_in_db(db: &mut Connection, conversation_id: i64, action: &str) -> Result<i64, String> {
+    let action = validate_board_text(action, 200)?;
+    let tx = db.transaction().map_err(|_| "Не удалось изменить план")?;
+    board_conversation_is_active(&tx, conversation_id)?;
+    let mut statement = tx.prepare("SELECT action FROM agent_plan_steps WHERE conversation_id=?1").map_err(|_| "Не удалось проверить план")?;
+    let existing = statement.query_map([conversation_id], |row| row.get::<_, String>(0)).map_err(|_| "Не удалось проверить план")?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось проверить план")?;
+    if existing.iter().any(|item| normalize_board_text(item) == normalize_board_text(&action)) { return Err("Такое действие уже есть в плане, включая выполненные шаги".into()); }
+    drop(statement);
+    let pending: i64 = tx.query_row("SELECT count(*) FROM agent_plan_steps WHERE conversation_id=?1 AND status='pending'", [conversation_id], |row| row.get(0)).map_err(|_| "Не удалось проверить план")?;
+    if pending >= 20 { return Err("В плане может быть не больше 20 незавершённых шагов".into()); }
+    let ordinal: i64 = tx.query_row("SELECT coalesce(max(ordinal), -1) + 1 FROM agent_plan_steps WHERE conversation_id=?1", [conversation_id], |row| row.get(0)).map_err(|_| "Не удалось изменить план")?;
+    tx.execute("INSERT INTO agent_plan_steps(conversation_id, ordinal, action) VALUES(?1, ?2, ?3)", params![conversation_id, ordinal, action])
+        .map_err(|_| "Не удалось сохранить шаг плана")?;
+    let id = tx.last_insert_rowid();
+    tx.commit().map_err(|_| "Не удалось сохранить шаг плана")?;
+    Ok(id)
+}
+
+fn complete_agent_plan_step_in_db(db: &mut Connection, conversation_id: i64, step_id: i64) -> Result<(), String> {
+    let changed = db.execute("UPDATE agent_plan_steps SET status='completed', completed_at=unixepoch() WHERE id=?1 AND conversation_id=?2 AND status='pending'", params![step_id, conversation_id])
+        .map_err(|_| "Не удалось завершить шаг плана")?;
+    if changed == 0 { return Err("Шаг уже выполнен или не найден".into()); }
+    Ok(())
+}
+
+fn add_agent_input_in_db(db: &mut Connection, conversation_id: i64, kind: &str, text: &str) -> Result<i64, String> {
+    let text = validate_board_text(text, if kind == "steering" { 1000 } else { 2000 })?;
+    if kind != "queue" && kind != "steering" { return Err("Неизвестный тип записи".into()); }
+    let tx = db.transaction().map_err(|_| "Не удалось сохранить запись")?;
+    board_conversation_is_active(&tx, conversation_id)?;
+    let (table, column, status) = if kind == "queue" { ("agent_queue_items", "request", "queued") } else { ("agent_steering_notes", "note", "pending") };
+    let sql = format!("SELECT {column} FROM {table} WHERE conversation_id=?1");
+    let mut statement = tx.prepare(&sql).map_err(|_| "Не удалось проверить повторы")?;
+    let existing = statement.query_map([conversation_id], |row| row.get::<_, String>(0)).map_err(|_| "Не удалось проверить повторы")?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось проверить повторы")?;
+    if existing.iter().any(|item| normalize_board_text(item) == normalize_board_text(&text)) { return Err("Такая запись уже есть; повтор не добавлен".into()); }
+    drop(statement);
+    let outstanding: i64 = tx.query_row(&format!("SELECT count(*) FROM {table} WHERE conversation_id=?1 AND status IN ('queued','pending')"), [conversation_id], |row| row.get(0))
+        .map_err(|_| "Не удалось проверить очередь")?;
+    if outstanding >= 20 { return Err("Можно хранить не больше 20 ожидающих записей такого типа".into()); }
+    let sql = if kind == "queue" {
+        "INSERT INTO agent_queue_items(conversation_id, request, status) VALUES(?1, ?2, ?3)"
+    } else {
+        "INSERT INTO agent_steering_notes(conversation_id, note, status) VALUES(?1, ?2, ?3)"
+    };
+    tx.execute(sql, params![conversation_id, text, status]).map_err(|_| "Не удалось сохранить запись")?;
+    let id = tx.last_insert_rowid();
+    tx.commit().map_err(|_| "Не удалось сохранить запись")?;
+    Ok(id)
+}
+
+fn mark_agent_input_submitted_in_db(db: &Connection, conversation_id: i64, kind: &str, item_id: i64) -> Result<(), String> {
+    let (sql, submitted) = match kind {
+        "queue" => ("UPDATE agent_queue_items SET status='submitted', submitted_at=unixepoch() WHERE id=?1 AND conversation_id=?2 AND status='queued'", "queued"),
+        "steering" => ("UPDATE agent_steering_notes SET status='submitted', submitted_at=unixepoch() WHERE id=?1 AND conversation_id=?2 AND status='pending'", "pending"),
+        _ => return Err("Неизвестный тип записи".into()),
+    };
+    if db.execute(sql, params![item_id, conversation_id]).map_err(|_| "Не удалось отметить отправку")? == 0 {
+        return Err(format!("Запись уже отправлена или не найдена (состояние {submitted})"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_agent_board(conversation_id: i64, state: State<'_, AppState>) -> Result<AgentBoard, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    board_conversation_is_active(&db, conversation_id)?;
+    get_agent_board_in_db(&db, conversation_id)
+}
+
+#[tauri::command]
+fn add_agent_plan_step(conversation_id: i64, action: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    add_agent_plan_step_in_db(&mut db, conversation_id, &action).map(|_| ())
+}
+
+#[tauri::command]
+fn complete_agent_plan_step(conversation_id: i64, step_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    complete_agent_plan_step_in_db(&mut db, conversation_id, step_id)
+}
+
+#[tauri::command]
+fn add_agent_queue_item(conversation_id: i64, request: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    add_agent_input_in_db(&mut db, conversation_id, "queue", &request).map(|_| ())
+}
+
+#[tauri::command]
+fn add_agent_steering_note(conversation_id: i64, note: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    add_agent_input_in_db(&mut db, conversation_id, "steering", &note).map(|_| ())
+}
+
+#[tauri::command]
+fn mark_agent_input_submitted(conversation_id: i64, kind: String, item_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    mark_agent_input_submitted_in_db(&db, conversation_id, &kind, item_id)
+}
+
 fn decode_text(bytes: &[u8]) -> Result<String, String> {
     if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
         let data = &bytes[2..];
@@ -458,8 +788,7 @@ fn attachment_metadata(path: &Path) -> Result<(String, u64), String> {
     let path = path.canonicalize().map_err(|_| "Файл не найден")?;
     let name = path.file_name().and_then(|part| part.to_str()).ok_or("Некорректное имя файла")?.to_owned();
     let lower = name.to_ascii_lowercase();
-    if lower == ".env" || lower.starts_with(".env.") || ["id_rsa", "id_ed25519", "credentials", "secrets"].contains(&lower.as_str())
-        || ["pem", "key", "p12", "pfx"].contains(&path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase().as_str()) {
+    if is_secret_attachment(&lower, &path) {
         return Err("Файл с возможными секретами нельзя прикрепить".into());
     }
     let extension = path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -472,6 +801,11 @@ fn attachment_metadata(path: &Path) -> Result<(String, u64), String> {
     }
     if metadata.len() > 256 * 1024 { return Err("Файл больше 256 КБ".into()); }
     Ok((name, metadata.len()))
+}
+
+fn is_secret_attachment(lower_name: &str, path: &Path) -> bool {
+    lower_name == ".env" || lower_name.starts_with(".env.") || ["id_rsa", "id_ed25519", "credentials", "secrets"].contains(&lower_name)
+        || ["pem", "key", "p12", "pfx"].contains(&path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase().as_str())
 }
 
 fn prepare_attachment(path: &Path, id: i64) -> Result<PendingAttachment, String> {
@@ -596,6 +930,33 @@ fn context_attachment(db: &Connection, tail: Option<(&str, &[&PendingAttachment]
     }
     db.query_row("SELECT mime, content FROM attachments WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|_| "Не удалось прочитать вложение".to_owned())
+}
+
+#[cfg(test)]
+fn with_calculator_tool(mut payload: serde_json::Value, enabled: bool) -> Result<serde_json::Value, String> {
+    if enabled {
+        let request = payload.as_object_mut().ok_or("INVALID_REQUEST")?;
+        request.insert("tools".into(), serde_json::json!([calculator_tool()]));
+        request.insert("tool_choice".into(), serde_json::json!("auto"));
+    }
+    if serde_json::to_vec(&payload).map_err(|_| "Не удалось собрать запрос")?.len() > 5 * 1024 * 1024 {
+        return Err("Запрос превышает предел 5 МиБ".into());
+    }
+    Ok(payload)
+}
+
+fn with_agent_tools(mut payload: serde_json::Value, enabled: bool, project_search_enabled: bool) -> Result<serde_json::Value, String> {
+    if enabled {
+        let request = payload.as_object_mut().ok_or("INVALID_REQUEST")?;
+        let mut tools = vec![calculator_tool()];
+        if project_search_enabled { tools.push(project_search_tool()); }
+        request.insert("tools".into(), serde_json::Value::Array(tools));
+        request.insert("tool_choice".into(), serde_json::json!("auto"));
+    }
+    if serde_json::to_vec(&payload).map_err(|_| "Не удалось собрать запрос")?.len() > 5 * 1024 * 1024 {
+        return Err("Запрос превышает предел 5 МиБ".into());
+    }
+    Ok(payload)
 }
 
 fn chat_payload(db: &Connection, context: &ContextPreview, tail: Option<(&str, &[&PendingAttachment])>) -> Result<serde_json::Value, String> {
@@ -937,7 +1298,7 @@ fn selected_project_materials(db: &Connection, conversation_id: i64, material_id
     if material_ids.len() > 5 || material_ids.iter().enumerate().any(|(index, id)| material_ids[..index].contains(id)) {
         return Err("Выберите не больше пяти разных материалов".into());
     }
-    let project_id: Option<i64> = db.query_row("SELECT project_id FROM conversations WHERE id=?1 AND archived=0", [conversation_id], |row| row.get(0))
+    let project_id: Option<i64> = db.query_row("SELECT c.project_id FROM conversations c JOIN projects p ON p.id=c.project_id WHERE c.id=?1 AND c.archived=0 AND p.archived=0", [conversation_id], |row| row.get(0))
         .map_err(|_| "Беседа не найдена или в архиве")?;
     let Some(project_id) = project_id else {
         if material_ids.is_empty() { return Ok(Vec::new()); }
@@ -953,6 +1314,75 @@ fn selected_project_materials(db: &Connection, conversation_id: i64, material_id
         selected.push(PendingAttachment { id: -*id, name: format!("{name} · версия {version}"), mime: "text/plain".into(), content, preview });
     }
     Ok(selected)
+}
+
+const AGENT_SKILL_MAX_BYTES: usize = 16 * 1024;
+
+fn validate_agent_skill_source(name: &str, content: &[u8]) -> Result<String, String> {
+    let lower = name.to_ascii_lowercase();
+    let path = Path::new(name);
+    if is_secret_attachment(&lower, path) { return Err("Источник навыка заблокирован как возможный секрет".into()); }
+    if path.extension().and_then(|part| part.to_str()).unwrap_or("").eq_ignore_ascii_case("md") == false {
+        return Err("Навык должен быть выбранным Markdown-файлом (.md)".into());
+    }
+    if content.is_empty() || content.len() > AGENT_SKILL_MAX_BYTES { return Err("Инструкции навыка должны быть не больше 16 КиБ".into()); }
+    let instructions = decode_text(content)?;
+    if instructions.contains('\0') { return Err("Файл навыка не похож на текстовый".into()); }
+    Ok(instructions)
+}
+
+fn get_agent_skill_in_db(db: &Connection, conversation_id: i64) -> Result<Option<AgentSkill>, String> {
+    let selected: Option<(i64, bool)> = db.query_row(
+        "SELECT material_id, enabled FROM conversation_agent_skills WHERE conversation_id=?1", [conversation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(|_| "Не удалось прочитать настройку навыка")?;
+    let Some((material_id, enabled)) = selected else { return Ok(None); };
+    let row: (String, i64, i64, String, Vec<u8>) = db.query_row(
+        "SELECT m.name, m.version, m.size, m.sha256, m.content
+         FROM conversations c JOIN project_materials m ON m.id=?2 JOIN projects p ON p.id=m.project_id
+         WHERE c.id=?1 AND c.archived=0 AND c.project_id=m.project_id AND p.archived=0",
+        params![conversation_id, material_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).map_err(|_| "Источник навыка больше не принадлежит активному проекту этой беседы".to_string())?;
+    let instructions = validate_agent_skill_source(&row.0, &row.4)?;
+    if row.2 != row.4.len() as i64 || format!("{:x}", Sha256::digest(&row.4)) != row.3 {
+        return Err("Источник навыка повреждён".into());
+    }
+    Ok(Some(AgentSkill { material_id, name: row.0, version: row.1, size: row.2, sha256: row.3, instructions, enabled }))
+}
+
+fn set_agent_skill_in_db(db: &Connection, conversation_id: i64, material_id: Option<i64>, enabled: bool) -> Result<(), String> {
+    let project_id: Option<i64> = db.query_row("SELECT project_id FROM conversations WHERE id=?1 AND archived=0", [conversation_id], |row| row.get(0))
+        .optional().map_err(|_| "Не удалось проверить беседу")?.flatten();
+    if let Some(material_id) = material_id {
+        let project_id = project_id.ok_or("Для локального навыка выберите проект беседы")?;
+        let (name, size, content): (String, i64, Vec<u8>) = db.query_row(
+            "SELECT name, size, content FROM project_materials WHERE id=?1 AND project_id=?2", params![material_id, project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|_| "Выберите материал из активного проекта беседы")?;
+        validate_agent_skill_source(&name, &content)?;
+        if size != content.len() as i64 { return Err("Источник навыка повреждён".into()); }
+        db.execute("INSERT INTO conversation_agent_skills(conversation_id, material_id, enabled) VALUES(?1, ?2, ?3)
+                    ON CONFLICT(conversation_id) DO UPDATE SET material_id=excluded.material_id, enabled=excluded.enabled",
+            params![conversation_id, material_id, enabled]).map_err(|_| "Не удалось сохранить настройку навыка")?;
+    } else {
+        if enabled { return Err("Сначала выберите источник навыка".into()); }
+        db.execute("DELETE FROM conversation_agent_skills WHERE conversation_id=?1", [conversation_id])
+            .map_err(|_| "Не удалось отключить навык")?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_agent_skill(conversation_id: i64, state: State<'_, AppState>) -> Result<Option<AgentSkill>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    get_agent_skill_in_db(&db, conversation_id)
+}
+
+#[tauri::command]
+fn set_agent_skill(conversation_id: i64, material_id: Option<i64>, enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    set_agent_skill_in_db(&db, conversation_id, material_id, enabled)
 }
 
 fn project_folder_path(db: &Connection, project_id: i64) -> Result<PathBuf, String> {
@@ -982,6 +1412,60 @@ fn project_folder_file(db: &Connection, project_id: i64, relative_path: &str) ->
     if !path.starts_with(&root) { return Err("Путь вышел за границы выбранной папки".into()); }
     attachment_metadata(&path)?;
     Ok(path)
+}
+
+fn search_project_files(db: &Connection, conversation_id: i64, query: &str) -> Result<(Vec<String>, Vec<AgentSource>), String> {
+    let query = query.trim();
+    if query.is_empty() || query.chars().count() > 200 { return Err("Запрос поиска должен содержать от 1 до 200 символов".into()); }
+    let project_id: i64 = db.query_row(
+        "SELECT p.id FROM conversations c JOIN projects p ON p.id=c.project_id JOIN project_folders f ON f.project_id=p.id WHERE c.id=?1 AND c.archived=0 AND p.archived=0",
+        [conversation_id], |row| row.get(0),
+    ).map_err(|_| "Для беседы не выбрана папка проекта".to_string())?;
+    let root = project_folder_path(db, project_id)?;
+    let needle = query.to_lowercase();
+    let mut scanned_bytes = 0usize;
+    let mut files_read = Vec::new();
+    let mut sources = Vec::new();
+    for (index, entry) in std::fs::read_dir(root).map_err(|_| "Не удалось прочитать выбранную папку")?.enumerate() {
+        if index >= 500 { return Err("В выбранной папке больше 500 элементов".into()); }
+        let entry = entry.map_err(|_| "Не удалось прочитать элемент папки")?;
+        let name = entry.file_name().into_string().map_err(|_| "Имя файла не поддерживается")?;
+        let file_type = entry.file_type().map_err(|_| "Не удалось проверить элемент папки")?;
+        if file_type.is_dir() { continue; }
+        if file_type.is_symlink() { return Err("В выбранной папке есть символическая ссылка; поиск остановлен".into()); }
+        if !file_type.is_file() { continue; }
+        let path = entry.path();
+        if is_secret_attachment(&name.to_ascii_lowercase(), &path) {
+            return Err("В выбранной папке найден файл с возможными секретами; поиск остановлен".into());
+        }
+        let extension = path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !["txt", "md", "csv", "json", "yaml", "yml", "toml", "xml", "html", "css", "js", "jsx", "ts", "tsx", "rs", "py", "sql", "svg"].contains(&extension.as_str()) { continue; }
+        let safe_path = project_folder_file(db, project_id, &name)?;
+        let draft = prepare_attachment(&safe_path, 0)?;
+        scanned_bytes += draft.content.len();
+        if scanned_bytes > 1024 * 1024 { return Err("Поиск ограничен суммарным размером файлов 1 МиБ".into()); }
+        files_read.push(name.clone());
+        for (line_index, line) in draft.preview.lines().enumerate() {
+            if line.to_lowercase().contains(&needle) {
+                if sources.len() < 8 {
+                    sources.push(AgentSource {
+                        relative_path: name.clone(),
+                        line: line_index + 1,
+                        excerpt: line.chars().take(500).collect(),
+                    });
+                }
+            }
+        }
+    }
+    Ok((files_read, sources))
+}
+
+fn search_result(files_read: &[String], sources: &[AgentSource]) -> serde_json::Value {
+    serde_json::json!({"files_read": files_read, "matches": sources.iter().map(|source| serde_json::json!({
+        "file": source.relative_path,
+        "line": source.line,
+        "excerpt": source.excerpt,
+    })).collect::<Vec<_>>()})
 }
 
 fn create_project_in_db(db: &Connection) -> rusqlite::Result<i64> {
@@ -1314,7 +1798,7 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let content = |db: &Connection| -> rusqlite::Result<[i64; 14]> {
+    let content = |db: &Connection| -> rusqlite::Result<[i64; 19]> {
         Ok([
             db.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
@@ -1329,6 +1813,11 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
             db.query_row("SELECT count(*) FROM app_settings", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM agent_tasks", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM agent_task_steps", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM agent_plan_steps", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM agent_queue_items", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM agent_steering_notes", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM conversation_agent_skills", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM scheduled_agent_tasks", [], |row| row.get(0))?,
             db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
         ])
     };
@@ -1342,7 +1831,7 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
     let check = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_keys: i64 = check.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
-    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !project_materials_valid(&check)? || !project_folders_valid(&check)? || !synthetic_tasks_valid(&check)? || !conversation_links_valid(&check)? {
+    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !project_materials_valid(&check)? || !project_folders_valid(&check)? || !synthetic_tasks_valid(&check)? || !agent_board_valid(&check)? || !agent_skills_valid(&check)? || !scheduled_agent_tasks_valid(&check)? || !conversation_links_valid(&check)? {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
@@ -1375,6 +1864,60 @@ fn synthetic_tasks_valid(db: &Connection) -> rusqlite::Result<bool> {
         [], |row| row.get(0),
     )?;
     Ok(invalid == 0)
+}
+
+fn agent_board_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let invalid: i64 = db.query_row(
+        "SELECT
+          (SELECT count(*) FROM agent_plan_steps WHERE trim(action)='' OR length(action)>200 OR status NOT IN ('pending','completed') OR (status='completed' AND completed_at IS NULL) OR (status='pending' AND completed_at IS NOT NULL))
+          + (SELECT count(*) FROM agent_queue_items WHERE trim(request)='' OR length(request)>2000 OR status NOT IN ('queued','submitted') OR (status='submitted' AND submitted_at IS NULL) OR (status='queued' AND submitted_at IS NOT NULL))
+          + (SELECT count(*) FROM agent_steering_notes WHERE trim(note)='' OR length(note)>1000 OR status NOT IN ('pending','submitted') OR (status='submitted' AND submitted_at IS NULL) OR (status='pending' AND submitted_at IS NOT NULL))",
+        [], |row| row.get(0),
+    )?;
+    Ok(invalid == 0)
+}
+
+fn agent_skills_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = db.prepare(
+        "SELECT c.project_id, m.project_id, m.name, m.size, m.sha256, m.content
+         FROM conversation_agent_skills s
+         JOIN conversations c ON c.id=s.conversation_id
+         JOIN project_materials m ON m.id=s.material_id
+         ORDER BY s.conversation_id",
+    )?;
+    let rows = statement.query_map([], |row| Ok((
+        row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?,
+        row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, Vec<u8>>(5)?,
+    )))?;
+    for row in rows {
+        let (conversation_project, material_project, name, size, sha256, content) = row?;
+        if conversation_project != Some(material_project)
+            || size != content.len() as i64
+            || format!("{:x}", Sha256::digest(&content)) != sha256
+            || validate_agent_skill_source(&name, &content).is_err()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn scheduled_agent_tasks_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let invalid: i64 = db.query_row(
+        "SELECT count(*) FROM scheduled_agent_tasks
+         WHERE length(trim(title)) NOT BETWEEN 1 AND 120 OR length(trim(prompt)) NOT BETWEEN 1 AND 2000
+           OR interval_minutes NOT BETWEEN 1 AND 10080 OR next_run_at<=0
+           OR status NOT IN ('active','awaiting_confirmation','stopped')
+           OR (status='awaiting_confirmation' AND due_at IS NULL)
+           OR (status!='awaiting_confirmation' AND due_at IS NOT NULL)",
+        [], |row| row.get(0),
+    )?;
+    let duplicates: i64 = db.query_row(
+        "SELECT count(*) FROM (SELECT conversation_id, lower(trim(prompt)) FROM scheduled_agent_tasks
+         WHERE status IN ('active','awaiting_confirmation') GROUP BY conversation_id, lower(trim(prompt)) HAVING count(*)>1)",
+        [], |row| row.get(0),
+    )?;
+    Ok(invalid == 0 && duplicates == 0)
 }
 
 fn project_folders_valid(db: &Connection) -> rusqlite::Result<bool> {
@@ -1440,11 +1983,21 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
         let _: i64 = source.query_row("SELECT count(*) FROM agent_tasks", [], |row| row.get(0))?;
         let _: i64 = source.query_row("SELECT count(*) FROM agent_task_steps", [], |row| row.get(0))?;
     }
-    if integrity != "ok" || foreign_keys != 0 || !(1..=14).contains(&version) || conversations < 1 || invalid_pins != 0
+    if version >= 15 {
+        let _: i64 = source.query_row("SELECT count(*) FROM agent_plan_steps", [], |row| row.get(0))?;
+        let _: i64 = source.query_row("SELECT count(*) FROM agent_queue_items", [], |row| row.get(0))?;
+        let _: i64 = source.query_row("SELECT count(*) FROM agent_steering_notes", [], |row| row.get(0))?;
+    }
+    if version >= 16 { let _: i64 = source.query_row("SELECT count(*) FROM conversation_agent_skills", [], |row| row.get(0))?; }
+    if version >= 17 { let _: i64 = source.query_row("SELECT count(*) FROM scheduled_agent_tasks", [], |row| row.get(0))?; }
+    if integrity != "ok" || foreign_keys != 0 || !(1..=17).contains(&version) || conversations < 1 || invalid_pins != 0
         || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
         || (version >= 11 && !project_materials_valid(&source)?)
         || (version >= 12 && !project_folders_valid(&source)?)
         || (version >= 14 && !synthetic_tasks_valid(&source)?)
+        || (version >= 15 && !agent_board_valid(&source)?)
+        || (version >= 16 && !agent_skills_valid(&source)?)
+        || (version >= 17 && !scheduled_agent_tasks_valid(&source)?)
         || (version >= 8 && !conversation_links_valid(&source)?) {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -1520,6 +2073,10 @@ fn create_attempt_for_model(db: &mut Connection, prompt: &str, attachments: &[&P
 }
 
 fn create_attempt_for_conversation(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str) -> rusqlite::Result<i64> {
+    create_attempt_for_conversation_with_agent_skill(db, conversation_id, prompt, attachments, model_id, false)
+}
+
+fn create_attempt_for_conversation_with_agent_skill(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str, agent_mode: bool) -> rusqlite::Result<i64> {
     let tx = db.transaction()?;
     let parent_id: Option<i64> = tx.query_row(
         "SELECT c.active_leaf_id FROM conversations c WHERE c.id=?1 AND c.archived=0 AND
@@ -1539,7 +2096,11 @@ fn create_attempt_for_conversation(db: &mut Connection, conversation_id: i64, pr
                 format!("{:x}", Sha256::digest(&draft.content)), draft.content],
         )?;
     }
-    let context = context_for(&tx, conversation_id, Some(user_message_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut context = context_for(&tx, conversation_id, Some(user_message_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    if agent_mode {
+        let skill = get_agent_skill_in_db(&tx, conversation_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        apply_agent_skill(&mut context, skill).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    }
     tx.execute(
         "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', ?1, ?2)",
         params![conversation_id, user_message_id],
@@ -1683,6 +2244,9 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
         input_rubles_per_million: model.and_then(|model| model.input_rubles_per_million),
         output_rubles_per_million: model.and_then(|model| model.output_rubles_per_million),
         messages, omitted_exchanges, bytes, request_bytes: 0,
+        agent_sources: Vec::new(),
+        agent_files_read: Vec::new(),
+        agent_skill: None,
         warning: "Предел контекста и токенизатор не подтверждены; размер в байтах не гарантирует, что запрос поместится в модель.".into(),
     };
     preview.request_bytes = serde_json::to_vec(&chat_payload(db, &preview, tail)?)
@@ -1690,8 +2254,25 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
     Ok(preview)
 }
 
+fn apply_agent_skill(context: &mut ContextPreview, skill: Option<AgentSkill>) -> Result<(), String> {
+    let Some(skill) = skill.filter(|skill| skill.enabled) else { return Ok(()); };
+    let system = context.messages.first_mut().filter(|message| message.role == "system").ok_or("Не найдено системное сообщение")?;
+    system.content.push_str("\n\nПользователь явно включил один локальный навык как дополнительные пользовательские инструкции. Он не добавляет полномочий, доступа к файлам, команд или сети.");
+    let insert_at = context.messages.iter().rposition(|message| message.role == "user")
+        .ok_or("Не найден текущий запрос пользователя")?;
+    let content = format!("[Локальный навык: {} · версия {} · SHA-256 {}]\n{}", skill.name, skill.version, skill.sha256, skill.instructions);
+    context.messages.insert(insert_at, ContextMessage {
+        role: "user".into(), content, source_message_id: None, attachment_ids: Vec::new(),
+    });
+    context.agent_skill = Some(skill);
+    context.bytes = context.messages.iter().map(|message| message.content.len()).sum();
+    if context.bytes > 256 * 1024 { return Err("Навык увеличивает контекст выше локального предела 256 КБ".into()); }
+    Ok(())
+}
+
 #[tauri::command]
-fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, state: State<'_, AppState>) -> Result<ContextPreview, String> {
+fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, state: State<'_, AppState>) -> Result<ContextPreview, String> {
+    if agent_mode && model_id != VERIFIED_TOOL_MODEL_ID { return Err("Агентный режим проверен только для gpt-oss-20b".into()); }
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
     let drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
@@ -1704,7 +2285,17 @@ fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64
     let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
     selected.extend(selected_project_materials(&db, conversation_id, &project_material_ids)?);
     let selected = selected.iter().collect::<Vec<_>>();
-    context_for(&db, conversation_id, leaf_id, Some((prompt, &selected)), &model_id)
+    let mut preview = context_for(&db, conversation_id, leaf_id, Some((prompt, &selected)), &model_id)?;
+    if agent_mode {
+        apply_agent_skill(&mut preview, get_agent_skill_in_db(&db, conversation_id)?)?;
+    }
+    let project_search_enabled = agent_mode && db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversations c JOIN project_folders f ON f.project_id=c.project_id WHERE c.id=?1 AND c.archived=0)",
+        [conversation_id], |row| row.get::<_, bool>(0),
+    ).map_err(|_| "Не удалось проверить папку проекта")?;
+    preview.request_bytes = serde_json::to_vec(&with_agent_tools(chat_payload(&db, &preview, Some((prompt, &selected)) )?, agent_mode, project_search_enabled)?)
+        .map_err(|_| "Не удалось собрать запрос")?.len();
+    Ok(preview)
 }
 
 #[cfg(test)]
@@ -1910,7 +2501,18 @@ fn record_stream_metadata(db: &Db, attempt_id: i64, response_id: Option<&str>, r
     }
 }
 
-fn process_http_event(db: &Db, attempt_id: i64, seq: &mut i64, data: &str, on_event: &Channel<StreamEvent>) -> Result<bool, String> {
+fn save_agent_sources(db: &Db, attempt_id: i64, files_read: Vec<String>, sources: Vec<AgentSource>) -> Result<(), String> {
+    let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
+    let context_json: String = connection.query_row("SELECT context_json FROM attempts WHERE id=?1", [attempt_id], |row| row.get(0)).map_err(|_| "DATABASE_ERROR")?;
+    let mut context: ContextPreview = serde_json::from_str(&context_json).map_err(|_| "DATABASE_ERROR")?;
+    context.agent_sources = sources;
+    context.agent_files_read = files_read;
+    let updated = connection.execute("UPDATE attempts SET context_json=?1 WHERE id=?2", params![serde_json::to_string(&context).map_err(|_| "DATABASE_ERROR")?, attempt_id]).map_err(|_| "DATABASE_ERROR")?;
+    if updated == 0 { return Err("DATABASE_ERROR".into()); }
+    Ok(())
+}
+
+fn process_http_event(db: &Db, attempt_id: i64, seq: &mut i64, data: &str, calls: &mut PendingToolCalls, on_event: &Channel<StreamEvent>) -> Result<bool, String> {
     if data == "[DONE]" { return Ok(true); }
     let value: serde_json::Value = serde_json::from_str(data).map_err(|_| "INVALID_SSE")?;
     if let Some(error) = value.get("error") {
@@ -1918,8 +2520,29 @@ fn process_http_event(db: &Db, attempt_id: i64, seq: &mut i64, data: &str, on_ev
         return Err(code);
     }
     let response_id = value.get("id").and_then(|value| value.as_str()).and_then(safe_server_field);
-    let usage = value.get("usage").filter(|value| !value.is_null());
-    record_stream_metadata(db, attempt_id, response_id.as_deref(), None, usage, None);
+    if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+        let total = calls.usage.get_or_insert_with(|| serde_json::json!({}));
+        if let (Some(total), Some(incoming)) = (total.as_object_mut(), usage.as_object()) {
+            for (key, value) in incoming {
+                if let Some(amount) = value.as_u64() {
+                    let sum = total.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0) + amount;
+                    total.insert(key.clone(), serde_json::json!(sum));
+                } else {
+                    total.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    record_stream_metadata(db, attempt_id, response_id.as_deref(), None, calls.usage.as_ref(), None);
+    if let Some(deltas) = value.pointer("/choices/0/delta/tool_calls").and_then(serde_json::Value::as_array) {
+        for delta in deltas {
+            let index = delta.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+            let call = calls.calls.entry(index).or_default();
+            if let Some(id) = delta.get("id").and_then(serde_json::Value::as_str) { call.id = Some(id.to_owned()); }
+            if let Some(name) = delta.pointer("/function/name").and_then(serde_json::Value::as_str) { call.name.push_str(name); }
+            if let Some(arguments) = delta.pointer("/function/arguments").and_then(serde_json::Value::as_str) { call.arguments.push_str(arguments); }
+        }
+    }
     if let Some(content) = value.pointer("/choices/0/delta/content").and_then(|value| value.as_str()) {
         if !content.is_empty() {
             *seq += 1;
@@ -1927,13 +2550,13 @@ fn process_http_event(db: &Db, attempt_id: i64, seq: &mut i64, data: &str, on_ev
             append_delta(&mut connection, attempt_id, *seq, content).map_err(|_| "DATABASE_ERROR")?;
             let _ = on_event.send(StreamEvent::Delta { attempt_id, seq: *seq, text: content.to_owned() });
         }
-    } else if value.get("choices").is_none() && usage.is_none() {
+    } else if value.get("choices").is_none() && value.get("usage").is_none() {
         return Err("INVALID_SSE".into());
     }
     Ok(false)
 }
 
-async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>, cancel: Arc<AtomicBool>, attempt_id: i64, model_id: String, key: String, url: &str, on_event: Channel<StreamEvent>) {
+async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>, cancel: Arc<AtomicBool>, attempt_id: i64, model_id: String, key: String, url: &str, agent_mode: bool, on_event: Channel<StreamEvent>) {
     let mut status = "interrupted";
     let mut error_code = None;
     let mut request_id = None;
@@ -1944,62 +2567,109 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
         let context: ContextPreview = serde_json::from_str(&context_json).map_err(|_| "DATABASE_ERROR")?;
         if context.model_id != model_id { return Err("MODEL_SNAPSHOT_MISMATCH".into()); }
         if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
+        let project_search_enabled = {
+            let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts a JOIN conversations c ON c.id=a.conversation_id JOIN project_folders f ON f.project_id=c.project_id WHERE a.id=?1 AND c.archived=0)",
+                [attempt_id], |row| row.get::<_, bool>(0),
+            ).map_err(|_| "DATABASE_ERROR")?
+        };
         let payload = {
             let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
-            chat_payload(&connection, &context, None)?
+            with_agent_tools(chat_payload(&connection, &context, None)?, agent_mode, project_search_enabled)?
         };
         let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(8))
             .read_timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none())
             .build().map_err(|_| "HTTP_CLIENT_ERROR")?;
-        let mut response = client.post(url).bearer_auth(key)
-            .json(&payload)
-            .send().await.map_err(|_| "NETWORK_RESULT_UNKNOWN")?;
-        http_status = Some(response.status().as_u16());
-        if let Ok(db) = db.lock() {
-            let _ = db.execute("UPDATE attempts SET http_status=?1 WHERE id=?2", params![http_status, attempt_id]);
-        }
-        request_id = response.headers().get("x-request-id").and_then(|value| value.to_str().ok()).and_then(safe_server_field);
-        record_stream_metadata(&db, attempt_id, None, request_id.as_deref(), None, None);
-        if !response.status().is_success() {
-            let status_code = response.status().as_u16();
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| "HTTP_ERROR")? {
-                if body.len() + chunk.len() > 64 * 1024 { break; }
-                body.extend_from_slice(&chunk);
+        let mut payload = payload;
+        let mut total_usage = None;
+        for turn in 0..=1 {
+            if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
+            let mut response = client.post(url).bearer_auth(&key).json(&payload)
+                .send().await.map_err(|_| "NETWORK_RESULT_UNKNOWN")?;
+            http_status = Some(response.status().as_u16());
+            if let Ok(db) = db.lock() {
+                let _ = db.execute("UPDATE attempts SET http_status=?1 WHERE id=?2", params![http_status, attempt_id]);
             }
-            let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
-            if request_id.is_none() {
-                request_id = parsed.as_ref().and_then(|body| body.pointer("/error/requestId")).and_then(|value| value.as_str()).and_then(safe_server_field);
-            }
-            status = "failed";
-            return Err(parsed.as_ref().and_then(|body| body.pointer("/error/code")).and_then(|value| value.as_str()).and_then(safe_server_field)
-                .unwrap_or_else(|| format!("HTTP_{status_code}")));
-        }
-        let mut parser = SseParser::default();
-        let mut seq = 0;
-        let mut total = 0usize;
-        let mut last_data = std::time::Instant::now();
-        loop {
-            if cancel.load(Ordering::SeqCst) { status = "stopped"; break; }
-            let chunk = match tokio::time::timeout(Duration::from_millis(250), response.chunk()).await {
-                Ok(chunk) => chunk.map_err(|_| "NETWORK_RESULT_UNKNOWN")?,
-                Err(_) if last_data.elapsed() < Duration::from_secs(30) => continue,
-                Err(_) => return Err("STREAM_IDLE_TIMEOUT".into()),
-            };
-            let Some(chunk) = chunk else { break; };
-            last_data = std::time::Instant::now();
-            total += chunk.len();
-            if total > 2 * 1024 * 1024 { status = "failed"; return Err("RESPONSE_TOO_LARGE".into()); }
-            let events = parser.push(&chunk).map_err(|_| { status = "failed"; "INVALID_SSE" })?;
-            for data in events {
-                match process_http_event(&db, attempt_id, &mut seq, &data, &on_event) {
-                    Ok(true) => { status = "completed"; return Ok(()); }
-                    Ok(false) => (),
-                    Err(code) => { status = "failed"; return Err(code); }
+            request_id = response.headers().get("x-request-id").and_then(|value| value.to_str().ok()).and_then(safe_server_field);
+            record_stream_metadata(&db, attempt_id, None, request_id.as_deref(), None, None);
+            if !response.status().is_success() {
+                let status_code = response.status().as_u16();
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(|_| "HTTP_ERROR")? {
+                    if body.len() + chunk.len() > 64 * 1024 { break; }
+                    body.extend_from_slice(&chunk);
                 }
+                let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+                if request_id.is_none() {
+                    request_id = parsed.as_ref().and_then(|body| body.pointer("/error/requestId")).and_then(|value| value.as_str()).and_then(safe_server_field);
+                }
+                status = "failed";
+                return Err(parsed.as_ref().and_then(|body| body.pointer("/error/code")).and_then(|value| value.as_str()).and_then(safe_server_field)
+                    .unwrap_or_else(|| format!("HTTP_{status_code}")));
+            }
+            let mut parser = SseParser::default();
+            let mut seq = 0;
+            let mut total = 0usize;
+            let mut calls = PendingToolCalls { calls: BTreeMap::new(), usage: total_usage.take() };
+            let mut last_data = std::time::Instant::now();
+            let mut terminated = false;
+            loop {
+                if cancel.load(Ordering::SeqCst) { status = "stopped"; break; }
+                let chunk = match tokio::time::timeout(Duration::from_millis(250), response.chunk()).await {
+                    Ok(chunk) => chunk.map_err(|_| "NETWORK_RESULT_UNKNOWN")?,
+                    Err(_) if last_data.elapsed() < Duration::from_secs(30) => continue,
+                    Err(_) => return Err("STREAM_IDLE_TIMEOUT".into()),
+                };
+                let Some(chunk) = chunk else { break; };
+                last_data = std::time::Instant::now();
+                total += chunk.len();
+                if total > 2 * 1024 * 1024 { status = "failed"; return Err("RESPONSE_TOO_LARGE".into()); }
+                let events = parser.push(&chunk).map_err(|_| { status = "failed"; "INVALID_SSE" })?;
+                for data in events {
+                    match process_http_event(&db, attempt_id, &mut seq, &data, &mut calls, &on_event) {
+                        Ok(true) => { terminated = true; break; }
+                        Ok(false) => (),
+                        Err(code) => { status = "failed"; return Err(code); }
+                    }
+                }
+                if terminated || status == "stopped" { break; }
+            }
+            total_usage = calls.usage;
+            if !terminated || status == "stopped" { return Ok(()); }
+            if calls.calls.is_empty() { status = "completed"; return Ok(()); }
+            if !agent_mode || turn != 0 || calls.calls.len() != 1 { status = "failed"; return Err("TOOL_LOOP_LIMIT".into()); }
+            let call = calls.calls.into_iter().next().map(|(_, call)| call).ok_or("INVALID_TOOL_CALL")?;
+            let id = match call.id { Some(id) => id, None => { status = "failed"; return Err("INVALID_TOOL_CALL".into()); } };
+            let result = match call.name.as_str() {
+                "calculate" => match run_calculator_tool(&call.arguments) {
+                    Ok(result) => result,
+                    Err(code) => { status = "failed"; return Err(code); }
+                },
+                "search_project" if project_search_enabled => {
+                    let arguments: serde_json::Value = serde_json::from_str(&call.arguments).map_err(|_| "INVALID_TOOL_ARGUMENTS")?;
+                    let query = arguments.get("query").and_then(serde_json::Value::as_str).ok_or("INVALID_TOOL_ARGUMENTS")?;
+                    let (files_read, sources) = {
+                        let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
+                        let conversation_id: i64 = connection.query_row("SELECT conversation_id FROM attempts WHERE id=?1", [attempt_id], |row| row.get(0)).map_err(|_| "DATABASE_ERROR")?;
+                        search_project_files(&connection, conversation_id, query).map_err(|code| { status = "failed"; code })?
+                    };
+                    let result = search_result(&files_read, &sources);
+                    save_agent_sources(&db, attempt_id, files_read, sources).map_err(|code| { status = "failed"; code })?;
+                    result
+                }
+                _ => { status = "failed"; return Err("UNKNOWN_TOOL".into()); }
+            };
+            let messages = payload.get_mut("messages").and_then(serde_json::Value::as_array_mut).ok_or("INVALID_REQUEST")?;
+            messages.push(serde_json::json!({"role":"assistant","tool_calls":[{"id":id.clone(),"type":"function","function":{"name":call.name,"arguments":call.arguments}}]}));
+            messages.push(serde_json::json!({"role":"tool","tool_call_id":id,"content":result.to_string()}));
+            if let Some(request) = payload.as_object_mut() {
+                request.remove("tools");
+                request.remove("tool_choice");
             }
         }
-        Ok(())
+        status = "failed";
+        Err("TOOL_LOOP_LIMIT".into())
     }.await;
     if let Err(code) = result { error_code = Some(code); }
     if cancel.load(Ordering::SeqCst) && status != "completed" { status = "stopped"; }
@@ -2012,18 +2682,19 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
 }
 
 #[tauri::command]
-fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
-    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id)
+    if agent_mode && model_id != VERIFIED_TOOL_MODEL_ID { return Err("Агентный режим проверен только для gpt-oss-20b".into()); }
+    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id, agent_mode)
 }
 
 #[tauri::command]
 fn retry_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id)
+    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, false)
 }
 
-fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str) -> Result<i64, String> {
+fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool) -> Result<i64, String> {
     if model_id == "local-mock" { return Err("Выберите модель SimpleClaw".into()); }
     let key = {
         let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
@@ -2043,7 +2714,7 @@ fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, con
             let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
             selected.extend(selected_project_materials(&db, conversation_id, project_material_ids)?);
             let selected = selected.iter().collect::<Vec<_>>();
-            let attempt_id = create_attempt_for_conversation(&mut db, conversation_id, prompt.unwrap(), &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов")?;
+            let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, conversation_id, prompt.unwrap(), &selected, model_id, agent_mode).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов")?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             attempt_id
         }
@@ -2051,7 +2722,7 @@ fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, con
     let cancel = Arc::new(AtomicBool::new(false));
     *active = Some((attempt_id, cancel.clone()));
     tauri::async_runtime::spawn(run_http_stream(state.db.clone(), state.active.clone(), cancel, attempt_id,
-        model_id.to_owned(), key, "https://simple-claw.ru/v1/chat/completions", on_event));
+        model_id.to_owned(), key, "https://simple-claw.ru/v1/chat/completions", agent_mode, on_event));
     Ok(attempt_id)
 }
 
@@ -2082,7 +2753,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -2156,6 +2827,168 @@ mod tests {
         std::fs::remove_file(backup_path).unwrap();
     }
 
+    #[test]
+    fn agent_board_persists_plan_queue_and_steering_without_repeating_or_sending() {
+        let suffix = std::process::id();
+        let path = std::env::temp_dir().join(format!("ai-desktop-agent-board-{suffix}.sqlite"));
+        let backup_path = std::env::temp_dir().join(format!("ai-desktop-agent-board-backup-{suffix}.sqlite"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup_path);
+        let mut db = Connection::open(&path).unwrap();
+        init_db(&db).unwrap();
+
+        let step_id = add_agent_plan_step_in_db(&mut db, 1, "Проверить diff").unwrap();
+        assert!(add_agent_plan_step_in_db(&mut db, 1, "  проверить   DIFF  ").is_err());
+        complete_agent_plan_step_in_db(&mut db, 1, step_id).unwrap();
+        assert!(complete_agent_plan_step_in_db(&mut db, 1, step_id).is_err());
+        assert!(add_agent_plan_step_in_db(&mut db, 1, "проверить diff").is_err());
+
+        let queue_id = add_agent_input_in_db(&mut db, 1, "queue", "Подготовить краткий отчёт").unwrap();
+        assert!(add_agent_input_in_db(&mut db, 1, "queue", " подготовить   КРАТКИЙ отчёт ").is_err());
+        let steering_id = add_agent_input_in_db(&mut db, 1, "steering", "Ограничиться изменениями в интерфейсе").unwrap();
+        assert!(add_agent_input_in_db(&mut db, 1, "steering", "ограничиться изменениями в интерфейсе").is_err());
+
+        let board = get_agent_board_in_db(&db, 1).unwrap();
+        assert_eq!(board.plan[0].status, "completed");
+        assert_eq!(board.queue[0].status, "queued");
+        assert_eq!(board.steering[0].status, "pending");
+        assert_eq!(db.query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+
+        mark_agent_input_submitted_in_db(&db, 1, "queue", queue_id).unwrap();
+        assert!(mark_agent_input_submitted_in_db(&db, 1, "queue", queue_id).is_err());
+        mark_agent_input_submitted_in_db(&db, 1, "steering", steering_id).unwrap();
+        assert!(mark_agent_input_submitted_in_db(&db, 1, "steering", steering_id).is_err());
+        backup_history_to(&db, &backup_path).unwrap();
+        drop(db);
+
+        let db = Connection::open(&path).unwrap();
+        init_db(&db).unwrap();
+        let board = get_agent_board_in_db(&db, 1).unwrap();
+        assert_eq!((board.plan[0].action.as_str(), board.plan[0].status.as_str()), ("Проверить diff", "completed"));
+        assert_eq!(board.queue[0].status, "submitted");
+        assert_eq!(board.steering[0].status, "submitted");
+        drop(db);
+
+        let mut restored = Connection::open_in_memory().unwrap();
+        init_db(&restored).unwrap();
+        restore_history_from(&mut restored, &backup_path).unwrap();
+        let board = get_agent_board_in_db(&restored, 1).unwrap();
+        assert_eq!(board.queue[0].status, "submitted");
+        assert_eq!(board.steering[0].status, "submitted");
+        drop(restored);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(backup_path).unwrap();
+    }
+
+    #[test]
+    fn local_agent_skill_requires_opt_in_and_is_snapshotted_without_extra_tools() {
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        db.execute("INSERT INTO projects(title) VALUES('Synthetic project')", []).unwrap();
+        let project_id = db.last_insert_rowid();
+        db.execute("UPDATE conversations SET project_id=?1 WHERE id=1", [project_id]).unwrap();
+        let instructions = "Use the project glossary. Do not claim tests were run.";
+        let content = instructions.as_bytes();
+        let hash = format!("{:x}", Sha256::digest(content));
+        db.execute("INSERT INTO project_materials(project_id,name,version,size,sha256,content) VALUES(?1,'SKILL.md',1,?2,?3,?4)",
+            params![project_id, content.len() as i64, hash, content]).unwrap();
+        let material_id = db.last_insert_rowid();
+
+        set_agent_skill_in_db(&db, 1, Some(material_id), false).unwrap();
+        let disabled = get_agent_skill_in_db(&db, 1).unwrap().unwrap();
+        assert_eq!((disabled.name.as_str(), disabled.sha256.as_str(), disabled.instructions.as_str(), disabled.enabled),
+            ("SKILL.md", hash.as_str(), instructions, false));
+        let mut preview = context_for(&db, 1, None, Some(("question", &[])), "local-mock").unwrap();
+        apply_agent_skill(&mut preview, Some(disabled)).unwrap();
+        assert!(preview.agent_skill.is_none());
+        assert!(preview.messages.iter().all(|message| !message.content.contains(instructions)));
+        let normal_tools = with_agent_tools(chat_payload(&db, &preview, None).unwrap(), true, false).unwrap();
+
+        set_agent_skill_in_db(&db, 1, Some(material_id), true).unwrap();
+        let enabled = get_agent_skill_in_db(&db, 1).unwrap().unwrap();
+        let mut preview = context_for(&db, 1, None, Some(("question", &[])), "local-mock").unwrap();
+        apply_agent_skill(&mut preview, Some(enabled)).unwrap();
+        assert_eq!(preview.agent_skill.as_ref().unwrap().name, "SKILL.md");
+        assert!(preview.messages.iter().any(|message| message.role == "user" && message.content.contains(instructions)));
+        let skill_tools = with_agent_tools(chat_payload(&db, &preview, None).unwrap(), true, false).unwrap();
+        assert_eq!(normal_tools["tools"], skill_tools["tools"]);
+
+        let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, 1, "question", &[], "local-mock", true).unwrap();
+        set_agent_skill_in_db(&db, 1, Some(material_id), false).unwrap();
+        let mut disabled_again = context_for(&db, 1, None, Some(("question", &[])), "local-mock").unwrap();
+        apply_agent_skill(&mut disabled_again, get_agent_skill_in_db(&db, 1).unwrap()).unwrap();
+        assert!(disabled_again.agent_skill.is_none());
+        assert!(disabled_again.messages.iter().all(|message| !message.content.contains(instructions)));
+        let saved_json: String = db.query_row("SELECT context_json FROM attempts WHERE id=?1", [attempt_id], |row| row.get(0)).unwrap();
+        let saved: ContextPreview = serde_json::from_str(&saved_json).unwrap();
+        assert_eq!(saved.agent_skill.as_ref().unwrap().instructions, instructions);
+        assert!(saved.messages.iter().any(|message| message.content.contains(instructions)));
+
+        let secret = b"private";
+        db.execute("INSERT INTO project_materials(project_id,name,version,size,sha256,content) VALUES(?1,'.env.md',1,7,?2,?3)",
+            params![project_id, format!("{:x}", Sha256::digest(secret)), secret]).unwrap();
+        let secret_id = db.last_insert_rowid();
+        assert!(set_agent_skill_in_db(&db, 1, Some(secret_id), true).is_err());
+    }
+
+    #[test]
+    fn archived_conversation_skill_survives_backup_restore() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-archived-skill-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let project_id = create_project_in_db(&db).unwrap();
+        move_conversation_in_db(&db, 1, Some(project_id)).unwrap();
+        let content = b"Use the synthetic project glossary.";
+        db.execute("INSERT INTO project_materials(project_id,name,version,size,sha256,content) VALUES(?1,'SKILL.md',1,?2,?3,?4)",
+            params![project_id, content.len() as i64, format!("{:x}", Sha256::digest(content)), content]).unwrap();
+        let material_id = db.last_insert_rowid();
+        set_agent_skill_in_db(&db, 1, Some(material_id), true).unwrap();
+        db.execute("UPDATE conversations SET archived=1 WHERE id=1", []).unwrap();
+        db.execute("UPDATE projects SET archived=1 WHERE id=?1", [project_id]).unwrap();
+
+        backup_history_to(&db, &path).unwrap();
+        let mut restored = Connection::open_in_memory().unwrap();
+        init_db(&restored).unwrap();
+        restore_history_from(&mut restored, &path).unwrap();
+        assert!(agent_skills_valid(&restored).unwrap());
+        let (saved_material, enabled): (i64, bool) = restored.query_row(
+            "SELECT material_id, enabled FROM conversation_agent_skills WHERE conversation_id=1", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((saved_material, enabled), (material_id, true));
+        assert_eq!(get_agent_skill_in_db(&restored, 1).err().unwrap(), "Источник навыка больше не принадлежит активному проекту этой беседы");
+        drop(restored);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scheduled_agent_task_is_deduped_confirmed_and_stopped_across_restart() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-scheduled-task-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let task_id = create_scheduled_agent_task_in_db(&db, 1, "Daily summary", "Summarize updates", 1, 100).unwrap();
+        assert!(create_scheduled_agent_task_in_db(&db, 1, "duplicate", "  SUMMARIZE   updates ", 5, 100).is_err());
+        assert_eq!(list_scheduled_agent_tasks_in_db(&mut db, 159).unwrap()[0].status, "active");
+        let due = list_scheduled_agent_tasks_in_db(&mut db, 161).unwrap();
+        assert_eq!((due.len(), due[0].status.as_str(), due[0].due_at), (1, "awaiting_confirmation", Some(161)));
+        assert_eq!(list_scheduled_agent_tasks_in_db(&mut db, 500).unwrap()[0].status, "awaiting_confirmation");
+        backup_history_to(&db, &path).unwrap();
+        let mut restored = Connection::open_in_memory().unwrap();
+        init_db(&restored).unwrap();
+        restore_history_from(&mut restored, &path).unwrap();
+        assert_eq!(list_scheduled_agent_tasks_in_db(&mut restored, 501).unwrap()[0].status, "awaiting_confirmation");
+        assert_eq!(prepare_scheduled_agent_task_in_db(&restored, task_id).unwrap(), "Summarize updates");
+        assert!(prepare_scheduled_agent_task_in_db(&restored, task_id).is_err());
+        stop_scheduled_agent_task_in_db(&restored, task_id).unwrap();
+        let stopped = list_scheduled_agent_tasks_in_db(&mut restored, 10_000).unwrap();
+        assert_eq!(stopped[0].status, "stopped");
+        assert!(scheduled_agent_tasks_valid(&restored).unwrap());
+        drop(restored);
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn local_response(status: &str, body: &str) -> (String, std::thread::JoinHandle<()>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2187,6 +3020,85 @@ mod tests {
 
     fn http_attempt() -> (Db, i64) { http_attempt_for("synthetic-model") }
 
+    #[test]
+    fn calculator_tool_validates_and_calculates_locally() {
+        assert_eq!(run_calculator_tool(r#"{"operation":"multiply","a":6,"b":7}"#).unwrap(), serde_json::json!({"result":42.0}));
+        assert_eq!(run_calculator_tool(r#"{"operation":"divide","a":1,"b":0}"#).unwrap_err(), "DIVISION_BY_ZERO");
+        assert!(run_calculator_tool(r#"{"operation":"run_command","a":1,"b":2}"#).is_err());
+        let payload = with_calculator_tool(serde_json::json!({"model":"gpt-oss-20b"}), true).unwrap();
+        assert_eq!(payload["tools"][0]["function"]["name"], "calculate");
+        let payload = with_agent_tools(serde_json::json!({"model":"gpt-oss-20b"}), true, true).unwrap();
+        assert_eq!(payload["tools"][1]["function"]["name"], "search_project");
+    }
+
+    #[test]
+    fn tool_call_sse_fragments_are_joined_before_json_validation() {
+        let (db, attempt_id) = http_attempt();
+        let mut calls = PendingToolCalls::default();
+        let mut seq = 0;
+        let channel = Channel::new(|_| Ok(()));
+        process_http_event(&db, attempt_id, &mut seq,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"calculate","arguments":"{\"operation\":\"add\",\"a\":"}}]}}]}"#,
+            &mut calls, &channel).unwrap();
+        process_http_event(&db, attempt_id, &mut seq,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"20,\"b\":22}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":8,"total_tokens":18}}"#,
+            &mut calls, &channel).unwrap();
+        assert_eq!(calls.calls[&0].name, "calculate");
+        assert_eq!(calls.calls[&0].id.as_deref(), Some("call-1"));
+        assert_eq!(run_calculator_tool(&calls.calls[&0].arguments).unwrap(), serde_json::json!({"result":42.0}));
+        assert_eq!(calls.usage.as_ref().unwrap()["total_tokens"], 18);
+    }
+
+    #[test]
+    fn agent_search_tool_completes_two_turn_loop_against_local_server() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("ai-desktop-agent-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("README.md"), "The release date is 2030-01-02.").unwrap();
+        let (db, id) = http_attempt_for(VERIFIED_TOOL_MODEL_ID);
+        {
+            let connection = db.lock().unwrap();
+            let project_id = create_project_in_db(&connection).unwrap();
+            move_conversation_in_db(&connection, 1, Some(project_id)).unwrap();
+            connection.execute("INSERT INTO project_folders(project_id,path) VALUES(?1,?2)", params![project_id, root.canonicalize().unwrap().to_str().unwrap()]).unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let first = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-search\",\"type\":\"function\",\"function\":{\"name\":\"search_project\",\"arguments\":\"{\\\"query\\\":\\\"release date\\\"}\"}}]}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\ndata: [DONE]\n\n";
+        let second = "data: {\"choices\":[{\"delta\":{\"content\":\"The release date is 2030-01-02.\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":8,\"total_tokens\":28}}\n\ndata: [DONE]\n\n";
+        let server = std::thread::spawn(move || {
+            for (turn, body) in [first, second].into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request = [0u8; 16384];
+                let size = socket.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.starts_with("POST /v1/chat/completions"));
+                if turn == 0 { assert!(request.contains("search_project")); }
+                if turn == 1 { assert!(request.contains("The release date is 2030-01-02.")); }
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
+            VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, Channel::new(|_| Ok(()))));
+        server.join().unwrap();
+        let connection = db.lock().unwrap();
+        let (content, status, usage): (String, String, String) = connection.query_row(
+            "SELECT m.content,a.status,a.usage_json FROM messages m JOIN attempts a ON a.assistant_id=m.id WHERE a.id=?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!((content.as_str(), status.as_str()), ("The release date is 2030-01-02.", "completed"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&usage).unwrap()["total_tokens"], 42);
+        let sources: String = connection.query_row("SELECT context_json FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        let context: ContextPreview = serde_json::from_str(&sources).unwrap();
+        assert_eq!(context.agent_files_read, ["README.md"]);
+        assert_eq!(context.agent_sources[0].excerpt, "The release date is 2030-01-02.");
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "one paid SimpleClaw POST; run only with explicit spending authorization"]
@@ -2200,7 +3112,7 @@ mod tests {
         let stored_key = entry.get_password().unwrap();
         let (db, id) = http_attempt_for("gpt-oss-20b");
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-            "gpt-oss-20b".into(), stored_key, "https://simple-claw.ru/v1/chat/completions", Channel::new(|_| Ok(()))));
+            "gpt-oss-20b".into(), stored_key, "https://simple-claw.ru/v1/chat/completions", false, Channel::new(|_| Ok(()))));
         delete_key_for(&entry).unwrap();
         let connection = db.lock().unwrap();
         let result: (String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64) = connection.query_row(
@@ -2248,7 +3160,7 @@ mod tests {
         let received = events.clone();
         let channel = Channel::new(move |body| { received.lock().unwrap().push(body); Ok(()) });
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-            "synthetic-model".into(), "synthetic-key".into(), &url, channel));
+            "synthetic-model".into(), "synthetic-key".into(), &url, false, channel));
         server.join().unwrap();
         let connection = db.lock().unwrap();
         let saved: (String, String, String, String) = connection.query_row(
@@ -2268,7 +3180,7 @@ mod tests {
             let (db, id) = http_attempt();
             let (url, server) = local_response(status, body);
             tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-                "synthetic-model".into(), "synthetic-key".into(), &url, Channel::new(|_| Ok(()))));
+                "synthetic-model".into(), "synthetic-key".into(), &url, false, Channel::new(|_| Ok(()))));
             server.join().unwrap();
             let connection = db.lock().unwrap();
             let saved: (String, String, Option<String>) = connection.query_row(
@@ -2304,7 +3216,7 @@ mod tests {
             Ok(())
         });
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), cancel, id,
-            "synthetic-model".into(), "synthetic-key".into(), &url, channel));
+            "synthetic-model".into(), "synthetic-key".into(), &url, false, channel));
         server.join().unwrap();
         let connection = db.lock().unwrap();
         let saved: (String, String) = connection.query_row("SELECT m.content, a.status FROM messages m JOIN attempts a ON a.assistant_id=m.id WHERE a.id=?1",
@@ -2593,7 +3505,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 14);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 17);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -2731,7 +3643,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 14);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 17);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
@@ -2944,6 +3856,46 @@ mod tests {
         assert!(project_folder_file(&db, project_id, "linked.md").is_err());
         assert!(project_folder_file(&db, project_id, ".env").is_err());
         assert!(project_folder_file(&db, project_id, "large.md").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_search_returns_and_persists_only_safe_folder_fragments() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("ai-desktop-agent-search-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("ai-desktop-agent-outside-{}.md", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::write(root.join("README.md"), "first line\nRelevant evidence here\nlast line").unwrap();
+        std::fs::write(root.join("nested/hidden.md"), "Relevant evidence outside first level").unwrap();
+        std::fs::write(&outside, "Relevant evidence outside folder").unwrap();
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let project_id = create_project_in_db(&db).unwrap();
+        move_conversation_in_db(&db, 1, Some(project_id)).unwrap();
+        db.execute("INSERT INTO project_folders(project_id,path) VALUES(?1,?2)", params![project_id, root.canonicalize().unwrap().to_str().unwrap()]).unwrap();
+
+        let (files_read, sources) = search_project_files(&db, 1, "evidence").unwrap();
+        assert_eq!(files_read, ["README.md"]);
+        assert_eq!(sources.len(), 1);
+        assert_eq!((sources[0].relative_path.as_str(), sources[0].line, sources[0].excerpt.as_str()), ("README.md", 2, "Relevant evidence here"));
+        let attempt = create_attempt_for_conversation(&mut db, 1, "question", &[], "local-mock").unwrap();
+        let shared = Arc::new(Mutex::new(db));
+        save_agent_sources(&shared, attempt, files_read, sources).unwrap();
+        let history = history_for(&shared.lock().unwrap(), 1).unwrap();
+        assert_eq!(history.contexts[0].context["agent_files_read"][0], "README.md");
+        assert_eq!(history.contexts[0].context["agent_sources"][0]["relative_path"], "README.md");
+        assert_eq!(history.contexts[0].context["agent_sources"][0]["excerpt"], "Relevant evidence here");
+
+        std::fs::write(root.join(".env"), "private").unwrap();
+        assert!(search_project_files(&shared.lock().unwrap(), 1, "evidence").is_err());
+        std::fs::remove_file(root.join(".env")).unwrap();
+        symlink(&outside, root.join("linked.md")).unwrap();
+        assert!(search_project_files(&shared.lock().unwrap(), 1, "evidence").is_err());
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_file(outside).unwrap();
     }

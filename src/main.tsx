@@ -9,6 +9,8 @@ type Message = { id: number; parent_id: number | null; role: "user" | "assistant
 type Attachment = { message_id: number; name: string; mime: string; size: number; sha256: string };
 type PendingAttachment = { id: number; name: string; mime: string; size: number; sha256: string; preview: string };
 type ContextMessage = { role: string; content: string; source_message_id: number | null; attachment_ids: number[] };
+type AgentSource = { relative_path: string; line: number; excerpt: string };
+type AgentSkill = { material_id: number; name: string; version: number; size: number; sha256: string; instructions: string; enabled: boolean };
 type ContextPreview = {
     model_id: string;
     response_style: "concise" | "balanced" | "detailed";
@@ -19,6 +21,9 @@ type ContextPreview = {
     omitted_exchanges: number;
     bytes: number;
     request_bytes: number;
+    agent_sources?: AgentSource[];
+    agent_files_read?: string[];
+    agent_skill?: AgentSkill | null;
     warning: string
 };
 type CatalogModel = {
@@ -56,6 +61,13 @@ type ProjectFolderFile = { relative_path: string; size: number | null; blocked_r
 type ProjectFolderView = { folder_name: string; max_entries: number; max_file_bytes: number; files: ProjectFolderFile[] };
 type SyntheticTask = { id: number; title: string; status: "awaiting_approval" | "completed" | "denied"; created_at: number;
     steps: { id: number; ordinal: number; action: string; decision: "pending" | "approved" | "denied"; result: string | null }[] };
+type ScheduledAgentTask = { id: number; conversation_id: number; title: string; prompt: string; interval_minutes: number; next_run_at: number; status: "active" | "awaiting_confirmation" | "stopped"; due_at: number | null };
+type AgentBoard = {
+    plan: {id: number; ordinal: number; action: string; status: "pending" | "completed"}[];
+    queue: {id: number; text: string; status: "queued" | "submitted"}[];
+    steering: {id: number; text: string; status: "pending" | "submitted"}[];
+};
+type BoardInputSource = {kind: "queue" | "steering"; id: number; text: string};
 
 const statusLabel: Record<string, string> = {
     interrupted: "Ответ прерван",
@@ -99,8 +111,19 @@ function App() {
     const [categories, setCategories] = useState<ModelCategory[]>([]);
     const [catalogError, setCatalogError] = useState("");
     const [modelId, setModelId] = useState("local-mock");
+    const [agentMode, setAgentMode] = useState(false);
+    const [agentSkill, setAgentSkill] = useState<AgentSkill | null>(null);
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
     const [syntheticTasks, setSyntheticTasks] = useState<SyntheticTask[]>([]);
+    const [scheduledTasks, setScheduledTasks] = useState<ScheduledAgentTask[]>([]);
+    const [scheduleTitle, setScheduleTitle] = useState("");
+    const [schedulePrompt, setSchedulePrompt] = useState("");
+    const [scheduleInterval, setScheduleInterval] = useState("60");
+    const [agentBoard, setAgentBoard] = useState<AgentBoard>({plan: [], queue: [], steering: []});
+    const [planDraft, setPlanDraft] = useState("");
+    const [queueDraft, setQueueDraft] = useState("");
+    const [steeringDraft, setSteeringDraft] = useState("");
+    const [boardInputSource, setBoardInputSource] = useState<BoardInputSource | null>(null);
     const [imagePrompt, setImagePrompt] = useState("");
     const [imageModelId, setImageModelId] = useState("");
     const [generatedImage, setGeneratedImage] = useState<GeneratedImage | null>(null);
@@ -199,6 +222,83 @@ function App() {
 
     async function refreshSyntheticTasks() {
         setSyntheticTasks(await invoke<SyntheticTask[]>("list_synthetic_tasks"));
+    }
+
+    async function refreshScheduledTasks() {
+        setScheduledTasks(await invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks"));
+    }
+
+    async function createScheduledTask() {
+        try {
+            await invoke("create_scheduled_agent_task", {conversationId, title: scheduleTitle, prompt: schedulePrompt, intervalMinutes: Number(scheduleInterval)});
+            setScheduleTitle(""); setSchedulePrompt("");
+            await refreshScheduledTasks();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function stopScheduledTask(taskId: number) {
+        try { await invoke("stop_scheduled_agent_task", {taskId}); await refreshScheduledTasks(); }
+        catch (reason) { setError(String(reason)); }
+    }
+
+    async function prepareScheduledTask(task: ScheduledAgentTask) {
+        if (busy) return;
+        if (!window.confirm(`Задача «${task.title}» наступила по расписанию. Продолжить и поместить её в черновик? При переходе текущий черновик и файлы будут убраны. Платный запрос не отправится. Проверьте модель, контекст и стоимость, затем отправьте вручную.`)) return;
+        try {
+            if (task.conversation_id !== conversationId && !await switchConversation(task.conversation_id, true)) return;
+            const text = await invoke<string>("prepare_scheduled_agent_task", {taskId: task.id});
+            setPrompt(text);
+            setContextPreview(null);
+            await refreshScheduledTasks();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function refreshAgentBoard(id = conversationId) {
+        setAgentBoard(await invoke<AgentBoard>("get_agent_board", {conversationId: id}));
+    }
+
+    async function refreshAgentSkill(id = conversationId) {
+        setAgentSkill(await invoke<AgentSkill | null>("get_agent_skill", {conversationId: id}));
+    }
+
+    async function saveAgentSkill(materialId: number | null, enabled: boolean) {
+        try {
+            await invoke("set_agent_skill", {conversationId, materialId, enabled});
+            await refreshAgentSkill();
+            setContextPreview(null);
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function addPlanStep() {
+        try {
+            await invoke("add_agent_plan_step", {conversationId, action: planDraft});
+            setPlanDraft("");
+            await refreshAgentBoard();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function completePlanStep(stepId: number) {
+        try {
+            await invoke("complete_agent_plan_step", {conversationId, stepId});
+            await refreshAgentBoard();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function addBoardInput(kind: "queue" | "steering") {
+        const text = kind === "queue" ? queueDraft : steeringDraft;
+        try {
+            await invoke(kind === "queue" ? "add_agent_queue_item" : "add_agent_steering_note",
+                {conversationId, [kind === "queue" ? "request" : "note"]: text});
+            if (kind === "queue") setQueueDraft(""); else setSteeringDraft("");
+            await refreshAgentBoard();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    function useBoardInput(kind: "queue" | "steering", item: {id: number; text: string; status: string}) {
+        if (item.status !== (kind === "queue" ? "queued" : "pending")) return;
+        setPrompt(item.text);
+        setBoardInputSource({kind, id: item.id, text: item.text});
+        setContextPreview(null);
     }
 
     async function startSyntheticTask() {
@@ -362,6 +462,7 @@ function App() {
     }, [conversationSearch, conversations, projectFilter]);
 
     const conversationProjectId = conversations.find((item) => item.id === conversationId)?.project_id ?? null;
+    const eligibleSkills = projectMaterials.filter((material) => material.name.toLowerCase().endsWith(".md") && material.size > 0 && material.size <= 16 * 1024);
     useEffect(() => {
         let current = true;
         setSelectedMaterialIds([]);
@@ -394,20 +495,33 @@ function App() {
         invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => setCatalogError(String(reason)));
         invoke<boolean>("key_status").then(setKeySaved).catch((reason) => setError(String(reason)));
         invoke<SyntheticTask[]>("list_synthetic_tasks").then(setSyntheticTasks).catch((reason) => setError(String(reason)));
+        invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => setError(String(reason)));
+        invoke<AgentBoard>("get_agent_board", {conversationId}).then(setAgentBoard).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog>("refresh_models").then((result) => { setCatalog(result); setContextPreview(null); setCatalogError(""); }).catch((reason) => setCatalogError(String(reason)));
     }, []);
 
     useEffect(() => {
+        const timer = window.setInterval(() => {
+            invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => setError(String(reason)));
+        }, 30_000);
+        return () => window.clearInterval(timer);
+    }, []);
+
+    useEffect(() => {
         reload(conversationId).catch((reason) => setError(String(reason)));
+        refreshAgentBoard(conversationId).catch((reason) => setError(String(reason)));
+        refreshAgentSkill(conversationId).catch((reason) => setError(String(reason)));
     }, [conversationId]);
 
     async function switchConversation(id: number, discardConfirmed = false) {
-        if (busy || id === conversationId) return;
-        if (!discardConfirmed && (prompt.trim() || pendingAttachments.length) && !window.confirm("Перейти в другую беседу? Черновик и выбранные файлы будут убраны.")) return;
+        if (busy) return false;
+        if (id === conversationId) return true;
+        if (!discardConfirmed && (prompt.trim() || pendingAttachments.length) && !window.confirm("Перейти в другую беседу? Черновик и выбранные файлы будут убраны.")) return false;
         try {
             for (const attachment of pendingAttachments) await invoke("remove_text_attachment", {id: attachment.id});
             setPendingAttachments([]);
             setPrompt("");
+            setBoardInputSource(null);
             contextRequest.current++;
             setContextPreview(null);
             setSelectedArtifactId(null);
@@ -416,7 +530,8 @@ function App() {
             setHistory({messages: [], attachments: [], artifacts: [], active_leaf_id: null, contexts: [], attempts: []});
             setConversationId(id);
             setError("");
-        } catch (reason) { setError(String(reason)); }
+            return true;
+        } catch (reason) { setError(String(reason)); return false; }
     }
 
     async function createConversation() {
@@ -646,11 +761,21 @@ function App() {
 
     async function send() {
         const value = prompt.trim();
-        const signature = JSON.stringify([conversationId, value, pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id]);
+        const signature = JSON.stringify([conversationId, value, pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false]);
         if (!value || busy || !contextPreview || previewSignature !== signature) return;
+        const tools = conversationProjectId !== null && projectFolderView ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
+        if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId}, value)) {
+        const inputSource = boardInputSource?.text === value ? boardInputSource : null;
+        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode}, value)) {
+            if (inputSource) {
+                try {
+                    await invoke("mark_agent_input_submitted", {conversationId, kind: inputSource.kind, itemId: inputSource.id});
+                    setBoardInputSource(null);
+                    await refreshAgentBoard();
+                } catch (reason) { setError(String(reason)); }
+            }
             setPendingAttachments((current) => current.filter((attachment) => !ids.includes(attachment.id)));
             setSelectedMaterialIds([]);
             setContextPreview(null);
@@ -758,8 +883,8 @@ function App() {
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
             const materialIds = selectedMaterialIds;
-            const signature = JSON.stringify([conversationId, prompt.trim(), ids, materialIds, modelId, history.active_leaf_id]);
-            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId});
+            const signature = JSON.stringify([conversationId, prompt.trim(), ids, materialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false]);
+            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId, agentMode});
             if (request !== contextRequest.current) return;
             setContextPreview(preview);
             setPreviewSignature(signature);
@@ -941,6 +1066,12 @@ function App() {
                     <button ref={compactSettingsButton} type="button" className="secondary-button compact-settings"
                             onClick={() => setSettingsOpen(true)}>Настройки</button>
                 </header>
+                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" key={task.id}>
+                    <strong>По расписанию наступила задача: {task.title}</strong>
+                    <p>Автоматический запуск не выполнялся. После подтверждения текст попадёт в черновик; платный запрос потребует обычной проверки контекста и отдельного подтверждения.</p>
+                    <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
+                    <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить расписание</button>
+                </section>)}
                 <div className="history" aria-label="История сообщений" role="log">
                     <div className="history-content">
                     {visible.length === 0 && !busy && (
@@ -969,6 +1100,21 @@ function App() {
                                     history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id &&
                                     (history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage ? " · Сумма не подтверждена" : " · Usage и сумма неизвестны")}
                             </small>}
+                            {message.role === "assistant" && (() => {
+                                const context = history.contexts.find((item) => item.assistant_id === message.id)?.context;
+                                const sources = context?.agent_sources ?? [];
+                                const filesRead = context?.agent_files_read ?? [];
+                                return filesRead.length > 0 && <details className="agent-sources">
+                                    <summary>Папка проекта: прочитано файлов {filesRead.length}, фрагментов передано {sources.length}</summary>
+                                    <p>Прочитанные файлы:</p>
+                                    <ul>{filesRead.map((file) => <li key={file}>{file}</li>)}</ul>
+                                    {sources.length === 0 && <p>Совпадений по запросу нет.</p>}
+                                    {sources.map((source, index) => <div key={`${source.relative_path}:${source.line}:${index}`}>
+                                        <strong>{source.relative_path}:{source.line}</strong>
+                                        <pre>{source.excerpt}</pre>
+                                    </div>)}
+                                </details>;
+                            })()}
                             {message.role === "assistant" && (
                                 <div className="branch-actions">
                                     {history.artifacts.filter((artifact) => artifact.message_id === message.id).map((artifact) =>
@@ -1020,6 +1166,7 @@ function App() {
                     <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000}
                               placeholder="Напишите сообщение" onChange={(event) => {
                         setPrompt(event.target.value);
+                        setBoardInputSource((source) => source && source.text !== event.target.value ? null : source);
                         setContextPreview(null);
                     }}/>
                     <section className="voice-input" aria-label="Голосовой ввод">
@@ -1116,11 +1263,32 @@ function App() {
                             <span>{material.name} · версия {material.version} · {material.size} Б · SHA-256 {material.sha256.slice(0, 12)}…</span>
                         </label>)}
                         {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
+                        <div className="agent-skill-picker">
+                            <h3>Локальный навык</h3>
+                            <p>Выберите Markdown-материал этого проекта. Инструкция попадёт только в агентный запрос после явного включения; навык не добавляет доступ к файлам, командам или сети.</p>
+                            <label htmlFor="agent-skill-source">Источник</label>
+                            <select id="agent-skill-source" value={agentSkill?.material_id ?? ""} disabled={busy}
+                                    onChange={(event) => void saveAgentSkill(event.target.value ? Number(event.target.value) : null, false)}>
+                                <option value="">Не выбран</option>
+                                {eligibleSkills.map((material) => <option key={material.id} value={material.id}>{material.name} · версия {material.version}</option>)}
+                            </select>
+                            <label className="agent-skill-toggle">
+                                <input type="checkbox" checked={agentSkill?.enabled ?? false} disabled={busy || !agentSkill}
+                                       onChange={(event) => agentSkill && void saveAgentSkill(agentSkill.material_id, event.target.checked)}/>
+                                Включить этот навык для агентных запросов
+                            </label>
+                            {agentSkill && <details>
+                                <summary>{agentSkill.name} · версия {agentSkill.version} · {agentSkill.size} Б · SHA-256 {agentSkill.sha256}</summary>
+                                <pre>{agentSkill.instructions}</pre>
+                            </details>}
+                            {!eligibleSkills.length && <small>В библиотеке проекта нет Markdown-файлов до 16 КиБ.</small>}
+                        </div>
                     </div>}
                     {contextPreview && <details open className="context-preview">
                         <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
                         <p>{contextPreview.warning}</p>
+                        {contextPreview.agent_skill && <p>В этом снимке включён навык «{contextPreview.agent_skill.name}», версия {contextPreview.agent_skill.version}, SHA-256 {contextPreview.agent_skill.sha256}. Текст инструкции показан ниже в составе сообщений.</p>}
                         {contextPreview.messages.map((part, index) => <pre
                             key={index}>{part.role} · {part.source_message_id ?? "новое сообщение или система"} · вложения: {part.attachment_ids.join(", ") || "нет"}{"\n"}{part.content}</pre>)}
                     </details>}
@@ -1129,6 +1297,7 @@ function App() {
                             <label className="sr-only" htmlFor="model">Модель для следующей попытки</label>
                             <select id="model" title={selectedModel ? `${selectedModel.name} · ${selectedModel.id}` : "Локальный тест"} value={modelId} disabled={busy} onChange={(event) => {
                                 setModelId(event.target.value);
+                                if (event.target.value !== "gpt-oss-20b") setAgentMode(false);
                                 setContextPreview(null);
                             }}>
                                 <option value="local-mock">Локальный тест</option>
@@ -1138,6 +1307,13 @@ function App() {
                                         .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
                                 </optgroup>)}
                             </select>
+                            <label className="agent-mode-toggle">
+                                <input type="checkbox" checked={agentMode} disabled={busy || modelId !== "gpt-oss-20b"} onChange={(event) => {
+                                    setAgentMode(event.target.checked);
+                                    setContextPreview(null);
+                                }}/>
+                                Агентный режим · калькулятор{conversationProjectId !== null && projectFolderView ? " и поиск по папке" : ""}
+                            </label>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
@@ -1164,7 +1340,7 @@ function App() {
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id])}>Отправить
+                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false])}>Отправить
                             </button>}
                         </div>
                     </div>
@@ -1189,6 +1365,59 @@ function App() {
                             </div>}
                         </div>)}
                     </article>)}
+                </details>
+                <details className="scheduled-task-panel" open={scheduledTasks.some((task) => task.conversation_id === conversationId && task.status === "awaiting_confirmation")}>
+                    <summary>Расписание агентных задач</summary>
+                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Закрытое приложение не создаёт уведомления в ОС и не выполняет задачи. Отправка всегда остаётся ручной.</p>
+                    <label>Название<input value={scheduleTitle} maxLength={120} onChange={(event) => setScheduleTitle(event.target.value)}/></label>
+                    <label>Текст задачи<textarea value={schedulePrompt} maxLength={2000} rows={2} onChange={(event) => setSchedulePrompt(event.target.value)}/></label>
+                    <label>Повторять каждые, минут<input type="number" min={1} max={10080} value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value)}/></label>
+                    <button type="button" className="secondary-button" disabled={!scheduleTitle.trim() || !schedulePrompt.trim() || !scheduleInterval}
+                            onClick={() => void createScheduledTask()}>Сохранить расписание</button>
+                    {scheduledTasks.filter((task) => task.conversation_id === conversationId).map((task) => <div className="scheduled-task-row" key={task.id}>
+                        <span>{task.title} · каждые {task.interval_minutes} мин · {task.status === "active" ? `следующий срок ${new Date(task.next_run_at * 1000).toLocaleString()}` : task.status === "awaiting_confirmation" ? "ожидает подтверждения" : "остановлено"}</span>
+                        {task.status !== "stopped" && <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить</button>}
+                    </div>)}
+                </details>
+                <details className="agent-board-panel" open={busy || agentBoard.plan.length > 0 || agentBoard.queue.some((item) => item.status === "queued") || agentBoard.steering.some((item) => item.status === "pending")}>
+                    <summary>План, очередь и уточнения для агента</summary>
+                    <p>Локальные записи сохраняются в этой беседе. Использование очереди или уточнения только вставляет текст в черновик; запрос отправится лишь после проверки контекста и нажатия «Отправить».</p>
+                    <section>
+                        <h2>План</h2>
+                        <div className="agent-board-entry">
+                            <input value={planDraft} maxLength={200} placeholder="Следующий шаг плана" onChange={(event) => setPlanDraft(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!planDraft.trim()} onClick={() => void addPlanStep()}>Сохранить шаг</button>
+                        </div>
+                        {agentBoard.plan.map((step) => <div className="agent-board-item" key={step.id}>
+                            <span>{step.ordinal + 1}. {step.action} · {step.status === "completed" ? "выполнено" : "ожидает"}</span>
+                            {step.status === "pending" && <button type="button" className="secondary-button" onClick={() => void completePlanStep(step.id)}>Отметить выполненным</button>}
+                        </div>)}
+                        {!agentBoard.plan.length && <p>Шаги ещё не добавлены.</p>}
+                    </section>
+                    <section>
+                        <h2>Очередь</h2>
+                        <div className="agent-board-entry">
+                            <input value={queueDraft} maxLength={2000} placeholder="Следующая просьба" onChange={(event) => setQueueDraft(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!queueDraft.trim()} onClick={() => void addBoardInput("queue")}>Добавить</button>
+                        </div>
+                        {agentBoard.queue.map((item) => <div className="agent-board-item" key={item.id}>
+                            <span>{item.text} · {item.status === "submitted" ? "отправлено" : "ожидает"}</span>
+                            {item.status === "queued" && <button type="button" className="secondary-button" onClick={() => useBoardInput("queue", item)}>Вставить в черновик</button>}
+                        </div>)}
+                        {!agentBoard.queue.length && <p>Очередь пуста.</p>}
+                    </section>
+                    <section>
+                        <h2>Уточнения</h2>
+                        <div className="agent-board-entry">
+                            <input value={steeringDraft} maxLength={1000} placeholder="Уточнить направление" onChange={(event) => setSteeringDraft(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!steeringDraft.trim()} onClick={() => void addBoardInput("steering")}>Сохранить уточнение</button>
+                        </div>
+                        {agentBoard.steering.map((item) => <div className="agent-board-item" key={item.id}>
+                            <span>{item.text} · {item.status === "submitted" ? "отправлено" : "ожидает"}</span>
+                            {item.status === "pending" && <button type="button" className="secondary-button" onClick={() => useBoardInput("steering", item)}>Вставить в черновик</button>}
+                        </div>)}
+                        {!agentBoard.steering.length && <p>Уточнений нет.</p>}
+                    </section>
                 </details>
                 <details className="image-generation-panel">
                     <summary>Генерация изображения</summary>
