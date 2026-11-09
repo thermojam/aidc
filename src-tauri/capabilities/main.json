@@ -6,13 +6,30 @@
   "permissions": [
     "core:default",
     "allow-list-history",
+    "allow-list-conversations",
+    "allow-create-conversation",
+    "allow-rename-conversation",
+    "allow-archive-conversation",
     "allow-start-mock-generation",
     "allow-retry-mock-generation",
+    "allow-start-generation",
+    "allow-retry-generation",
     "allow-select-branch",
     "allow-stop-generation",
     "allow-save-key",
     "allow-delete-key",
     "allow-key-status",
-    "allow-create-backup"
+    "allow-create-backup",
+    "allow-list-backups",
+    "allow-restore-backup",
+    "allow-pick-text-attachment",
+    "allow-remove-text-attachment",
+    "allow-list-models",
+    "allow-list-model-categories",
+    "allow-set-model-category",
+    "allow-refresh-models",
+    "allow-preview-context",
+    "allow-create-artifact",
+    "allow-export-artifact"
   ]
 }

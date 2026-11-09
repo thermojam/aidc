@@ -1,0 +1,12 @@
+BEGIN;
+CREATE TABLE attachments (
+  id INTEGER PRIMARY KEY,
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  content BLOB NOT NULL
+);
+PRAGMA user_version = 2;
+COMMIT;
