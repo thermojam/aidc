@@ -49,10 +49,14 @@ Promise.allSettled([
     invoke("preview_context", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "local-mock"}),
     invoke("get_response_style"),
     invoke("set_response_style", {style: "concise"}),
+    invoke("start_synthetic_task"),
+    invoke("list_synthetic_tasks"),
+    invoke("approve_synthetic_step", {taskId: 1, stepId: 1}),
+    invoke("deny_synthetic_step", {taskId: 1, stepId: 1}),
     invoke("create_artifact", {messageId: 2, kind: "html", title: "viewer", content: "<p>test</p>"}),
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все сорок две команды отклонены"
+        ? "PASS: все сорок шесть команд отклонены"
         : "FAIL: хотя бы одна команда доступна";
 });

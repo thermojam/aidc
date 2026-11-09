@@ -48,6 +48,8 @@ type Project = { id: number; title: string; archived: boolean };
 type ProjectMaterial = { id: number; name: string; version: number; size: number; sha256: string };
 type ProjectFolderFile = { relative_path: string; size: number | null; blocked_reason: string | null };
 type ProjectFolderView = { folder_name: string; max_entries: number; max_file_bytes: number; files: ProjectFolderFile[] };
+type SyntheticTask = { id: number; title: string; status: "awaiting_approval" | "completed" | "denied"; created_at: number;
+    steps: { id: number; ordinal: number; action: string; decision: "pending" | "approved" | "denied"; result: string | null }[] };
 
 const statusLabel: Record<string, string> = {
     interrupted: "Ответ прерван",
@@ -92,6 +94,7 @@ function App() {
     const [catalogError, setCatalogError] = useState("");
     const [modelId, setModelId] = useState("local-mock");
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
+    const [syntheticTasks, setSyntheticTasks] = useState<SyntheticTask[]>([]);
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
@@ -171,6 +174,24 @@ function App() {
         return items;
     }
 
+    async function refreshSyntheticTasks() {
+        setSyntheticTasks(await invoke<SyntheticTask[]>("list_synthetic_tasks"));
+    }
+
+    async function startSyntheticTask() {
+        try {
+            await invoke("start_synthetic_task");
+            await refreshSyntheticTasks();
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function decideSyntheticStep(taskId: number, stepId: number, decision: "approve" | "deny") {
+        try {
+            await invoke(decision === "approve" ? "approve_synthetic_step" : "deny_synthetic_step", {taskId, stepId});
+            await refreshSyntheticTasks();
+        } catch (reason) { setError(String(reason)); }
+    }
+
     async function refreshProjects() {
         const items = await invoke<Project[]>("list_projects");
         setProjects(items);
@@ -221,6 +242,7 @@ function App() {
         invoke<ContextPreview["response_style"]>("get_response_style").then(setResponseStyle).catch((reason) => setError(String(reason)));
         invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => setCatalogError(String(reason)));
         invoke<boolean>("key_status").then(setKeySaved).catch((reason) => setError(String(reason)));
+        invoke<SyntheticTask[]>("list_synthetic_tasks").then(setSyntheticTasks).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog>("refresh_models").then((result) => { setCatalog(result); setContextPreview(null); setCatalogError(""); }).catch((reason) => setCatalogError(String(reason)));
     }, []);
 
@@ -933,6 +955,22 @@ function App() {
                     {catalogError && <p role="alert">Ошибка обновления каталога. {catalog ? "Сохранённый каталог доступен." : "Каталог недоступен."}</p>}
                     {error && <p role="alert">{error}</p>}
                 </form>
+                <details className="synthetic-task-panel" open={syntheticTasks.some((task) => task.status === "awaiting_approval")}>
+                    <summary>Локальная демонстрация многошаговых действий</summary>
+                    <p>Синтетические шаги работают только в SQLite. Здесь нет сетевых запросов, файловых команд или внешних инструментов.</p>
+                    <button type="button" className="secondary-button" onClick={() => void startSyntheticTask()}>Создать демонстрацию</button>
+                    {syntheticTasks.map((task) => <article className="synthetic-task" key={task.id}>
+                        <h2>{task.title} · {task.status === "awaiting_approval" ? "ожидает решения" : task.status === "completed" ? "завершена" : "отклонена"}</h2>
+                        {task.steps.map((step) => <div className="synthetic-task-step" key={step.id}>
+                            <p>{step.ordinal + 1}. {step.action} · {step.decision === "pending" ? "ожидает разрешения" : step.decision === "approved" ? "разрешено" : "отклонено"}</p>
+                            {step.result && <p>{step.result}</p>}
+                            {step.decision === "pending" && <div className="actions">
+                                <button type="button" onClick={() => void decideSyntheticStep(task.id, step.id, "approve")}>Разрешить и выполнить</button>
+                                <button type="button" className="secondary-button" onClick={() => void decideSyntheticStep(task.id, step.id, "deny")}>Отклонить</button>
+                            </div>}
+                        </div>)}
+                    </article>)}
+                </details>
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}

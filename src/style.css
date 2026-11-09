@@ -657,6 +657,28 @@ textarea::placeholder {
     font-size: 12px;
 }
 
+.synthetic-task-panel {
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+}
+
+.synthetic-task-panel > p, .synthetic-task-step p {
+    color: var(--muted);
+}
+
+.synthetic-task {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.synthetic-task h2 {
+    font-size: 14px;
+}
+
+.synthetic-task-step {
+    padding-left: 12px;
+}
+
 .settings-header {
     display: flex;
     align-items: center;

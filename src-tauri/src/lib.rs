@@ -71,6 +71,24 @@ struct ContextPreview {
     warning: String,
 }
 
+#[derive(Serialize)]
+struct AgentTaskStep {
+    id: i64,
+    ordinal: i64,
+    action: String,
+    decision: String,
+    result: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AgentTask {
+    id: i64,
+    title: String,
+    status: String,
+    created_at: i64,
+    steps: Vec<AgentTaskStep>,
+}
+
 #[derive(Clone)]
 struct PendingAttachment {
     id: i64,
@@ -268,7 +286,11 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0014_response_style.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 13 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 13 {
+        db.execute_batch(include_str!("../migrations/0015_durable_tasks.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 14 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -299,6 +321,90 @@ fn save_response_style(db: &Connection, style: &str) -> Result<(), String> {
     db.execute("INSERT INTO app_settings(key, value) VALUES('response_style', ?1)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value", [style])
         .map_err(|_| "Не удалось сохранить стиль ответа")?;
+    Ok(())
+}
+
+const DEMO_ACTIONS: [&str; 3] = ["Подготовить план", "Сверить критерии задачи", "Составить локальный итог"];
+
+#[tauri::command]
+fn start_synthetic_task(state: State<'_, AppState>) -> Result<i64, String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    start_synthetic_task_in_db(&mut db)
+}
+
+fn start_synthetic_task_in_db(db: &mut Connection) -> Result<i64, String> {
+    let tx = db.transaction().map_err(|_| "Не удалось создать задачу")?;
+    tx.execute("INSERT INTO agent_tasks(title, status) VALUES('Демо: подготовка результата', 'awaiting_approval')", [])
+        .map_err(|_| "Не удалось создать задачу")?;
+    let id = tx.last_insert_rowid();
+    insert_pending_agent_step(&tx, id, 0)?;
+    tx.commit().map_err(|_| "Не удалось сохранить задачу")?;
+    Ok(id)
+}
+
+fn insert_pending_agent_step(db: &Connection, task_id: i64, ordinal: usize) -> Result<(), String> {
+    db.execute("INSERT INTO agent_task_steps(task_id, ordinal, action, decision) VALUES(?1, ?2, ?3, 'pending')",
+        params![task_id, ordinal as i64, DEMO_ACTIONS[ordinal]])
+        .map_err(|_| "Не удалось сохранить шаг задачи")?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_synthetic_tasks(state: State<'_, AppState>) -> Result<Vec<AgentTask>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let mut tasks = db.prepare("SELECT id, title, status, created_at FROM agent_tasks ORDER BY id DESC")
+        .map_err(|_| "Не удалось прочитать задачи")?;
+    let rows = tasks.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?)))
+        .map_err(|_| "Не удалось прочитать задачи")?;
+    rows.map(|row| {
+        let (id, title, status, created_at) = row.map_err(|_| "Не удалось прочитать задачу")?;
+        let mut steps = db.prepare("SELECT id, ordinal, action, decision, result FROM agent_task_steps WHERE task_id=?1 ORDER BY ordinal")
+            .map_err(|_| "Не удалось прочитать шаги")?;
+        let steps = steps.query_map([id], |row| Ok(AgentTaskStep { id: row.get(0)?, ordinal: row.get(1)?, action: row.get(2)?, decision: row.get(3)?, result: row.get(4)? }))
+            .map_err(|_| "Не удалось прочитать шаги")?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать шаги")?;
+        Ok(AgentTask { id, title, status, created_at, steps })
+    }).collect()
+}
+
+#[tauri::command]
+fn approve_synthetic_step(task_id: i64, step_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    approve_synthetic_step_in_db(&mut db, task_id, step_id)
+}
+
+fn approve_synthetic_step_in_db(db: &mut Connection, task_id: i64, step_id: i64) -> Result<(), String> {
+    let tx = db.transaction().map_err(|_| "Не удалось принять шаг")?;
+    let ordinal: i64 = tx.query_row("SELECT ordinal FROM agent_task_steps WHERE id=?1 AND task_id=?2 AND decision='pending'", params![step_id, task_id], |row| row.get(0))
+        .map_err(|_| "Шаг уже решён или не найден")?;
+    tx.execute("UPDATE agent_task_steps SET decision='approved', result=?1, decided_at=unixepoch() WHERE id=?2 AND task_id=?3 AND decision='pending'",
+        params![format!("Шаг {} выполнен локально. Внешние запросы и инструменты не запускались.", ordinal + 1), step_id, task_id])
+        .map_err(|_| "Не удалось сохранить решение")?;
+    if (ordinal as usize) + 1 < DEMO_ACTIONS.len() {
+        insert_pending_agent_step(&tx, task_id, ordinal as usize + 1)?;
+    } else {
+        tx.execute("UPDATE agent_tasks SET status='completed' WHERE id=?1 AND status='awaiting_approval'", [task_id])
+            .map_err(|_| "Не удалось завершить задачу")?;
+    }
+    tx.commit().map_err(|_| "Не удалось сохранить решение")?;
+    Ok(())
+}
+
+#[tauri::command]
+fn deny_synthetic_step(task_id: i64, step_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    deny_synthetic_step_in_db(&mut db, task_id, step_id)
+}
+
+fn deny_synthetic_step_in_db(db: &mut Connection, task_id: i64, step_id: i64) -> Result<(), String> {
+    let tx = db.transaction().map_err(|_| "Не удалось отклонить шаг")?;
+    let changed = tx.execute("UPDATE agent_task_steps SET decision='denied', result='Отклонено пользователем; действие не запускалось.', decided_at=unixepoch()
+        WHERE id=?1 AND task_id=?2 AND decision='pending'", params![step_id, task_id])
+        .map_err(|_| "Не удалось сохранить решение")?;
+    if changed == 0 { return Err("Шаг уже решён или не найден".into()); }
+    tx.execute("UPDATE agent_tasks SET status='denied' WHERE id=?1 AND status='awaiting_approval'", [task_id])
+        .map_err(|_| "Не удалось завершить задачу")?;
+    tx.commit().map_err(|_| "Не удалось сохранить решение")?;
     Ok(())
 }
 
@@ -1012,8 +1118,8 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let content = |db: &Connection| -> rusqlite::Result<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> {
-        Ok((
+    let content = |db: &Connection| -> rusqlite::Result<[i64; 14]> {
+        Ok([
             db.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
             db.query_row("SELECT coalesce(sum(length(content)), 0) FROM messages", [], |row| row.get(0))?,
@@ -1024,8 +1130,11 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
             db.query_row("SELECT count(*) FROM project_materials", [], |row| row.get(0))?,
             db.query_row("SELECT coalesce(sum(size), 0) FROM project_materials", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM project_folders", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM app_settings", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM agent_tasks", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM agent_task_steps", [], |row| row.get(0))?,
             db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
-        ))
+        ])
     };
     let source_content = content(db)?;
     let mut target = Connection::open(path)?;
@@ -1037,7 +1146,7 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
     let check = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_keys: i64 = check.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
-    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !project_materials_valid(&check)? || !project_folders_valid(&check)? || !conversation_links_valid(&check)? {
+    if integrity != "ok" || foreign_keys != 0 || content(&check)? != source_content || !attachments_valid(&check)? || !artifacts_valid(&check)? || !project_materials_valid(&check)? || !project_folders_valid(&check)? || !synthetic_tasks_valid(&check)? || !conversation_links_valid(&check)? {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
@@ -1051,6 +1160,25 @@ fn project_materials_valid(db: &Connection) -> rusqlite::Result<bool> {
         if size != bytes.len() as i64 || hash != format!("{:x}", Sha256::digest(&bytes)) { return Ok(false); }
     }
     Ok(true)
+}
+
+fn synthetic_tasks_valid(db: &Connection) -> rusqlite::Result<bool> {
+    let invalid: i64 = db.query_row(
+        "SELECT
+           (SELECT count(*) FROM agent_tasks t WHERE
+             (SELECT count(*) FROM agent_task_steps s WHERE s.task_id=t.id)=0
+             OR (t.status='awaiting_approval' AND ((SELECT count(*) FROM agent_task_steps s WHERE s.task_id=t.id AND s.decision='pending')!=1
+               OR EXISTS (SELECT 1 FROM agent_task_steps s WHERE s.task_id=t.id AND s.decision='denied')))
+             OR (t.status='completed' AND ((SELECT count(*) FROM agent_task_steps s WHERE s.task_id=t.id)!=3
+               OR EXISTS (SELECT 1 FROM agent_task_steps s WHERE s.task_id=t.id AND s.decision!='approved')))
+             OR (t.status='denied' AND ((SELECT count(*) FROM agent_task_steps s WHERE s.task_id=t.id AND s.decision='denied')!=1
+               OR EXISTS (SELECT 1 FROM agent_task_steps s WHERE s.task_id=t.id AND s.decision='pending'))))
+           + (SELECT count(*) FROM agent_task_steps WHERE
+               (decision='approved' AND result IS NULL) OR (decision='pending' AND result IS NOT NULL)
+               OR (decision='denied' AND result IS NULL) OR ordinal NOT BETWEEN 0 AND 2)",
+        [], |row| row.get(0),
+    )?;
+    Ok(invalid == 0)
 }
 
 fn project_folders_valid(db: &Connection) -> rusqlite::Result<bool> {
@@ -1112,10 +1240,15 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
     if version >= 11 { let _: i64 = source.query_row("SELECT count(*) FROM project_materials", [], |row| row.get(0))?; }
     if version >= 12 { let _: i64 = source.query_row("SELECT count(*) FROM project_folders", [], |row| row.get(0))?; }
     if version >= 13 { let _: i64 = source.query_row("SELECT count(*) FROM app_settings", [], |row| row.get(0))?; }
-    if integrity != "ok" || foreign_keys != 0 || !(1..=13).contains(&version) || conversations < 1 || invalid_pins != 0
+    if version >= 14 {
+        let _: i64 = source.query_row("SELECT count(*) FROM agent_tasks", [], |row| row.get(0))?;
+        let _: i64 = source.query_row("SELECT count(*) FROM agent_task_steps", [], |row| row.get(0))?;
+    }
+    if integrity != "ok" || foreign_keys != 0 || !(1..=14).contains(&version) || conversations < 1 || invalid_pins != 0
         || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
         || (version >= 11 && !project_materials_valid(&source)?)
         || (version >= 12 && !project_folders_valid(&source)?)
+        || (version >= 14 && !synthetic_tasks_valid(&source)?)
         || (version >= 8 && !conversation_links_valid(&source)?) {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -1750,7 +1883,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -1782,6 +1915,46 @@ mod tests {
         assert!(preview.messages[0].content.contains("Стиль ответа: кратко"));
         drop(db);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn synthetic_task_resumes_pending_approval_after_restart_and_backup_restore() {
+        let suffix = std::process::id();
+        let path = std::env::temp_dir().join(format!("ai-desktop-agent-task-{suffix}.sqlite"));
+        let backup_path = std::env::temp_dir().join(format!("ai-desktop-agent-task-backup-{suffix}.sqlite"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup_path);
+        let mut db = Connection::open(&path).unwrap();
+        init_db(&db).unwrap();
+        let task_id = start_synthetic_task_in_db(&mut db).unwrap();
+        let first_step: i64 = db.query_row("SELECT id FROM agent_task_steps WHERE task_id=?1", [task_id], |row| row.get(0)).unwrap();
+        assert!(synthetic_tasks_valid(&db).unwrap());
+        drop(db);
+
+        let mut db = Connection::open(&path).unwrap();
+        init_db(&db).unwrap();
+        let pending: (String, Option<String>) = db.query_row(
+            "SELECT decision, result FROM agent_task_steps WHERE id=?1", [first_step], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((pending.0.as_str(), pending.1), ("pending", None));
+        backup_history_to(&db, &backup_path).unwrap();
+        let mut restored = Connection::open_in_memory().unwrap();
+        init_db(&restored).unwrap();
+        restore_history_from(&mut restored, &backup_path).unwrap();
+        assert_eq!(restored.query_row("SELECT decision FROM agent_task_steps WHERE id=?1", [first_step], |row| row.get::<_, String>(0)).unwrap(), "pending");
+
+        approve_synthetic_step_in_db(&mut db, task_id, first_step).unwrap();
+        assert!(approve_synthetic_step_in_db(&mut db, task_id, first_step).is_err());
+        let next_step: i64 = db.query_row("SELECT id FROM agent_task_steps WHERE task_id=?1 AND decision='pending'", [task_id], |row| row.get(0)).unwrap();
+        deny_synthetic_step_in_db(&mut db, task_id, next_step).unwrap();
+        let task_status: String = db.query_row("SELECT status FROM agent_tasks WHERE id=?1", [task_id], |row| row.get(0)).unwrap();
+        assert_eq!(task_status, "denied");
+        assert_eq!(db.query_row("SELECT count(*) FROM agent_task_steps WHERE task_id=?1 AND decision='pending'", [task_id], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert!(synthetic_tasks_valid(&db).unwrap());
+        drop(db);
+        drop(restored);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(backup_path).unwrap();
     }
 
     fn local_response(status: &str, body: &str) -> (String, std::thread::JoinHandle<()>) {
@@ -2172,7 +2345,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 13);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 14);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -2310,7 +2483,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 13);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 14);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
