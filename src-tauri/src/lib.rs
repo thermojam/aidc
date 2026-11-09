@@ -1780,10 +1780,16 @@ mod tests {
         }] };
         save_catalog_if_latest(&connection, &AtomicU64::new(1), 1, &catalog).unwrap();
         set_model_category_in_db(&connection, "synthetic-model", "speed").unwrap();
+        let refreshed = ModelCatalog { fetched_at: 200, models: vec![CatalogModel {
+            id: "synthetic-model".into(), name: "Synthetic refreshed".into(), input_rubles_per_million: Some(1.0), output_rubles_per_million: Some(2.0),
+        }] };
+        save_catalog_if_latest(&connection, &AtomicU64::new(2), 2, &refreshed).unwrap();
+        assert_eq!(cached_catalog(&connection).unwrap().unwrap().fetched_at, 200);
+        assert_eq!(connection.query_row("SELECT category FROM model_categories WHERE model_id='synthetic-model'", [], |row| row.get::<_, String>(0)).unwrap(), "speed");
         let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();
         let result = tauri::async_runtime::block_on(fetch_catalog(&client, "http://127.0.0.1:0/models"));
         assert!(result.is_err());
-        assert_eq!(cached_catalog(&connection).unwrap().unwrap().fetched_at, 100);
+        assert_eq!(cached_catalog(&connection).unwrap().unwrap().fetched_at, 200);
         assert_eq!(connection.query_row("SELECT category FROM model_categories WHERE model_id='synthetic-model'", [], |row| row.get::<_, String>(0)).unwrap(), "speed");
         set_model_category_in_db(&connection, "synthetic-model", "other").unwrap();
         assert_eq!(connection.query_row("SELECT count(*) FROM model_categories", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
