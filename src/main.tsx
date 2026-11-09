@@ -269,7 +269,7 @@ function App() {
                 if (audioSize.current <= 25 * 1024 * 1024) audioChunks.current.push(event.data);
                 else {
                     setError("Запись превысила 25 МиБ и удалена. Попробуйте короче.");
-                    nextRecorder.stop();
+                    if (nextRecorder.state === "recording") nextRecorder.stop();
                 }
             };
             nextRecorder.onstop = () => {
@@ -308,7 +308,7 @@ function App() {
 
     async function transcribeVoice() {
         if (!recordedAudio) return;
-        const model = catalog?.models.find((item) => item.id === transcriptionModelId);
+        const model = selectedTranscriptionModel;
         if (!model || model.audio_rubles_per_minute === null || !model.protocols.includes("audio_transcriptions")) return;
         const signature = recordedAudio.id;
         if (uncertainTranscription === signature) return;
@@ -322,6 +322,7 @@ function App() {
                 durationSeconds: recordedAudio.seconds, expectedRatePerMinute: model.audio_rubles_per_minute
             });
             setTranscriptionText(result.text);
+            setRecordedAudio(null);
         } catch (reason) {
             const message = String(reason);
             if (message.includes("UNKNOWN") || /TRANSCRIPTION_HTTP_5\d\d/.test(message)) {
@@ -692,6 +693,7 @@ function App() {
     }
 
     async function captureWindowSnapshot() {
+        setCapturedSnapshot(null);
         try {
             setCapturedSnapshot(await invoke<CapturedSnapshot>("capture_window_snapshot"));
             setError("");
@@ -1036,14 +1038,15 @@ function App() {
                                 <button type="button" className="secondary-button" disabled={!recordedAudio || transcribing || !keySaved || !selectedTranscriptionModel || uncertainTranscription === recordedAudio?.id} onClick={() => void transcribeVoice()}>
                                     {transcribing ? "Распознавание…" : "Распознать"}
                                 </button>
+                                {recordedAudio && <button type="button" className="secondary-button" disabled={transcribing} onClick={() => setRecordedAudio(null)}>Удалить запись</button>}
                             </div>
-                            <small>SimpleClaw · тариф из каталога от {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестной даты"}. Сначала покажем оценку и запросим подтверждение. Аудио временно хранится в памяти этого окна.</small>
+                            <small>SimpleClaw · тариф из <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">Provider API</a>, каталог от {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестной даты"}. Сначала покажем оценку и запросим подтверждение. Аудио временно хранится в памяти этого окна.</small>
                         </>}
                         {!transcriptionModels.length && <small>Нет моделей распознавания с опубликованным тарифом.</small>}
                         {transcriptionText && <div className="transcription-result">
                             <label htmlFor="transcription-text">Распознанный текст — проверьте и исправьте</label>
                             <textarea id="transcription-text" value={transcriptionText} maxLength={2000} onChange={(event) => setTranscriptionText(event.target.value)}/>
-                            <button type="button" className="secondary-button" disabled={!transcriptionText.trim() || prompt.length + transcriptionText.length > 2000} onClick={() => {
+                            <button type="button" className="secondary-button" disabled={!transcriptionText.trim() || prompt.length + transcriptionText.trim().length + (prompt ? 1 : 0) > 2000} onClick={() => {
                                 setPrompt((current) => current ? `${current}\n${transcriptionText.trim()}` : transcriptionText.trim());
                                 setContextPreview(null);
                                 promptField.current?.focus();
