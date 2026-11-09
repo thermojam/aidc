@@ -127,6 +127,14 @@ struct AttachmentPreview {
 }
 
 #[derive(Serialize)]
+struct CapturedSnapshot {
+    mime: String,
+    size: usize,
+    sha256: String,
+    preview: String,
+}
+
+#[derive(Serialize)]
 struct Message {
     id: i64,
     parent_id: Option<i64>,
@@ -494,6 +502,11 @@ fn prepare_image_attachment(path: &Path, id: i64) -> Result<PendingAttachment, S
     std::fs::File::open(&path).map_err(|_| "Не удалось открыть изображение")?.take(3 * 1024 * 1024 + 1)
         .read_to_end(&mut content).map_err(|_| "Не удалось прочитать изображение")?;
     if content.len() > 3 * 1024 * 1024 { return Err("Изображение больше 3 МиБ".into()); }
+    prepare_image_attachment_bytes(name, content, id, &extension)
+}
+
+fn prepare_image_attachment_bytes(name: String, content: Vec<u8>, id: i64, extension: &str) -> Result<PendingAttachment, String> {
+    if content.len() > 3 * 1024 * 1024 { return Err("Изображение больше 3 МиБ".into()); }
     let mime = if extension == "png" && content.starts_with(b"\x89PNG\r\n\x1a\n") { "image/png" }
         else if (extension == "jpg" || extension == "jpeg") && content.starts_with(&[0xff, 0xd8, 0xff]) { "image/jpeg" }
         else if extension == "webp" && content.len() >= 12 && &content[0..4] == b"RIFF" && &content[8..12] == b"WEBP" { "image/webp" }
@@ -514,6 +527,50 @@ fn prepare_image_attachment(path: &Path, id: i64) -> Result<PendingAttachment, S
     reader.decode().map_err(|_| "Файл изображения повреждён")?;
     let preview = format!("data:{mime};base64,{}", BASE64.encode(&content));
     Ok(PendingAttachment { id, name, mime: mime.into(), content, preview })
+}
+
+#[tauri::command]
+fn capture_window_snapshot() -> Result<CapturedSnapshot, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "Не удалось подготовить временный файл")?.as_nanos();
+        let dir = std::env::temp_dir().join(format!("ai-desktop-snapshot-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).map_err(|_| "Не удалось создать временный каталог")?;
+        let file = dir.join("snapshot.png");
+        let capture = Command::new("/usr/sbin/screencapture").args(["-i", "-w", "-o", "-x"]).arg(&file).output();
+        let result = (|| {
+            match capture {
+                Ok(output) if output.status.success() => {
+                    let bytes = std::fs::read(&file).map_err(|_| "Не удалось прочитать снимок")?;
+                    let draft = prepare_image_attachment_bytes("window-snapshot.png".into(), bytes, 0, "png")?;
+                    Ok(CapturedSnapshot { mime: draft.mime, size: draft.content.len(), sha256: format!("{:x}", Sha256::digest(&draft.content)), preview: draft.preview })
+                }
+                Ok(_) => Err("Захват отменён или запрещён macOS. Проверьте разрешение «Запись экрана» в настройках конфиденциальности.".into()),
+                Err(_) => Err("Не удалось открыть системный выбор окна macOS".into()),
+            }
+        })();
+        let _ = std::fs::remove_dir_all(dir);
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    { Err("Выбор окна доступен только в macOS".into()) }
+}
+
+#[tauri::command]
+fn add_captured_snapshot(data_url: String, state: State<'_, AppState>) -> Result<AttachmentPreview, String> {
+    let encoded = data_url.strip_prefix("data:image/png;base64,").ok_or("Некорректный снимок")?;
+    if encoded.len() > 4 * 1024 * 1024 { return Err("Снимок больше 3 МиБ".into()); }
+    let bytes = BASE64.decode(encoded).map_err(|_| "Некорректный снимок")?;
+    let mut drafts = state.drafts.lock().map_err(|_| "Список вложений занят")?;
+    if drafts.len() >= 5 { return Err("Можно выбрать не больше пяти вложений".into()); }
+    if drafts.iter().filter(|draft| draft.mime.starts_with("image/")).count() >= 8 { return Err("В одном запросе можно использовать не больше восьми изображений".into()); }
+    let id = drafts.last().map_or(1, |draft| draft.id + 1);
+    let draft = prepare_image_attachment_bytes("window-snapshot.png".into(), bytes, id, "png")?;
+    let preview = attachment_preview(&draft);
+    drafts.push(draft);
+    Ok(preview)
 }
 
 fn attachment_preview(draft: &PendingAttachment) -> AttachmentPreview {
@@ -2025,7 +2082,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -2376,7 +2433,13 @@ mod tests {
         ] };
         db.execute("INSERT INTO model_catalog_snapshots(fetched_at,source,data_json) VALUES(100,'test',?1)",
             [serde_json::to_string(&catalog).unwrap()]).unwrap();
-        let bytes = BASE64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lnsAAAAASUVORK5CYII=").unwrap();
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes).write_image(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8).unwrap();
+        let captured = prepare_image_attachment_bytes("window-snapshot.png".into(), bytes.clone(), 0, "png").unwrap();
+        assert_eq!(captured.mime, "image/png");
+        assert!(captured.preview.starts_with("data:image/png;base64,"));
+        assert!(prepare_image_attachment_bytes("window-snapshot.png".into(), b"not png".to_vec(), 0, "png").is_err());
         let image = PendingAttachment { id: 1, name: "pixel.png".into(), mime: "image/png".into(), content: bytes.clone(), preview: format!("data:image/png;base64,{}", BASE64.encode(&bytes)) };
         let preview = context_for(&db, 1, None, Some(("describe", &[&image])), "gpt-6-luna").unwrap();
         let payload = chat_payload(&db, &preview, Some(("describe", &[&image]))).unwrap();

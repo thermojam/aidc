@@ -34,6 +34,8 @@ fn main() {
                 "restore_backup",
                 "pick_text_attachment",
                 "pick_image_attachment",
+                "capture_window_snapshot",
+                "add_captured_snapshot",
                 "remove_text_attachment",
                 "list_models",
                 "list_model_categories",

@@ -37,6 +37,8 @@
     "allow-restore-backup",
     "allow-pick-text-attachment",
     "allow-pick-image-attachment",
+    "allow-capture-window-snapshot",
+    "allow-add-captured-snapshot",
     "allow-remove-text-attachment",
     "allow-list-models",
     "allow-list-model-categories",

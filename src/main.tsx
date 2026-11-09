@@ -32,6 +32,7 @@ type CatalogModel = {
 };
 type ModelCatalog = { fetched_at: number; models: CatalogModel[] };
 type GeneratedImage = { model_id: string; price_rubles: number; data_url: string };
+type CapturedSnapshot = { mime: string; size: number; sha256: string; preview: string };
 type TranscriptionResult = { text: string };
 type ModelCategory = { model_id: string; category: string; source: string; updated_at: number };
 type History = {
@@ -111,6 +112,7 @@ function App() {
     const [transcriptionText, setTranscriptionText] = useState("");
     const [transcribing, setTranscribing] = useState(false);
     const [uncertainTranscription, setUncertainTranscription] = useState("");
+    const [capturedSnapshot, setCapturedSnapshot] = useState<CapturedSnapshot | null>(null);
     const [transcriptionModelId, setTranscriptionModelId] = useState("");
     const recorder = useRef<MediaRecorder | null>(null);
     const recordingStream = useRef<MediaStream | null>(null);
@@ -689,6 +691,23 @@ function App() {
         } catch (reason) { setError(String(reason)); }
     }
 
+    async function captureWindowSnapshot() {
+        try {
+            setCapturedSnapshot(await invoke<CapturedSnapshot>("capture_window_snapshot"));
+            setError("");
+        } catch (reason) { setError(String(reason)); }
+    }
+
+    async function attachCapturedSnapshot() {
+        if (!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
+        try {
+            const attachment = await invoke<PendingAttachment>("add_captured_snapshot", {dataUrl: capturedSnapshot.preview});
+            setPendingAttachments((current) => [...current, attachment]);
+            setCapturedSnapshot(null);
+            setContextPreview(null);
+        } catch (reason) { setError(String(reason)); }
+    }
+
     async function removeAttachment(id: number) {
         try {
             await invoke("remove_text_attachment", {id});
@@ -1032,6 +1051,21 @@ function App() {
                         </div>}
                     </section>
                     <div className="attachment-controls">
+                        <div className="snapshot-controls">
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void captureWindowSnapshot()}>Снимок выбранного окна…</button>
+                            <small>macOS откроет системный выбор окна и при необходимости запросит разрешение «Запись экрана».</small>
+                        </div>
+                        {capturedSnapshot && <div className="snapshot-preview">
+                            <img src={capturedSnapshot.preview} alt="Предпросмотр снимка окна"/>
+                            <div><strong>Снимок пока не прикреплён</strong>
+                                <small>{capturedSnapshot.size} Б · SHA-256 {capturedSnapshot.sha256.slice(0, 12)}…</small>
+                                <div className="actions">
+                                    <button type="button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => void attachCapturedSnapshot()}>Прикрепить снимок</button>
+                                    <button type="button" className="secondary-button" onClick={() => setCapturedSnapshot(null)}>Удалить снимок</button>
+                                </div>
+                            </div>
+                        </div>}
                         {pendingAttachments.map((attachment) => (
                             <div className="attachment-item" key={attachment.id}>
                                 <span title={attachment.name}>{attachment.name} · {attachment.size} Б · SHA-256 {attachment.sha256.slice(0, 12)}…</span>

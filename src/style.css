@@ -445,6 +445,41 @@ h2 {
     gap: 6px;
 }
 
+.snapshot-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.snapshot-controls small, .snapshot-preview small {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.snapshot-preview {
+    display: flex;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 8px;
+    border: 1px solid var(--border);
+}
+
+.snapshot-preview > img {
+    width: min(100%, 280px);
+    max-height: 180px;
+    object-fit: contain;
+    object-position: left top;
+    background: var(--panel);
+}
+
+.snapshot-preview > div {
+    display: grid;
+    justify-items: start;
+    gap: 6px;
+}
+
 .attachment-item {
     width: 100%;
     display: flex;
