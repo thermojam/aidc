@@ -5,6 +5,9 @@ import {getCurrentWindow} from "@tauri-apps/api/window";
 import {isPermissionGranted, onAction, requestPermission, sendNotification} from "@tauri-apps/plugin-notification";
 import MarkdownMessage from "./MarkdownMessage";
 import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
+import {Button} from "./components/ui/button";
+import {Dialog, DialogContent, DialogTitle} from "./components/ui/dialog";
+import {NativeSelect} from "./components/ui/native-select";
 import "./style.css";
 
 type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
@@ -165,7 +168,6 @@ function App() {
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const settingsButton = useRef<HTMLButtonElement>(null);
     const compactSettingsButton = useRef<HTMLButtonElement>(null);
-    const settingsDialog = useRef<HTMLDialogElement>(null);
     const paletteDialog = useRef<HTMLDialogElement>(null);
     const paletteInput = useRef<HTMLInputElement>(null);
     const paletteTrigger = useRef<HTMLElement | null>(null);
@@ -180,14 +182,15 @@ function App() {
     });
 
     useEffect(() => {
-        document.documentElement.dataset.theme = theme;
+        const media = window.matchMedia("(prefers-color-scheme: dark)");
+        function applyTheme() {
+            document.documentElement.dataset.theme = theme === "system" ? (media.matches ? "dark" : "light") : theme;
+        }
+        applyTheme();
         localStorage.setItem("appearance", theme);
+        media.addEventListener("change", applyTheme);
+        return () => media.removeEventListener("change", applyTheme);
     }, [theme]);
-
-    useEffect(() => {
-        if (settingsOpen) settingsDialog.current?.showModal();
-        else settingsDialog.current?.close();
-    }, [settingsOpen]);
 
     useEffect(() => {
         if (paletteOpen) {
@@ -200,7 +203,7 @@ function App() {
         function onShortcut(event: KeyboardEvent) {
             const target = event.target;
             const typing = target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
-            if (typing || paletteOpen || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
+            if (typing || paletteOpen || settingsOpen || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
             event.preventDefault();
             paletteTrigger.current = target instanceof HTMLElement ? target : null;
             setPaletteQuery("");
@@ -208,7 +211,7 @@ function App() {
         }
         window.addEventListener("keydown", onShortcut);
         return () => window.removeEventListener("keydown", onShortcut);
-    }, [paletteOpen]);
+    }, [paletteOpen, settingsOpen]);
 
     function closePalette() {
         if (paletteDialog.current?.open) paletteDialog.current.close();
@@ -218,7 +221,6 @@ function App() {
 
     function closeSettings() {
         setSettingsOpen(false);
-        requestAnimationFrame(() => (compactSettingsButton.current?.offsetParent ? compactSettingsButton.current : settingsButton.current)?.focus());
     }
 
     async function reload(id = conversationId) {
@@ -1601,52 +1603,57 @@ function App() {
                 </div>
                 <p className="palette-hint">↑ ↓ выбрать · Enter открыть · Esc закрыть · ⌘K / Ctrl+K</p>
             </dialog>
-            <dialog ref={settingsDialog} className="settings-dialog" aria-labelledby="settings-title"
-                    onCancel={(event) => { event.preventDefault(); closeSettings(); }}>
-                <header className="settings-header"><h2 id="settings-title">Настройки</h2>
-                    <button type="button" className="secondary-button" onClick={closeSettings}>Закрыть</button></header>
+            <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+                <DialogContent className="settings-content" aria-describedby={undefined}
+                               onCloseAutoFocus={(event) => {
+                                   event.preventDefault();
+                                   (compactSettingsButton.current?.offsetParent ? compactSettingsButton.current : settingsButton.current)?.focus();
+                               }}>
+                <header className="settings-header"><DialogTitle className="text-base font-semibold">Настройки</DialogTitle>
+                    <Button type="button" onClick={closeSettings}>Закрыть</Button></header>
                 <section className="settings-section" aria-labelledby="connection-title">
                     <h3 id="connection-title">Подключение</h3>
                     <label htmlFor="api-key">Ключ SimpleClaw · {keySaved ? "сохранён" : "не сохранён"}</label>
                     <input id="api-key" type="password" value={key} autoComplete="off"
                            onChange={(event) => setKey(event.target.value)} placeholder="Введите ключ"/>
                     <div className="settings-actions">
-                        <button type="button" className="secondary-button" disabled={!key.trim() || busy}
-                                onClick={() => void saveKey()}>Сохранить ключ</button>
-                        {keySaved && <button type="button" className="secondary-button" disabled={busy}
-                                             onClick={() => void deleteKey()}>Удалить ключ</button>}
+                        <Button type="button" disabled={!key.trim() || busy}
+                                onClick={() => void saveKey()}>Сохранить ключ</Button>
+                        {keySaved && <Button type="button" disabled={busy}
+                                             onClick={() => void deleteKey()}>Удалить ключ</Button>}
                     </div>
                 </section>
                 <section className="settings-section" aria-labelledby="appearance-title">
                     <h3 id="appearance-title">Внешний вид</h3>
                     <label htmlFor="theme">Тема</label>
-                    <select id="theme" value={theme} onChange={(event) => setTheme(event.target.value as Theme)}>
+                    <NativeSelect id="theme" value={theme} onChange={(event) => setTheme(event.target.value as Theme)}>
                         <option value="system">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option>
-                    </select>
+                    </NativeSelect>
                 </section>
                 <section className="settings-section" aria-labelledby="response-style-title">
                     <h3 id="response-style-title">Стиль ответа</h3>
                     <label htmlFor="response-style">Для следующих запросов</label>
-                    <select id="response-style" value={responseStyle} disabled={busy}
+                    <NativeSelect id="response-style" value={responseStyle} disabled={busy}
                             onChange={(event) => void updateResponseStyle(event.target.value as ContextPreview["response_style"])}>
                         <option value="concise">Кратко</option><option value="balanced">Сбалансированно</option>
                         <option value="detailed">Подробно</option>
-                    </select>
+                    </NativeSelect>
                 </section>
                 <section className="settings-section" aria-labelledby="data-title">
                     <h3 id="data-title">Данные</h3>
-                    <button type="button" className="secondary-button" disabled={busy}
-                            onClick={() => void createBackup()}>Создать копию</button>
+                    <Button type="button" disabled={busy}
+                            onClick={() => void createBackup()}>Создать копию</Button>
                     <label htmlFor="backup">Резервные копии</label>
-                    <select id="backup" value={selectedBackup} onChange={(event) => setSelectedBackup(event.target.value)}>
+                    <NativeSelect id="backup" value={selectedBackup} onChange={(event) => setSelectedBackup(event.target.value)}>
                         <option value="">Выберите копию</option>
                         {backups.map((name) => <option key={name} value={name}>{name}</option>)}
-                    </select>
-                    <button type="button" className="secondary-button" disabled={busy || !selectedBackup}
-                            onClick={() => void restoreBackup()}>Восстановить</button>
+                    </NativeSelect>
+                    <Button type="button" disabled={busy || !selectedBackup}
+                            onClick={() => void restoreBackup()}>Восстановить</Button>
                 </section>
                 {error && <p role="alert">{error}</p>}
-            </dialog>
+                </DialogContent>
+            </Dialog>
         </main>
     );
 }
