@@ -5,6 +5,7 @@ Installed versions are pinned in package.json and package-lock.json. All pre-exi
 | Package | Version | License |
 | --- | --- | --- |
 | @radix-ui/react-dialog | 1.3.1 | MIT (WorkOS) |
+| sonner | 2.0.8 | MIT (Emil Kowalski) |
 | clsx | 2.1.1 | MIT (Luke Edwards) |
 | tailwind-merge | 3.7.0 | MIT (Dany Castillo) |
 | tailwindcss | 4.3.5 | MIT (Tailwind Labs) |
@@ -44,3 +45,5 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Sonner 2.0.8 provides the operation notification stack. Its original MIT license is distributed in `node_modules/sonner/LICENSE.md`. Source: https://github.com/emilkowalski/sonner.

@@ -1025,3 +1025,31 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-
 }
 
 }
+
+/* Operation errors remain beside the action, independently of transient notices. */
+.operation-error {
+    margin-block: 8px;
+    padding-block: 8px;
+    border-block: 1px solid var(--border);
+    overflow-wrap: anywhere;
+}
+.operation-error > p { color: var(--alert); margin: 0 0 8px; }
+.operation-error button + button { margin-inline-start: 8px; }
+.operation-error dd { margin-inline-start: 0; overflow-wrap: anywhere; }
+.render-error { padding: 16px; }
+.render-error pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+[data-sonner-toaster] [data-sonner-toast].operation-toast { box-shadow: none; }
+[data-sonner-toaster] [data-sonner-toast][data-visible="false"] { display: none; }
+.operation-toast-content {
+    display: flex;
+    align-items: start;
+    gap: 8px;
+    width: min(356px, calc(100vw - 32px));
+    padding: 12px;
+    border: 1px solid var(--control-border);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--text);
+    font: 13px/18px system-ui, sans-serif;
+}
+.operation-toast-content button { flex-shrink: 0; margin-inline-start: auto; }

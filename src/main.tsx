@@ -8,6 +8,8 @@ import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
 import {Button} from "./components/ui/button";
 import {Dialog, DialogContent, DialogTitle} from "./components/ui/dialog";
 import {NativeSelect} from "./components/ui/native-select";
+import {OperationNotice, OperationToaster, useOperationErrors, type ErrorArea, AnswerFailure, notify} from "./OperationErrors";
+import RenderBoundary from "./RenderBoundary";
 import "./style.css";
 
 type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
@@ -111,13 +113,13 @@ function App() {
     const [prompt, setPrompt] = useState("");
     const [busy, setBusy] = useState(false);
     const [draft, setDraft] = useState("");
-    const [error, setError] = useState("");
+    const {errors, report, clear} = useOperationErrors(conversationId);
     const [backups, setBackups] = useState<string[]>([]);
     const [selectedBackup, setSelectedBackup] = useState("");
     const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
     const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
     const [categories, setCategories] = useState<ModelCategory[]>([]);
-    const [catalogError, setCatalogError] = useState("");
+
     const [modelId, setModelId] = useState("local-mock");
     const [agentMode, setAgentMode] = useState(false);
     const [agentSkill, setAgentSkill] = useState<AgentSkill | null>(null);
@@ -151,6 +153,7 @@ function App() {
     const [transcriptionText, setTranscriptionText] = useState("");
     const [transcribing, setTranscribing] = useState(false);
     const [uncertainTranscription, setUncertainTranscription] = useState("");
+    const [captureNotice, setCaptureNotice] = useState("");
     const [capturedSnapshot, setCapturedSnapshot] = useState<CapturedSnapshot | null>(null);
     const [transcriptionModelId, setTranscriptionModelId] = useState("");
     const recorder = useRef<MediaRecorder | null>(null);
@@ -174,6 +177,13 @@ function App() {
     const chatSearchField = useRef<HTMLInputElement>(null);
     const artifactTrigger = useRef<HTMLElement | null>(null);
     const promptField = useRef<HTMLTextAreaElement>(null);
+    const activeConversation = useRef(conversationId);
+    activeConversation.current = conversationId;
+    const currentModel = useRef(modelId);
+    currentModel.current = modelId;
+    const navigationRequest = useRef(0);
+    const generationRequest = useRef(0);
+    const catalogRequest = useRef(0);
     const historyRequest = useRef(0);
     const contextRequest = useRef(0);
     const [theme, setTheme] = useState<Theme>(() => {
@@ -224,9 +234,10 @@ function App() {
     }
 
     async function reload(id = conversationId) {
+        if (id !== activeConversation.current) return;
         const request = ++historyRequest.current;
         const next = await invoke<History>("list_history", {conversationId: id});
-        if (request === historyRequest.current) setHistory(next);
+        if (request === historyRequest.current && id === activeConversation.current) { setHistory(next); clear("history"); }
     }
 
     async function refreshConversations() {
@@ -250,10 +261,11 @@ function App() {
     async function enableScheduleNotifications() {
         try {
             const granted = await isPermissionGranted() || await requestPermission() === "granted";
-            if (!granted) { setError("Уведомления запрещены в настройках системы."); return; }
+            if (!granted) { report("enableScheduleNotifications", "Уведомления запрещены в настройках системы."); return; }
             localStorage.setItem("scheduleNotifications", "enabled");
             setScheduleNotificationsEnabled(true);
-        } catch (reason) { setError(String(reason)); }
+            clear("enableScheduleNotifications");
+        } catch (reason) { report("enableScheduleNotifications", reason); }
     }
 
     async function createScheduledTask() {
@@ -261,12 +273,13 @@ function App() {
             await invoke("create_scheduled_agent_task", {conversationId, title: scheduleTitle, prompt: schedulePrompt, intervalMinutes: Number(scheduleInterval)});
             setScheduleTitle(""); setSchedulePrompt("");
             await refreshScheduledTasks();
-        } catch (reason) { setError(String(reason)); }
+            clear("createScheduledTask");
+        } catch (reason) { report("createScheduledTask", reason); }
     }
 
     async function stopScheduledTask(taskId: number) {
-        try { await invoke("stop_scheduled_agent_task", {taskId}); await refreshScheduledTasks(); }
-        catch (reason) { setError(String(reason)); }
+        try { await invoke("stop_scheduled_agent_task", {taskId}); await refreshScheduledTasks(); clear("stopScheduledTask"); }
+        catch (reason) { report("stopScheduledTask", reason); }
     }
 
     async function prepareScheduledTask(task: ScheduledAgentTask) {
@@ -275,21 +288,25 @@ function App() {
         try {
             if (task.conversation_id !== conversationId && !await switchConversation(task.conversation_id, true)) return;
             const prepared = await invoke<PreparedScheduledAgentTask>("prepare_scheduled_agent_task", {taskId: task.id});
+            if (task.conversation_id !== activeConversation.current || modelId !== currentModel.current) return;
             setPrompt(prepared.prompt);
             setScheduledDraft(prepared);
             setModelId("gpt-oss-20b");
             setAgentMode(true);
             setContextPreview(null);
             await refreshScheduledTasks();
-        } catch (reason) { setError(String(reason)); }
+            clear("prepareScheduledTask");
+        } catch (reason) { report("prepareScheduledTask", reason); }
     }
 
     async function refreshAgentBoard(id = conversationId) {
-        setAgentBoard(await invoke<AgentBoard>("get_agent_board", {conversationId: id}));
+        const board = await invoke<AgentBoard>("get_agent_board", {conversationId: id});
+        if (id === activeConversation.current) { setAgentBoard(board); clear("agentBoard"); }
     }
 
     async function refreshAgentSkill(id = conversationId) {
-        setAgentSkill(await invoke<AgentSkill | null>("get_agent_skill", {conversationId: id}));
+        const skill = await invoke<AgentSkill | null>("get_agent_skill", {conversationId: id});
+        if (id === activeConversation.current) { setAgentSkill(skill); clear("agentSkill"); }
     }
 
     async function saveAgentSkill(materialId: number | null, enabled: boolean) {
@@ -297,7 +314,8 @@ function App() {
             await invoke("set_agent_skill", {conversationId, materialId, enabled});
             await refreshAgentSkill();
             setContextPreview(null);
-        } catch (reason) { setError(String(reason)); }
+            clear("saveAgentSkill");
+        } catch (reason) { report("saveAgentSkill", reason); }
     }
 
     async function addPlanStep() {
@@ -305,14 +323,16 @@ function App() {
             await invoke("add_agent_plan_step", {conversationId, action: planDraft});
             setPlanDraft("");
             await refreshAgentBoard();
-        } catch (reason) { setError(String(reason)); }
+            clear("addPlanStep");
+        } catch (reason) { report("addPlanStep", reason); }
     }
 
     async function completePlanStep(stepId: number) {
         try {
             await invoke("complete_agent_plan_step", {conversationId, stepId});
             await refreshAgentBoard();
-        } catch (reason) { setError(String(reason)); }
+            clear("completePlanStep");
+        } catch (reason) { report("completePlanStep", reason); }
     }
 
     async function addBoardInput(kind: "queue" | "steering") {
@@ -322,7 +342,8 @@ function App() {
                 {conversationId, [kind === "queue" ? "request" : "note"]: text});
             if (kind === "queue") setQueueDraft(""); else setSteeringDraft("");
             await refreshAgentBoard();
-        } catch (reason) { setError(String(reason)); }
+            clear("addBoardInput");
+        } catch (reason) { report("addBoardInput", reason); }
     }
 
     function useBoardInput(kind: "queue" | "steering", item: {id: number; text: string; status: string}) {
@@ -336,14 +357,16 @@ function App() {
         try {
             await invoke("start_synthetic_task");
             await refreshSyntheticTasks();
-        } catch (reason) { setError(String(reason)); }
+            clear("startSyntheticTask");
+        } catch (reason) { report("startSyntheticTask", reason); }
     }
 
     async function decideSyntheticStep(taskId: number, stepId: number, decision: "approve" | "deny") {
         try {
             await invoke(decision === "approve" ? "approve_synthetic_step" : "deny_synthetic_step", {taskId, stepId});
             await refreshSyntheticTasks();
-        } catch (reason) { setError(String(reason)); }
+            clear("decideSyntheticStep");
+        } catch (reason) { report("decideSyntheticStep", reason); }
     }
 
     async function generateImage() {
@@ -356,7 +379,7 @@ function App() {
         setImageGenerationBusy(true);
         setGeneratedImage(null);
         setImageSaved(false);
-        setError("");
+        clear("generateImage");
         try {
             setGeneratedImage(await invoke<GeneratedImage>("generate_image", {
                 modelId: selectedImageModelId, prompt: imagePrompt, expectedPriceRubles: model.request_rubles
@@ -365,13 +388,13 @@ function App() {
             const message = String(reason);
             if (message.includes("NETWORK_RESULT_UNKNOWN") || message.includes("GENERATION_RESULT_UNKNOWN") || /GENERATION_HTTP_5\d\d/.test(message)) {
                 setUncertainImageSignature(signature);
-                setError("Результат генерации неизвестен; запрос мог быть принят и оплачен. Для продолжения измените описание или модель, чтобы не повторить тот же запрос.");
+                report("generateImage", "Результат генерации неизвестен; запрос мог быть принят и оплачен. Для продолжения измените описание или модель, чтобы не повторить тот же запрос.");
             } else if (message.includes("Цена изменилась")) {
                 try {
                     setCatalog(await invoke<ModelCatalog>("refresh_models"));
-                    setError("Цена каталога изменилась. Проверьте новую сумму, затем подтвердите запрос ещё раз.");
-                } catch (refreshReason) { setError(`Не удалось обновить цену: ${String(refreshReason)}`); }
-            } else setError(message);
+                    report("generateImage", "Цена каталога изменилась. Проверьте новую сумму, затем подтвердите запрос ещё раз.");
+                } catch (refreshReason) { report("generateImage", `Не удалось обновить цену: ${String(refreshReason)}`); }
+            } else report("generateImage", message);
         }
         finally { setImageGenerationBusy(false); }
     }
@@ -381,7 +404,7 @@ function App() {
         try {
             const saved = await invoke<boolean>("save_generated_image", {dataUrl: generatedImage.data_url});
             setImageSaved(saved);
-        } catch (reason) { setError(String(reason)); }
+        } catch (reason) { report("saveGeneratedImage", reason); }
     }
 
     async function startVoiceRecording() {
@@ -399,7 +422,7 @@ function App() {
                 audioSize.current += event.data.size;
                 if (audioSize.current <= 25 * 1024 * 1024) audioChunks.current.push(event.data);
                 else {
-                    setError("Запись превысила 25 МиБ и удалена. Попробуйте короче.");
+                    report("startVoiceRecording", "Запись превысила 25 МиБ и удалена. Попробуйте короче.");
                     if (nextRecorder.state === "recording") nextRecorder.stop();
                 }
             };
@@ -419,11 +442,11 @@ function App() {
             startedAt.current = Date.now();
             setRecordedAudio(null);
             setTranscriptionText("");
-            setError("");
+            clear("startVoiceRecording");
             nextRecorder.start(1000);
             setRecording(true);
             window.setTimeout(() => { if (recorder.current === nextRecorder && nextRecorder.state === "recording") nextRecorder.stop(); }, 600_000);
-        } catch (reason) { setError(`Не удалось начать запись: ${String(reason)}`); }
+        } catch (reason) { report("startVoiceRecording", `Не удалось начать запись: ${String(reason)}`); }
     }
 
     const startedAt = useRef(0);
@@ -446,7 +469,7 @@ function App() {
         const estimate = (Math.ceil(recordedAudio.seconds) + 1) / 60 * model.audio_rubles_per_minute;
         if (!window.confirm(`Отправить запись в SimpleClaw для распознавания?\nМодель: ${model.name} (${model.id})\nДлительность записи: ${recordedAudio.seconds.toFixed(1)} с\nТариф: ${model.audio_rubles_per_minute} ₽/мин\nОценка по записи с запасом 1 с: ${estimate.toFixed(2)} ₽. Сервис считает декодированную длительность; итог может отличаться. Автоповтора не будет.`)) return;
         setTranscribing(true);
-        setError("");
+        clear("transcribeVoice");
         try {
             const result = await invoke<TranscriptionResult>("transcribe_audio", {
                 modelId: model.id, audioBase64: recordedAudio.base64, mimeType: recordedAudio.mime,
@@ -458,20 +481,23 @@ function App() {
             const message = String(reason);
             if (message.includes("UNKNOWN") || /TRANSCRIPTION_HTTP_5\d\d/.test(message)) {
                 setUncertainTranscription(signature);
-                setError("Результат распознавания неизвестен; запрос мог быть принят и оплачен. Автоповтора нет.");
+                report("transcribeVoice", "Результат распознавания неизвестен; запрос мог быть принят и оплачен. Автоповтора нет.");
             } else if (message.includes("Ставка изменилась")) {
-                try { setCatalog(await invoke<ModelCatalog>("refresh_models")); setError("Тариф изменился. Обновите оценку и подтвердите отправку снова."); }
-                catch (refreshReason) { setError(`Не удалось обновить тариф: ${String(refreshReason)}`); }
-            } else setError(message);
+                try { setCatalog(await invoke<ModelCatalog>("refresh_models")); report("transcribeVoice", "Тариф изменился. Обновите оценку и подтвердите отправку снова."); }
+                catch (refreshReason) { report("transcribeVoice", `Не удалось обновить тариф: ${String(refreshReason)}`); }
+            } else report("transcribeVoice", message);
         } finally { setTranscribing(false); }
     }
 
     async function refreshModelCatalog() {
-        setCatalogError("");
+        const request = ++catalogRequest.current;
         try {
-            setCatalog(await invoke<ModelCatalog>("refresh_models"));
+            const result = await invoke<ModelCatalog>("refresh_models");
+            if (request !== catalogRequest.current) return;
+            setCatalog(result);
             setContextPreview(null);
-        } catch (reason) { setCatalogError(String(reason)); }
+            clear("catalog");
+        } catch (reason) { if (request === catalogRequest.current) report("catalog", reason); }
     }
 
     async function refreshProjects() {
@@ -487,7 +513,7 @@ function App() {
         const timer = window.setTimeout(() => {
             invoke<Conversation[]>("search_conversations", {query, projectFilter})
                 .then((items) => { if (current) setSearchMatches(items.map((item) => item.id)); })
-                .catch((reason) => { if (current) setError(String(reason)); });
+                .catch((reason) => { if (current) report("search", reason); });
         }, 150);
         return () => { current = false; window.clearTimeout(timer); };
     }, [conversationSearch, conversations, projectFilter]);
@@ -506,36 +532,38 @@ function App() {
         }
         invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
             .then((items) => { if (current) setProjectMaterials(items); })
-            .catch((reason) => { if (current) setError(String(reason)); });
+            .catch((reason) => { if (current) report("materials", reason); });
         invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
             .then((folder) => { if (current) setProjectFolderView(folder); })
-            .catch((reason) => { if (current) setError(String(reason)); });
+            .catch((reason) => { if (current) report("folder", reason); });
         return () => { current = false; };
     }, [conversationProjectId]);
 
     useEffect(() => {
         refreshConversations().then((items) => {
-            if (!items.some((item) => item.id === conversationId && !item.archived)) {
+            if (!items.some((item) => item.id === activeConversation.current && !item.archived)) {
                 setConversationId(items.find((item) => !item.archived)?.id ?? items[0]?.id ?? 1);
             }
-        }).catch((reason) => setError(String(reason)));
-        refreshProjects().catch((reason) => setError(String(reason)));
-        invoke<string[]>("list_backups").then(setBackups).catch((reason) => setError(String(reason)));
-        invoke<ModelCatalog | null>("list_models").then(setCatalog).catch((reason) => setCatalogError(String(reason)));
-        invoke<ContextPreview["response_style"]>("get_response_style").then(setResponseStyle).catch((reason) => setError(String(reason)));
-        invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => setCatalogError(String(reason)));
-        invoke<boolean>("key_status").then(setKeySaved).catch((reason) => setError(String(reason)));
-        invoke<SyntheticTask[]>("list_synthetic_tasks").then(setSyntheticTasks).catch((reason) => setError(String(reason)));
-        invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => setError(String(reason)));
-        invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => setError(String(reason)));
-        invoke<AgentBoard>("get_agent_board", {conversationId}).then(setAgentBoard).catch((reason) => setError(String(reason)));
-        invoke<ModelCatalog>("refresh_models").then((result) => { setCatalog(result); setContextPreview(null); setCatalogError(""); }).catch((reason) => setCatalogError(String(reason)));
+        }).catch((reason) => report("navigation", reason));
+        refreshProjects().catch((reason) => report("projects", reason));
+        invoke<string[]>("list_backups").then(setBackups).catch((reason) => report("backups", reason));
+        invoke<ModelCatalog | null>("list_models").then((cached) => { setCatalog((current) => current ?? cached); }).catch(() => {
+            // The concurrent refresh reports catalog failure; a late cache read must not replace its result.
+        });
+        invoke<ContextPreview["response_style"]>("get_response_style").then(setResponseStyle).catch((reason) => report("responseStyle", reason));
+        invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => report("categories", reason));
+        invoke<boolean>("key_status").then(setKeySaved).catch((reason) => report("keyStatus", reason));
+        invoke<SyntheticTask[]>("list_synthetic_tasks").then(setSyntheticTasks).catch((reason) => report("syntheticTasks", reason));
+        invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => report("scheduledTasks", reason));
+        invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => report("scheduledRuns", reason));
+
+        void refreshModelCatalog();
     }, []);
 
     useEffect(() => {
         const timer = window.setInterval(() => {
-            invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => setError(String(reason)));
-            invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => setError(String(reason)));
+            invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => report("scheduledTasks", reason));
+            invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => report("scheduledRuns", reason));
         }, 30_000);
         return () => window.clearInterval(timer);
     }, []);
@@ -547,19 +575,19 @@ function App() {
             if (event.actionId !== "tap") return;
             const runId = event.notification?.extra?.scheduledRunId;
             if (typeof runId === "number") {
-                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => setError(String(reason)));
-                void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId}).then(setOpenedScheduledResult).catch((reason) => setError(String(reason)));
+                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => report("notifications", reason));
+                void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId}).then(setOpenedScheduledResult).catch((reason) => report("scheduledRuns", reason));
                 return;
             }
             const taskId = event.notification?.extra?.scheduledTaskId;
             if (typeof taskId === "number") {
-                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => setError(String(reason)));
+                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => report("scheduledRuns", reason));
                 setNotificationTaskId(taskId);
             }
         }).then((registered) => {
             if (!active) void registered.unregister();
             else { listener = registered; setNotificationListenerReady(true); }
-        }).catch((reason) => setError(String(reason)));
+        }).catch((reason) => report("notifications", reason));
         return () => { active = false; if (listener) void listener.unregister(); };
     }, []);
 
@@ -575,7 +603,7 @@ function App() {
                 notifiedDueTasks.current.add(key);
                 sendNotification({title: "Пора подтвердить задачу", body: "Откройте приложение, чтобы просмотреть её.", extra: {scheduledTaskId: task.id}});
             }
-        }).catch((reason) => setError(String(reason)));
+        }).catch((reason) => report("notifications", reason));
         return () => { active = false; };
     }, [scheduledTasks, scheduleNotificationsEnabled, notificationListenerReady]);
 
@@ -589,10 +617,10 @@ function App() {
                 try {
                     sendNotification({title: "Агентная задача завершена", body: "Откройте приложение, чтобы посмотреть результат.", extra: {scheduledRunId: run.id}});
                     notifiedRuns.current.add(run.id);
-                    void invoke("mark_scheduled_agent_run_notified", {runId: run.id}).catch((reason) => setError(String(reason)));
-                } catch (reason) { setError(String(reason)); }
+                    void invoke("mark_scheduled_agent_run_notified", {runId: run.id}).catch((reason) => report("notifications", reason));
+                } catch (reason) { report("notifications", reason); }
             }
-        }).catch((reason) => setError(String(reason)));
+        }).catch((reason) => report("notifications", reason));
         return () => { active = false; };
     }, [scheduledRuns, scheduleNotificationsEnabled, notificationListenerReady]);
 
@@ -610,20 +638,23 @@ function App() {
     }, [openedScheduledResult]);
 
     useEffect(() => {
-        reload(conversationId).catch((reason) => setError(String(reason)));
-        refreshAgentBoard(conversationId).catch((reason) => setError(String(reason)));
-        refreshAgentSkill(conversationId).catch((reason) => setError(String(reason)));
+        reload(conversationId).catch((reason) => report("history", reason));
+        refreshAgentBoard(conversationId).catch((reason) => report("agentBoard", reason));
+        refreshAgentSkill(conversationId).catch((reason) => report("agentSkill", reason));
     }, [conversationId]);
 
     async function switchConversation(id: number, discardConfirmed = false) {
         if (busy) return false;
         if (id === conversationId) return true;
         if (!discardConfirmed && (prompt.trim() || pendingAttachments.length) && !window.confirm("Перейти в другую беседу? Черновик и выбранные файлы будут убраны.")) return false;
+        const request = ++navigationRequest.current;
         try {
             for (const attachment of pendingAttachments) await invoke("remove_text_attachment", {id: attachment.id});
+            if (request !== navigationRequest.current) return false;
             setPendingAttachments([]);
             setPrompt("");
             setScheduledDraft(null);
+            setCaptureNotice("");
             setBoardInputSource(null);
             contextRequest.current++;
             setContextPreview(null);
@@ -631,10 +662,11 @@ function App() {
             setSidebarOpen(false);
             historyRequest.current++;
             setHistory({messages: [], attachments: [], artifacts: [], active_leaf_id: null, contexts: [], attempts: []});
+            activeConversation.current = id;
             setConversationId(id);
-            setError("");
+            setDraft("");
             return true;
-        } catch (reason) { setError(String(reason)); return false; }
+        } catch (reason) { report("switchConversation", reason); return false; }
     }
 
     async function createConversation() {
@@ -645,7 +677,8 @@ function App() {
             if (projectFilter && projectFilter > 0) await invoke("move_conversation", {conversationId: id, projectId: projectFilter});
             await refreshConversations();
             await switchConversation(id, true);
-        } catch (reason) { setError(String(reason)); }
+            clear("createConversation");
+        } catch (reason) { report("createConversation", reason); }
     }
 
     async function saveRename() {
@@ -659,8 +692,8 @@ function App() {
                 await refreshProjects();
             }
             setRenameTarget(null);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("saveRename");
+        } catch (reason) { report("saveRename", reason); }
     }
 
     async function updateResponseStyle(style: ContextPreview["response_style"]) {
@@ -668,7 +701,8 @@ function App() {
             await invoke("set_response_style", {style});
             setResponseStyle(style);
             setContextPreview(null);
-        } catch (reason) { setError(String(reason)); }
+            clear("updateResponseStyle");
+        } catch (reason) { report("updateResponseStyle", reason); }
     }
 
     async function archiveConversation(item: Conversation) {
@@ -678,7 +712,7 @@ function App() {
         try {
             await invoke("archive_conversation", {conversationId: item.id, archived: !item.archived});
             const items = await refreshConversations();
-            setError("");
+            clear("archiveConversation");
             if (item.id === conversationId && !item.archived) {
                 let nextId = items.find((candidate) => !candidate.archived)?.id;
                 if (!nextId) {
@@ -687,15 +721,15 @@ function App() {
                 }
                 await switchConversation(nextId, true);
             }
-        } catch (reason) { setError(String(reason)); }
+        } catch (reason) { report("archiveConversation", reason); }
     }
 
     async function togglePin(item: Conversation) {
         try {
             await invoke("set_conversation_pinned", {conversationId: item.id, pinned: !item.pinned});
             await refreshConversations();
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("togglePin");
+        } catch (reason) { report("togglePin", reason); }
     }
 
     async function createProject() {
@@ -703,8 +737,8 @@ function App() {
             const id = await invoke<number>("create_project");
             await refreshProjects();
             setProjectFilter(id);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("createProject");
+        } catch (reason) { report("createProject", reason); }
     }
 
     async function archiveProject(item: Project) {
@@ -712,8 +746,8 @@ function App() {
             await invoke("archive_project", {id: item.id, archived: !item.archived});
             await refreshProjects();
             if (!item.archived && projectFilter === item.id) setProjectFilter(null);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("archiveProject");
+        } catch (reason) { report("archiveProject", reason); }
     }
 
     async function moveConversation(projectId: number | null) {
@@ -721,8 +755,8 @@ function App() {
             await invoke("move_conversation", {conversationId, projectId});
             await refreshConversations();
             setProjectFilter(projectId ?? 0);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("moveConversation");
+        } catch (reason) { report("moveConversation", reason); }
     }
 
     async function addProjectMaterial() {
@@ -731,29 +765,35 @@ function App() {
             const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
             if (!attachment) return;
             const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
+            if (conversationId !== activeConversation.current) return;
             setProjectMaterials((items) => [...items.filter((item) => item.id !== material.id), material]);
             setContextPreview(null);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("addProjectMaterial");
+        } catch (reason) { report("addProjectMaterial", reason); }
     }
 
     async function chooseProjectFolder() {
         if (conversationProjectId === null) return;
         try {
             const chosen = await invoke<string | null>("choose_project_folder", {projectId: conversationProjectId});
-            if (chosen) setProjectFolderView(await invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId}));
+            if (!chosen) return;
+            const folder = await invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId});
+            if (conversationId !== activeConversation.current) return;
+            setProjectFolderView(folder);
             setFolderPreview(null);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("chooseProjectFolder");
+        } catch (reason) { report("chooseProjectFolder", reason); }
     }
 
     async function previewProjectFile(relativePath: string) {
         if (conversationProjectId === null) return;
         try {
             setFolderPreview(null);
-            setFolderPreview(await invoke<PendingAttachment>("preview_project_file", {projectId: conversationProjectId, relativePath}));
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            const result = await invoke<PendingAttachment>("preview_project_file", {projectId: conversationProjectId, relativePath});
+            if (conversationId !== activeConversation.current) return;
+            setFolderPreview(result);
+            clear("previewProjectFile");
+        } catch (reason) { report("previewProjectFile", reason); }
     }
 
     async function saveFolderPreview() {
@@ -762,19 +802,20 @@ function App() {
             const material = await invoke<ProjectMaterial>("save_project_folder_material", {
                 projectId: conversationProjectId, relativePath: folderPreview.name, expectedSha256: folderPreview.sha256
             });
+            if (conversationId !== activeConversation.current) return;
             setProjectMaterials((items) => [...items, material]);
             setFolderPreview(null);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("saveFolderPreview");
+        } catch (reason) { report("saveFolderPreview", reason); }
     }
 
     async function createBackup() {
         try {
             await invoke<string>("create_backup");
             setBackups(await invoke<string[]>("list_backups"));
-            setError("");
+            clear("createBackup", "Резервная копия создана");
         } catch (reason) {
-            setError(String(reason));
+            report("createBackup", reason);
         }
     }
 
@@ -796,9 +837,9 @@ function App() {
             setSelectedArtifactId(null);
             setContextPreview(null);
             setBackups(await invoke<string[]>("list_backups"));
-            setError("");
+            clear("restoreBackup", "Резервная копия восстановлена");
         } catch (reason) {
-            setError(String(reason));
+            report("restoreBackup", reason);
         }
     }
 
@@ -807,58 +848,72 @@ function App() {
             await invoke("save_key", {key});
             setKey("");
             setKeySaved(true);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("saveKey", "Ключ сохранён");
+        } catch (reason) { report("saveKey", reason); }
     }
 
     async function deleteKey() {
         try {
             await invoke("delete_key");
             setKeySaved(false);
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("deleteKey", "Ключ удалён");
+        } catch (reason) { report("deleteKey", reason); }
     }
 
     async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string): Promise<boolean> {
         if (busy) return false;
+        const request = ++generationRequest.current;
         setBusy(true);
-        setError("");
+        clear("runGeneration");
         setDraft("");
         const channel = new Channel<StreamEvent>();
         let lastSeq = 0;
         let pending = "";
         let frame = 0;
+        let ended = false;
         channel.onmessage = (message) => {
+            if (ended || request !== generationRequest.current || conversationId !== activeConversation.current) return;
             if (message.event === "delta") {
                 if (message.data.seq === lastSeq + 1) {
                     lastSeq = message.data.seq;
                     pending += message.data.text;
                     if (!frame) frame = requestAnimationFrame(() => {
-                        setDraft((current) => current + pending);
+                        if (request !== generationRequest.current || conversationId !== activeConversation.current) return;
+                        const chunk = pending;
                         pending = "";
+                        setDraft((current) => current + chunk);
                         frame = 0;
                     });
                 } else if (message.data.seq > lastSeq + 1) {
-                    reload().catch((reason) => setError(String(reason)));
+                    reload().catch((reason) => report("history", reason));
                 }
             } else {
+                ended = true;
                 if (frame) cancelAnimationFrame(frame);
+                const tail = pending;
+                pending = "";
+                setDraft((current) => current + tail);
                 setBusy(false);
-                setDraft("");
-                if (message.data.error_code) setError(`${message.data.http_status ? `HTTP ${message.data.http_status} · ` : ""}${message.data.error_code}${message.data.request_id ? ` · запрос ${message.data.request_id}` : ""}. Расход неизвестен.`);
-                reload().catch((reason) => setError(String(reason)));
-                refreshScheduledRuns().catch((reason) => setError(String(reason)));
+                if (message.data.status === "failed" || message.data.status === "interrupted") {
+                    notify("Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
+                }
+                void reload().then(() => {
+                    if (request === generationRequest.current && conversationId === activeConversation.current) setDraft("");
+                }).catch((reason) => report("history", reason));
+                refreshScheduledRuns().catch((reason) => report("scheduledRuns", reason));
             }
         };
         try {
             await invoke<number>(command, {conversationId, ...args, onEvent: channel});
+            if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
             await reload();
             return true;
         } catch (reason) {
+            if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
             if (frame) cancelAnimationFrame(frame);
             setBusy(false);
             if (restorePrompt !== undefined) setPrompt(restorePrompt);
-            setError(String(reason));
+            report("runGeneration", reason);
             return false;
         }
     }
@@ -874,7 +929,7 @@ function App() {
         const tools = conversationProjectId !== null && projectFolderView ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
         if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
         if (scheduledDraft && value === scheduledDraft.prompt && (!agentMode || modelId !== "gpt-oss-20b")) {
-            setError("Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
+            report("send", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
             return;
         }
         setPrompt("");
@@ -882,12 +937,13 @@ function App() {
         const inputSource = boardInputSource?.text === value ? boardInputSource : null;
         if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
             setScheduledDraft(null);
+            clear("send");
             if (inputSource) {
                 try {
                     await invoke("mark_agent_input_submitted", {conversationId, kind: inputSource.kind, itemId: inputSource.id});
                     setBoardInputSource(null);
                     await refreshAgentBoard();
-                } catch (reason) { setError(String(reason)); }
+                } catch (reason) { report("send", reason); }
             }
             setPendingAttachments((current) => current.filter((attachment) => !ids.includes(attachment.id)));
             setSelectedMaterialIds([]);
@@ -898,19 +954,25 @@ function App() {
     async function pickAttachment() {
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
+            if (!attachment) return;
+            if (conversationId !== activeConversation.current) {
+                await invoke("remove_text_attachment", {id: attachment.id});
+                return;
+            }
             if (attachment) {
                 setPendingAttachments((current) => [...current, attachment]);
                 setContextPreview(null);
             }
-            setError("");
+            clear("pickAttachment");
         } catch (reason) {
-            setError(String(reason));
+            report("pickAttachment", reason);
         }
     }
 
     async function pickImageAttachment() {
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_image_attachment");
+            if (!attachment) return;
             if (attachment) {
                 const image = new Image();
                 image.src = attachment.preview;
@@ -923,29 +985,46 @@ function App() {
                     await invoke("remove_text_attachment", {id: attachment.id});
                     throw new Error("Изображение превышает локальный предел 16 мегапикселей");
                 }
+                if (conversationId !== activeConversation.current) {
+                    await invoke("remove_text_attachment", {id: attachment.id});
+                    return;
+                }
                 setPendingAttachments((current) => [...current, attachment]);
                 setContextPreview(null);
             }
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            clear("pickImageAttachment");
+        } catch (reason) { report("pickImageAttachment", reason); }
     }
 
     async function captureWindowSnapshot() {
         setCapturedSnapshot(null);
+        setCaptureNotice("");
         try {
-            setCapturedSnapshot(await invoke<CapturedSnapshot>("capture_window_snapshot"));
-            setError("");
-        } catch (reason) { setError(String(reason)); }
+            const snapshot = await invoke<CapturedSnapshot | null>("capture_window_snapshot");
+            if (!snapshot || conversationId !== activeConversation.current) return;
+            setCapturedSnapshot(snapshot);
+            clear("captureWindowSnapshot");
+        } catch (reason) {
+            if (conversationId !== activeConversation.current) return;
+            if (reason === "Захват отменён или запрещён macOS. Проверьте разрешение «Запись экрана» в настройках конфиденциальности." || reason === "Не удалось прочитать снимок") {
+                setCaptureNotice("Снимок не создан. Если вы не отменяли выбор, проверьте разрешение «Запись экрана» в настройках macOS.");
+            } else report("captureWindowSnapshot", reason);
+        }
     }
 
     async function attachCapturedSnapshot() {
         if (!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
         try {
             const attachment = await invoke<PendingAttachment>("add_captured_snapshot", {dataUrl: capturedSnapshot.preview});
+            if (conversationId !== activeConversation.current) {
+                await invoke("remove_text_attachment", {id: attachment.id});
+                return;
+            }
             setPendingAttachments((current) => [...current, attachment]);
             setCapturedSnapshot(null);
             setContextPreview(null);
-        } catch (reason) { setError(String(reason)); }
+            clear("attachCapturedSnapshot");
+        } catch (reason) { report("attachCapturedSnapshot", reason); }
     }
 
     async function removeAttachment(id: number) {
@@ -953,8 +1032,9 @@ function App() {
             await invoke("remove_text_attachment", {id});
             setPendingAttachments((current) => current.filter((attachment) => attachment.id !== id));
             setContextPreview(null);
+            clear("removeAttachment");
         } catch (reason) {
-            setError(String(reason));
+            report("removeAttachment", reason);
         }
     }
 
@@ -968,8 +1048,9 @@ function App() {
             await invoke("select_branch", {conversationId, messageId});
             await reload();
             setContextPreview(null);
+            clear("selectBranch");
         } catch (reason) {
-            setError(String(reason));
+            report("selectBranch", reason);
         }
     }
 
@@ -977,9 +1058,9 @@ function App() {
         try {
             await invoke("set_model_category", {modelId, category});
             setCategories(await invoke<ModelCategory[]>("list_model_categories"));
-            setCatalogError("");
+            clear("changeCategory");
         } catch (reason) {
-            setCatalogError(String(reason));
+            report("changeCategory", reason);
         }
     }
 
@@ -987,25 +1068,28 @@ function App() {
         try {
             await invoke("stop_generation");
         } catch (reason) {
-            setError(String(reason));
+            report("stop", reason);
         }
     }
 
+    const liveContextSignature = useRef("");
+    liveContextSignature.current = contextSignature();
+
     async function checkContext() {
         const request = ++contextRequest.current;
+        const signature = contextSignature();
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
             const materialIds = selectedMaterialIds;
-            const signature = contextSignature();
             const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId, agentMode});
-            if (request !== contextRequest.current) return;
+            if (request !== contextRequest.current || signature !== liveContextSignature.current) return;
             setContextPreview(preview);
             setPreviewSignature(signature);
-            setError("");
+            clear("checkContext");
         } catch (reason) {
-            if (request !== contextRequest.current) return;
+            if (request !== contextRequest.current || signature !== liveContextSignature.current) return;
             setContextPreview(null);
-            setError(String(reason));
+            report("checkContext", reason);
         }
     }
 
@@ -1015,18 +1099,18 @@ function App() {
             const id = await invoke<number>("create_artifact", {messageId, kind, title, content});
             await reload();
             setSelectedArtifactId(id);
-            setError("");
+            clear("openArtifact");
         } catch (reason) {
-            setError(String(reason));
+            report("openArtifact", reason);
         }
     }
 
     async function exportArtifact(id: number) {
         try {
             await invoke("export_artifact", {id});
-            setError("");
+            clear("exportArtifact");
         } catch (reason) {
-            setError(String(reason));
+            report("exportArtifact", reason);
         }
     }
 
@@ -1052,7 +1136,7 @@ function App() {
             requestAnimationFrame(() => void pickImageAttachment());
         } else if (command === "artifact") {
             const latest = history.artifacts.at(-1);
-            if (!latest) { setError("В этой беседе пока нет результатов."); return; }
+            if (!latest) { report("runPaletteCommand", "В этой беседе пока нет результатов."); return; }
             artifactTrigger.current = promptField.current;
             setSelectedArtifactId(latest.id);
         }
@@ -1099,9 +1183,24 @@ function App() {
         }
         return false;
     }
+    function operationErrors(area: ErrorArea) {
+        return errors.filter((error) => error.area === area).map((error) => <OperationNotice key={error.id} error={error}>
+            {area === "connection" && <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button>}
+            {area === "catalog" && error.id.endsWith(":catalog") && <>
+                <p>{catalog ? `Каталог устарел. Сохранённый список от ${new Date(catalog.fetched_at * 1000).toLocaleString()} доступен.` : "Не удалось загрузить модели. Локальный тест остаётся доступным."}</p>
+                <Button type="button" onClick={() => void refreshModelCatalog()}>Обновить каталог</Button>
+            </>}
+            {error.id.endsWith(":categories") && <Button type="button" onClick={() => void invoke<ModelCategory[]>("list_model_categories").then((items) => {
+                setCategories(items); clear("categories");
+            }).catch((reason) => report("categories", reason))}>Загрузить категории</Button>}
+            {error.id.endsWith(":changeCategory") && <p>Выберите категорию ещё раз в сведениях модели.</p>}
+            {error.id.endsWith(":history") && <Button type="button" onClick={() => void reload().catch((reason) => report("history", reason))}>Загрузить историю заново</Button>}
+        </OperationNotice>);
+    }
     return (
         <main className={`app-shell${selectedArtifact ? " with-artifact" : ""}${sidebarOpen ? " sidebar-open" : ""}`}>
             <aside className="sidebar" aria-label="Чаты">
+                {operationErrors("navigation")}
                 <div className="sidebar-heading">AI Desktop Client
                     <button type="button" className="secondary-button sidebar-close" aria-label="Закрыть список чатов"
                             onClick={() => setSidebarOpen(false)}>×</button>
@@ -1190,7 +1289,7 @@ function App() {
                     <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
                     <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить расписание</button>
                 </section>)}
-                <div className="history" aria-label="История сообщений" role="log">
+                <div className="history" aria-label="История сообщений" role="region">
                     <div className="history-content">
                     {visible.length === 0 && !busy && (
                         <div className="empty-state">
@@ -1202,7 +1301,7 @@ function App() {
                         <article className={`message message-${message.role}`} key={message.id}>
                             <strong>{message.role === "user" ? "Вы" : "Ответ"}</strong>
                             {message.role === "assistant" && message.status === "completed" ?
-                                <MarkdownMessage content={message.content} messageId={message.id} onArtifact={(id, kind, title, content) => void openArtifact(id, kind, title, content)}/> :
+                                <RenderBoundary key={message.id} sourceText={message.content}><MarkdownMessage content={message.content} messageId={message.id} onArtifact={(id, kind, title, content) => void openArtifact(id, kind, title, content)}/></RenderBoundary> :
                                 <p>{message.content}</p>}
                             {history.attachments.filter((attachment) => attachment.message_id === message.id).map((attachment) => (
                                 <small
@@ -1218,6 +1317,12 @@ function App() {
                                     history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id &&
                                     (history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage ? " · Сумма не подтверждена" : " · Usage и сумма неизвестны")}
                             </small>}
+                            {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed") && (() => {
+                                const attempt = history.attempts.find((item) => item.assistant_id === message.id);
+                                return <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
+                                    code={attempt?.error_code ?? null} httpStatus={attempt?.http_status ?? null} requestId={attempt?.server_request_id ?? null}
+                                    onConnection={() => setSettingsOpen(true)}/>;
+                            })()}
                             {message.role === "assistant" && (() => {
                                 const context = history.contexts.find((item) => item.assistant_id === message.id)?.context;
                                 const sources = context?.agent_sources ?? [];
@@ -1272,6 +1377,8 @@ function App() {
                             )}
                         </article>
                     ))}
+                    {!busy && draft && <article className="message message-assistant"><strong>Полученный текст</strong><p>{draft}</p>
+                        <small>Загрузка сохранённого ответа не завершена. Проверьте историю; расход без usage неизвестен.</small></article>}
                     {busy && <article className="message message-assistant"><strong>Ответ</strong>
                         <p>{draft || "Ожидание ответа…"}</p><small>Ответ продолжается</small></article>}
                     </div>
@@ -1280,6 +1387,9 @@ function App() {
                     event.preventDefault();
                     void send();
                 }}>
+                    {operationErrors("attachment")}
+                    {captureNotice && <p role="status">{captureNotice}</p>}
+                    {operationErrors("artifact")}
                     <label className="sr-only" htmlFor="prompt">Сообщение</label>
                     <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000}
                               placeholder="Напишите сообщение" onChange={(event) => {
@@ -1288,6 +1398,7 @@ function App() {
                         setContextPreview(null);
                     }}/>
                     <section className="voice-input" aria-label="Голосовой ввод">
+                        {operationErrors("voice")}
                         <div className="voice-controls">
                             {recording ? <button type="button" className="secondary-button" onClick={stopVoiceRecording}>Остановить запись</button> :
                                 <button type="button" className="secondary-button" disabled={busy || transcribing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
@@ -1436,10 +1547,10 @@ function App() {
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickImageAttachment()}>Прикрепить изображение</button>
+                            {operationErrors("catalog")}
                             <details className="model-details">
                                 <summary>О модели</summary>
                                 <p>{catalog ? `Каталог: ${new Date(catalog.fetched_at * 1000).toLocaleString()}` : "Каталог ещё не загружен"}</p>
-                                {catalogError && <p role="alert">Ошибка обновления каталога: {catalogError}. {catalog ? "Сохранённый каталог доступен." : "Каталог недоступен."}</p>}
                                 {modelId !== "local-mock" && <>
                                     <p>Цена: {selectedModel?.input_rubles_per_million ?? "неизвестна"} ₽/млн входных; {selectedModel?.output_rubles_per_million ?? "неизвестна"} ₽/млн выходных. Источник и дата каталога: <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">Provider API, GET /v1/models</a>, {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестны"}.</p>
                                     <p>Окно контекста и токенизатор: неизвестны — каталог их не сообщает. Возможность работы с текстом отдельно для этой модели не подтверждена.</p>
@@ -1462,14 +1573,16 @@ function App() {
                             </button>}
                         </div>
                     </div>
+                    {operationErrors("send")}
+                    {!settingsOpen && operationErrors("connection")}
                     <p className="send-warning">{modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
                     {hasImage && !imageModelSupported && <p role="alert">Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение.</p>}
-                    {modelId !== "local-mock" && !keySaved && <p role="alert">Ключ SimpleClaw не сохранён. Откройте настройки.</p>}
-                    {catalogError && <p role="alert">Ошибка обновления каталога. {catalog ? "Сохранённый каталог доступен." : "Каталог недоступен."}</p>}
-                    {error && <p role="alert">{error}</p>}
+                    {modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
+
                 </form>
                 <details className="synthetic-task-panel" open={syntheticTasks.some((task) => task.status === "awaiting_approval")}>
                     <summary>Локальная демонстрация многошаговых действий</summary>
+                    {operationErrors("agent")}
                     <p>Синтетические шаги работают только в SQLite. Здесь нет сетевых запросов, файловых команд или внешних инструментов.</p>
                     <button type="button" className="secondary-button" onClick={() => void startSyntheticTask()}>Создать демонстрацию</button>
                     {syntheticTasks.map((task) => <article className="synthetic-task" key={task.id}>
@@ -1486,6 +1599,7 @@ function App() {
                 </details>
                 <details className="scheduled-task-panel" open={scheduledTasks.some((task) => task.conversation_id === conversationId && task.status === "awaiting_confirmation")}>
                     <summary>Расписание агентных задач</summary>
+                    {operationErrors("schedule")}
                     <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Уведомление ведёт к ожидающей задаче или готовому результату. Закрытое приложение не выполняет задачи. Отправка всегда остаётся ручной.</p>
                     {scheduleNotificationsEnabled ?
                         <button type="button" className="secondary-button" onClick={() => { localStorage.removeItem("scheduleNotifications"); setScheduleNotificationsEnabled(false); }}>Выключить уведомления</button> :
@@ -1542,6 +1656,7 @@ function App() {
                 </details>
                 <details className="image-generation-panel">
                     <summary>Генерация изображения</summary>
+                    {operationErrors("image")}
                     <p>Поставщик: SimpleClaw. Один запрос создаёт одно изображение. Перед каждым платным запросом потребуется подтверждение.</p>
                     <label htmlFor="image-generation-model">Модель</label>
                     <select id="image-generation-model" value={imageModelId || imageModels[0]?.id || ""} disabled={imageGenerationBusy}
@@ -1572,7 +1687,7 @@ function App() {
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}
-                                                 onExport={(id) => void exportArtifact(id)} onError={setError}/>}
+                                                 onExport={(id) => void exportArtifact(id)} onError={(reason) => report("artifact", reason)}/>}
             <dialog ref={paletteDialog} className="command-palette" aria-labelledby="command-palette-title"
                     onCancel={(event) => { event.preventDefault(); closePalette(); }}>
                 <h2 id="command-palette-title">Команды</h2>
@@ -1613,6 +1728,7 @@ function App() {
                     <Button type="button" onClick={closeSettings}>Закрыть</Button></header>
                 <section className="settings-section" aria-labelledby="connection-title">
                     <h3 id="connection-title">Подключение</h3>
+                    {operationErrors("connection")}
                     <label htmlFor="api-key">Ключ SimpleClaw · {keySaved ? "сохранён" : "не сохранён"}</label>
                     <input id="api-key" type="password" value={key} autoComplete="off"
                            onChange={(event) => setKey(event.target.value)} placeholder="Введите ключ"/>
@@ -1641,6 +1757,7 @@ function App() {
                 </section>
                 <section className="settings-section" aria-labelledby="data-title">
                     <h3 id="data-title">Данные</h3>
+                    {operationErrors("data")}
                     <Button type="button" disabled={busy}
                             onClick={() => void createBackup()}>Создать копию</Button>
                     <label htmlFor="backup">Резервные копии</label>
@@ -1651,11 +1768,11 @@ function App() {
                     <Button type="button" disabled={busy || !selectedBackup}
                             onClick={() => void restoreBackup()}>Восстановить</Button>
                 </section>
-                {error && <p role="alert">{error}</p>}
+
                 </DialogContent>
             </Dialog>
         </main>
     );
 }
 
-createRoot(document.getElementById("root")!).render(<App/>);
+createRoot(document.getElementById("root")!).render(<><OperationToaster/><RenderBoundary><App/></RenderBoundary></>);
