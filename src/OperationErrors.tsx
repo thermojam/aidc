@@ -1,5 +1,7 @@
 import {useEffect, useRef, useState} from "react";
 import {toast, Toaster} from "sonner";
+// The packaged app's CSP blocks Sonner's runtime stylesheet injection.
+import "sonner/dist/styles.css";
 import {Button} from "./components/ui/button";
 import {Dialog, DialogContent, DialogTitle} from "./components/ui/dialog";
 
@@ -139,6 +141,7 @@ export function useOperationErrors(conversation: number) {
 export function OperationNotice({error, children}: {error: OperationError; children?: React.ReactNode}) {
     const [open, setOpen] = useState(false);
     const [copyStatus, setCopyStatus] = useState("");
+    const detailsButton = useRef<HTMLButtonElement>(null);
     // Only these explicitly selected fields are copied; no raw exception or state dump.
     const diagnostic = {time: error.time, operation: error.operation, code: error.code, httpStatus: error.httpStatus, requestId: error.requestId, message: error.message};
     async function copy() {
@@ -148,9 +151,12 @@ export function OperationNotice({error, children}: {error: OperationError; child
     return <div className="operation-error" data-operation={error.id}>
         <p role={error.area === "catalog" || error.area === "schedule" ? "status" : "alert"}>{error.message}</p>
         {children}
-        <Button type="button" onClick={() => { setCopyStatus(""); setOpen(true); }}>Технические подробности</Button>
+        <Button ref={detailsButton} type="button" onClick={() => { setCopyStatus(""); setOpen(true); }}>Технические подробности</Button>
         <Dialog open={open} onOpenChange={setOpen}>
-            <DialogContent aria-describedby={undefined}>
+            <DialogContent aria-describedby={undefined} onCloseAutoFocus={(event) => {
+                event.preventDefault();
+                detailsButton.current?.focus();
+            }}>
                 <DialogTitle>Подробности операции</DialogTitle>
                 <dl><dt>Время обнаружения</dt><dd>{error.time}</dd><dt>Операция</dt><dd>{error.operation}</dd>
                     <dt>Код</dt><dd>{error.code}</dd><dt>HTTP</dt><dd>{error.httpStatus ?? "неизвестен"}</dd>
