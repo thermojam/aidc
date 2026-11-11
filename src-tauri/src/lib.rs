@@ -182,6 +182,23 @@ struct ScheduledAgentTask {
 }
 
 #[derive(Serialize)]
+struct PreparedScheduledAgentTask {
+    prompt: String,
+    run_id: i64,
+}
+
+#[derive(Serialize)]
+struct ScheduledAgentRun {
+    id: i64,
+}
+
+#[derive(Serialize)]
+struct ScheduledAgentResult {
+    title: String,
+    content: String,
+}
+
+#[derive(Serialize)]
 struct AgentPlanStep {
     id: i64,
     ordinal: i64,
@@ -424,7 +441,11 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0018_scheduled_agent_tasks.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 17 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 17 {
+        db.execute_batch(include_str!("../migrations/0019_scheduled_agent_runs.sql"))?;
+    }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 18 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -577,17 +598,67 @@ fn stop_scheduled_agent_task_in_db(db: &Connection, task_id: i64) -> Result<(), 
 }
 
 #[tauri::command]
-fn prepare_scheduled_agent_task(task_id: i64, state: State<'_, AppState>) -> Result<String, String> {
-    let db = state.db.lock().map_err(|_| "База занята")?;
-    prepare_scheduled_agent_task_in_db(&db, task_id)
+fn prepare_scheduled_agent_task(task_id: i64, state: State<'_, AppState>) -> Result<PreparedScheduledAgentTask, String> {
+    let mut db = state.db.lock().map_err(|_| "База занята")?;
+    prepare_scheduled_agent_task_in_db(&mut db, task_id, now_unix())
 }
 
-fn prepare_scheduled_agent_task_in_db(db: &Connection, task_id: i64) -> Result<String, String> {
-    let changed = db.execute("UPDATE scheduled_agent_tasks SET status='active', due_at=NULL WHERE id=?1 AND status='awaiting_confirmation'", [task_id])
+fn prepare_scheduled_agent_task_in_db(db: &mut Connection, task_id: i64, now: i64) -> Result<PreparedScheduledAgentTask, String> {
+    let tx = db.transaction().map_err(|_| "Не удалось подтвердить задачу")?;
+    let (prompt, due_at): (String, i64) = tx.query_row(
+        "SELECT prompt, due_at FROM scheduled_agent_tasks WHERE id=?1 AND status='awaiting_confirmation'", [task_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| "Задача уже подтверждена или остановлена")?;
+    tx.execute("INSERT INTO scheduled_agent_runs(task_id, due_at) VALUES(?1, ?2)", params![task_id, due_at])
         .map_err(|_| "Не удалось подтвердить задачу")?;
-    if changed == 0 { return Err("Задача уже подтверждена или остановлена".into()); }
-    db.query_row("SELECT prompt FROM scheduled_agent_tasks WHERE id=?1", [task_id], |row| row.get(0))
-        .map_err(|_| "Не удалось прочитать задачу".into())
+    let run_id = tx.last_insert_rowid();
+    tx.execute("UPDATE scheduled_agent_tasks SET status='active', due_at=NULL,
+        next_run_at=CASE WHEN next_run_at<=?2 THEN next_run_at + ((?2-next_run_at)/(interval_minutes*60)+1)*interval_minutes*60 ELSE next_run_at END
+        WHERE id=?1", params![task_id, now])
+        .map_err(|_| "Не удалось подтвердить задачу")?;
+    tx.commit().map_err(|_| "Не удалось подтвердить задачу")?;
+    Ok(PreparedScheduledAgentTask { prompt, run_id })
+}
+
+#[tauri::command]
+fn list_scheduled_agent_runs(state: State<'_, AppState>) -> Result<Vec<ScheduledAgentRun>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let mut query = db.prepare("SELECT r.id FROM scheduled_agent_runs r
+        JOIN messages m ON m.id=r.assistant_id WHERE r.notified_at IS NULL AND m.status='completed' ORDER BY r.id")
+        .map_err(|_| "Не удалось прочитать результаты задач")?;
+    let runs = query.query_map([], |row| Ok(ScheduledAgentRun { id: row.get(0)? }))
+        .map_err(|_| "Не удалось прочитать результаты задач")?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать результаты задач")?;
+    Ok(runs)
+}
+
+#[tauri::command]
+fn mark_scheduled_agent_run_notified(run_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    mark_scheduled_agent_run_notified_in_db(&db, run_id)
+}
+
+fn mark_scheduled_agent_run_notified_in_db(db: &Connection, run_id: i64) -> Result<(), String> {
+    let changed = db.execute("UPDATE scheduled_agent_runs SET notified_at=unixepoch() WHERE id=?1 AND notified_at IS NULL
+        AND EXISTS (SELECT 1 FROM messages m WHERE m.id=assistant_id AND m.status='completed')", [run_id])
+        .map_err(|_| "Не удалось отметить уведомление")?;
+    if changed == 0 { return Err("Готовый результат не найден".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_scheduled_agent_result(run_id: i64, state: State<'_, AppState>) -> Result<ScheduledAgentResult, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    get_scheduled_agent_result_in_db(&db, run_id)
+}
+
+fn get_scheduled_agent_result_in_db(db: &Connection, run_id: i64) -> Result<ScheduledAgentResult, String> {
+    db.query_row("SELECT t.title, m.content FROM scheduled_agent_runs r
+        JOIN scheduled_agent_tasks t ON t.id=r.task_id
+        JOIN messages m ON m.id=r.assistant_id AND m.conversation_id=t.conversation_id
+        WHERE r.id=?1 AND m.status='completed'", [run_id], |row| Ok(ScheduledAgentResult {
+            title: row.get(0)?, content: row.get(1)?,
+        })).map_err(|_| "Готовый результат не найден".into())
 }
 
 #[tauri::command]
@@ -1298,7 +1369,7 @@ fn selected_project_materials(db: &Connection, conversation_id: i64, material_id
     if material_ids.len() > 5 || material_ids.iter().enumerate().any(|(index, id)| material_ids[..index].contains(id)) {
         return Err("Выберите не больше пяти разных материалов".into());
     }
-    let project_id: Option<i64> = db.query_row("SELECT c.project_id FROM conversations c JOIN projects p ON p.id=c.project_id WHERE c.id=?1 AND c.archived=0 AND p.archived=0", [conversation_id], |row| row.get(0))
+    let project_id: Option<i64> = db.query_row("SELECT c.project_id FROM conversations c LEFT JOIN projects p ON p.id=c.project_id WHERE c.id=?1 AND c.archived=0 AND (c.project_id IS NULL OR p.archived=0)", [conversation_id], |row| row.get(0))
         .map_err(|_| "Беседа не найдена или в архиве")?;
     let Some(project_id) = project_id else {
         if material_ids.is_empty() { return Ok(Vec::new()); }
@@ -1798,7 +1869,7 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let content = |db: &Connection| -> rusqlite::Result<[i64; 19]> {
+    let content = |db: &Connection| -> rusqlite::Result<[i64; 20]> {
         Ok([
             db.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
@@ -1818,6 +1889,7 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
             db.query_row("SELECT count(*) FROM agent_steering_notes", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM conversation_agent_skills", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM scheduled_agent_tasks", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM scheduled_agent_runs", [], |row| row.get(0))?,
             db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
         ])
     };
@@ -1917,7 +1989,15 @@ fn scheduled_agent_tasks_valid(db: &Connection) -> rusqlite::Result<bool> {
          WHERE status IN ('active','awaiting_confirmation') GROUP BY conversation_id, lower(trim(prompt)) HAVING count(*)>1)",
         [], |row| row.get(0),
     )?;
-    Ok(invalid == 0 && duplicates == 0)
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let invalid_runs: i64 = if version >= 18 { db.query_row(
+        "SELECT count(*) FROM scheduled_agent_runs r JOIN scheduled_agent_tasks t ON t.id=r.task_id
+         LEFT JOIN messages m ON m.id=r.assistant_id
+         WHERE r.due_at<=0 OR (r.assistant_id IS NOT NULL AND (m.role!='assistant' OR m.conversation_id!=t.conversation_id))
+            OR (r.notified_at IS NOT NULL AND (r.assistant_id IS NULL OR m.status!='completed'))",
+        [], |row| row.get(0),
+    )? } else { 0 };
+    Ok(invalid == 0 && duplicates == 0 && invalid_runs == 0)
 }
 
 fn project_folders_valid(db: &Connection) -> rusqlite::Result<bool> {
@@ -1990,7 +2070,8 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
     }
     if version >= 16 { let _: i64 = source.query_row("SELECT count(*) FROM conversation_agent_skills", [], |row| row.get(0))?; }
     if version >= 17 { let _: i64 = source.query_row("SELECT count(*) FROM scheduled_agent_tasks", [], |row| row.get(0))?; }
-    if integrity != "ok" || foreign_keys != 0 || !(1..=17).contains(&version) || conversations < 1 || invalid_pins != 0
+    if version >= 18 { let _: i64 = source.query_row("SELECT count(*) FROM scheduled_agent_runs", [], |row| row.get(0))?; }
+    if integrity != "ok" || foreign_keys != 0 || !(1..=18).contains(&version) || conversations < 1 || invalid_pins != 0
         || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
         || (version >= 11 && !project_materials_valid(&source)?)
         || (version >= 12 && !project_folders_valid(&source)?)
@@ -2073,10 +2154,10 @@ fn create_attempt_for_model(db: &mut Connection, prompt: &str, attachments: &[&P
 }
 
 fn create_attempt_for_conversation(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str) -> rusqlite::Result<i64> {
-    create_attempt_for_conversation_with_agent_skill(db, conversation_id, prompt, attachments, model_id, false)
+    create_attempt_for_conversation_with_agent_skill(db, conversation_id, prompt, attachments, model_id, false, None)
 }
 
-fn create_attempt_for_conversation_with_agent_skill(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str, agent_mode: bool) -> rusqlite::Result<i64> {
+fn create_attempt_for_conversation_with_agent_skill(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>) -> rusqlite::Result<i64> {
     let tx = db.transaction()?;
     let parent_id: Option<i64> = tx.query_row(
         "SELECT c.active_leaf_id FROM conversations c WHERE c.id=?1 AND c.archived=0 AND
@@ -2106,6 +2187,13 @@ fn create_attempt_for_conversation_with_agent_skill(db: &mut Connection, convers
         params![conversation_id, user_message_id],
     )?;
     let assistant_id = tx.last_insert_rowid();
+    if let Some(run_id) = scheduled_run_id {
+        if !agent_mode || tx.execute("UPDATE scheduled_agent_runs SET assistant_id=?1 WHERE id=?2 AND assistant_id IS NULL
+            AND EXISTS (SELECT 1 FROM scheduled_agent_tasks t WHERE t.id=task_id AND t.conversation_id=?3 AND t.prompt=?4)",
+            params![assistant_id, run_id, conversation_id, prompt])? != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
     tx.execute(
         "INSERT INTO attempts(assistant_id, status, conversation_id, user_message_id, model_id, pricing_json, catalog_fetched_at, context_json)
          VALUES(?1, 'streaming', ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2661,7 +2749,7 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
                 _ => { status = "failed"; return Err("UNKNOWN_TOOL".into()); }
             };
             let messages = payload.get_mut("messages").and_then(serde_json::Value::as_array_mut).ok_or("INVALID_REQUEST")?;
-            messages.push(serde_json::json!({"role":"assistant","tool_calls":[{"id":id.clone(),"type":"function","function":{"name":call.name,"arguments":call.arguments}}]}));
+            messages.push(serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":id.clone(),"type":"function","function":{"name":call.name,"arguments":call.arguments}}]}));
             messages.push(serde_json::json!({"role":"tool","tool_call_id":id,"content":result.to_string()}));
             if let Some(request) = payload.as_object_mut() {
                 request.remove("tools");
@@ -2682,19 +2770,19 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
 }
 
 #[tauri::command]
-fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, scheduled_run_id: Option<i64>, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
     if agent_mode && model_id != VERIFIED_TOOL_MODEL_ID { return Err("Агентный режим проверен только для gpt-oss-20b".into()); }
-    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id, agent_mode)
+    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id, agent_mode, scheduled_run_id)
 }
 
 #[tauri::command]
 fn retry_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, false)
+    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, false, None)
 }
 
-fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool) -> Result<i64, String> {
+fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>) -> Result<i64, String> {
     if model_id == "local-mock" { return Err("Выберите модель SimpleClaw".into()); }
     let key = {
         let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
@@ -2714,7 +2802,7 @@ fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, con
             let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
             selected.extend(selected_project_materials(&db, conversation_id, project_material_ids)?);
             let selected = selected.iter().collect::<Vec<_>>();
-            let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, conversation_id, prompt.unwrap(), &selected, model_id, agent_mode).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов")?;
+            let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, conversation_id, prompt.unwrap(), &selected, model_id, agent_mode, scheduled_run_id).map_err(|_| "Не удалось собрать контекст, задачу или файлы")?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             attempt_id
         }
@@ -2754,7 +2842,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -2914,7 +3002,7 @@ mod tests {
         let skill_tools = with_agent_tools(chat_payload(&db, &preview, None).unwrap(), true, false).unwrap();
         assert_eq!(normal_tools["tools"], skill_tools["tools"]);
 
-        let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, 1, "question", &[], "local-mock", true).unwrap();
+        let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, 1, "question", &[], "local-mock", true, None).unwrap();
         set_agent_skill_in_db(&db, 1, Some(material_id), false).unwrap();
         let mut disabled_again = context_for(&db, 1, None, Some(("question", &[])), "local-mock").unwrap();
         apply_agent_skill(&mut disabled_again, get_agent_skill_in_db(&db, 1).unwrap()).unwrap();
@@ -2980,13 +3068,44 @@ mod tests {
         init_db(&restored).unwrap();
         restore_history_from(&mut restored, &path).unwrap();
         assert_eq!(list_scheduled_agent_tasks_in_db(&mut restored, 501).unwrap()[0].status, "awaiting_confirmation");
-        assert_eq!(prepare_scheduled_agent_task_in_db(&restored, task_id).unwrap(), "Summarize updates");
-        assert!(prepare_scheduled_agent_task_in_db(&restored, task_id).is_err());
+        assert_eq!(prepare_scheduled_agent_task_in_db(&mut restored, task_id, 501).unwrap().prompt, "Summarize updates");
+        assert_eq!(list_scheduled_agent_tasks_in_db(&mut restored, 501).unwrap()[0].status, "active");
+        assert!(prepare_scheduled_agent_task_in_db(&mut restored, task_id, 501).is_err());
         stop_scheduled_agent_task_in_db(&restored, task_id).unwrap();
         let stopped = list_scheduled_agent_tasks_in_db(&mut restored, 10_000).unwrap();
         assert_eq!(stopped[0].status, "stopped");
         assert!(scheduled_agent_tasks_valid(&restored).unwrap());
         drop(restored);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scheduled_agent_result_is_linked_only_to_its_confirmed_agent_run() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-scheduled-result-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let task_id = create_scheduled_agent_task_in_db(&db, 1, "Daily summary", "Summarize updates", 1, 100).unwrap();
+        list_scheduled_agent_tasks_in_db(&mut db, 161).unwrap();
+        let prepared = prepare_scheduled_agent_task_in_db(&mut db, task_id, 501).unwrap();
+        assert!(create_attempt_for_conversation_with_agent_skill(&mut db, 1, "wrong prompt", &[], "local-mock", true, Some(prepared.run_id)).is_err());
+        assert!(create_attempt_for_conversation_with_agent_skill(&mut db, 1, &prepared.prompt, &[], "local-mock", false, Some(prepared.run_id)).is_err());
+        let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, 1, &prepared.prompt, &[], "local-mock", true, Some(prepared.run_id)).unwrap();
+        assert!(create_attempt_for_conversation_with_agent_skill(&mut db, 1, &prepared.prompt, &[], "local-mock", true, Some(prepared.run_id)).is_err());
+        assert!(get_scheduled_agent_result_in_db(&db, prepared.run_id).is_err());
+        assert!(mark_scheduled_agent_run_notified_in_db(&db, prepared.run_id).is_err());
+        append_delta(&mut db, attempt_id, 1, "Summary complete").unwrap();
+        finish(&db, attempt_id, "completed").unwrap();
+        let result = get_scheduled_agent_result_in_db(&db, prepared.run_id).unwrap();
+        assert_eq!((result.title.as_str(), result.content.as_str()), ("Daily summary", "Summary complete"));
+        mark_scheduled_agent_run_notified_in_db(&db, prepared.run_id).unwrap();
+        assert!(mark_scheduled_agent_run_notified_in_db(&db, prepared.run_id).is_err());
+        backup_history_to(&db, &path).unwrap();
+        let mut restored = Connection::open_in_memory().unwrap();
+        init_db(&restored).unwrap();
+        restore_history_from(&mut restored, &path).unwrap();
+        assert_eq!(get_scheduled_agent_result_in_db(&restored, prepared.run_id).unwrap().content, "Summary complete");
+        assert!(scheduled_agent_tasks_valid(&restored).unwrap());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3077,7 +3196,10 @@ mod tests {
                 let request = String::from_utf8_lossy(&request[..size]);
                 assert!(request.starts_with("POST /v1/chat/completions"));
                 if turn == 0 { assert!(request.contains("search_project")); }
-                if turn == 1 { assert!(request.contains("The release date is 2030-01-02.")); }
+                if turn == 1 {
+                    assert!(request.contains("The release date is 2030-01-02."));
+                    assert!(request.contains("\"content\":null,\"role\":\"assistant\""));
+                }
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 socket.write_all(response.as_bytes()).unwrap();
             }
@@ -3526,7 +3648,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 17);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 18);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -3664,7 +3786,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 17);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 18);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
@@ -3821,6 +3943,13 @@ mod tests {
         move_conversation_in_db(&restored, 1, None).unwrap();
         assert!(list_conversations_in_db(&restored).unwrap()[0].project_id.is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn context_without_project_accepts_empty_material_selection() {
+        let db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        assert!(selected_project_materials(&db, 1, &[]).unwrap().is_empty());
     }
 
     #[test]
