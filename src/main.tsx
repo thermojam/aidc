@@ -10,6 +10,9 @@ import {Dialog, DialogContent, DialogTitle} from "./components/ui/dialog";
 import {NativeSelect} from "./components/ui/native-select";
 import {OperationNotice, OperationToaster, useOperationErrors, type ErrorArea, AnswerFailure, notify} from "./OperationErrors";
 import RenderBoundary from "./RenderBoundary";
+import ProjectSidebar, {type Conversation, type Project} from "./ProjectSidebar";
+import ShellIcon from "./ShellIcon";
+import {useNavigationLayout} from "./useNavigationLayout";
 import "./style.css";
 
 type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
@@ -61,8 +64,6 @@ type StreamEvent =
     | { event: "delta"; data: { attempt_id: number; seq: number; text: string } }
     | { event: "end"; data: { attempt_id: number; status: string; error_code: string | null; request_id: string | null; http_status: number | null } };
 type Theme = "system" | "light" | "dark";
-type Conversation = { id: number; title: string; archived: boolean; pinned: boolean; project_id: number | null };
-type Project = { id: number; title: string; archived: boolean };
 type ProjectMaterial = { id: number; name: string; version: number; size: number; sha256: string };
 type ProjectFolderFile = { relative_path: string; size: number | null; blocked_reason: string | null };
 type ProjectFolderView = { folder_name: string; max_entries: number; max_file_bytes: number; files: ProjectFolderFile[] };
@@ -168,13 +169,26 @@ function App() {
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [paletteQuery, setPaletteQuery] = useState("");
-    const [sidebarOpen, setSidebarOpen] = useState(false);
+    const navigation = useNavigationLayout();
+    const [recentIds, setRecentIds] = useState<number[]>(() => {
+        try { const saved = JSON.parse(localStorage.getItem("navigation.recent") ?? "[]"); return Array.isArray(saved) ? saved.filter(Number.isInteger).slice(0, 10) : []; }
+        catch { return []; }
+    });
+    useEffect(() => {
+        if (!conversations.some((item) => item.id === conversationId && !item.archived)) return;
+        setRecentIds((previous) => {
+            const next = [conversationId, ...previous.filter((id) => id !== conversationId)].slice(0, 10);
+            return next;
+
+        });
+    }, [conversationId, conversations]);
+    useEffect(() => { localStorage.setItem("navigation.recent", JSON.stringify(recentIds)); }, [recentIds]);
     const settingsButton = useRef<HTMLButtonElement>(null);
     const compactSettingsButton = useRef<HTMLButtonElement>(null);
     const paletteDialog = useRef<HTMLDialogElement>(null);
     const paletteInput = useRef<HTMLInputElement>(null);
     const paletteTrigger = useRef<HTMLElement | null>(null);
-    const chatSearchField = useRef<HTMLInputElement>(null);
+    const chatSearchField = navigation.search;
     const artifactTrigger = useRef<HTMLElement | null>(null);
     const promptField = useRef<HTMLTextAreaElement>(null);
     const activeConversation = useRef(conversationId);
@@ -213,6 +227,9 @@ function App() {
         function onShortcut(event: KeyboardEvent) {
             const target = event.target;
             const typing = target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+            if (!paletteOpen && !settingsOpen && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b" && !document.querySelector('[role="dialog"]')) {
+                event.preventDefault(); navigation.setOpen(!navigation.open); return;
+            }
             if (typing || paletteOpen || settingsOpen || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
             event.preventDefault();
             paletteTrigger.current = target instanceof HTMLElement ? target : null;
@@ -221,7 +238,7 @@ function App() {
         }
         window.addEventListener("keydown", onShortcut);
         return () => window.removeEventListener("keydown", onShortcut);
-    }, [paletteOpen, settingsOpen]);
+    }, [paletteOpen, settingsOpen, navigation.open, navigation.modal]);
 
     function closePalette() {
         if (paletteDialog.current?.open) paletteDialog.current.close();
@@ -645,7 +662,7 @@ function App() {
 
     async function switchConversation(id: number, discardConfirmed = false) {
         if (busy) return false;
-        if (id === conversationId) return true;
+        if (id === conversationId) { if (navigation.modal) navigation.setOpen(false); return true; }
         if (!discardConfirmed && (prompt.trim() || pendingAttachments.length) && !window.confirm("Перейти в другую беседу? Черновик и выбранные файлы будут убраны.")) return false;
         const request = ++navigationRequest.current;
         try {
@@ -659,7 +676,7 @@ function App() {
             contextRequest.current++;
             setContextPreview(null);
             setSelectedArtifactId(null);
-            setSidebarOpen(false);
+            if (navigation.modal) navigation.setOpen(false);
             historyRequest.current++;
             setHistory({messages: [], attachments: [], artifacts: [], active_leaf_id: null, contexts: [], attempts: []});
             activeConversation.current = id;
@@ -750,11 +767,12 @@ function App() {
         } catch (reason) { report("archiveProject", reason); }
     }
 
-    async function moveConversation(projectId: number | null) {
+    async function moveConversation(projectId: number | null, id = conversationId) {
+        if (busy) return;
         try {
-            await invoke("move_conversation", {conversationId, projectId});
+            await invoke("move_conversation", {conversationId: id, projectId});
             await refreshConversations();
-            setProjectFilter(projectId ?? 0);
+            if (id === conversationId) setProjectFilter(projectId ?? 0);
             clear("moveConversation");
         } catch (reason) { report("moveConversation", reason); }
     }
@@ -1125,10 +1143,10 @@ function App() {
             void createConversation();
             requestAnimationFrame(() => promptField.current?.focus());
         } else if (command === "search") {
-            setSidebarOpen(true);
+            navigation.setOpen(true);
             requestAnimationFrame(() => chatSearchField.current?.focus());
         } else if (command === "settings") {
-            setSidebarOpen(false);
+            if (navigation.modal) navigation.setOpen(false);
             setSettingsOpen(true);
         } else if (command === "attach") {
             requestAnimationFrame(() => void pickAttachment());
@@ -1165,13 +1183,6 @@ function App() {
     const imageModels = catalog?.models.filter((model) => model.protocols.includes("images_generations")) ?? [];
     const transcriptionModels = catalog?.models.filter((model) => model.protocols.includes("audio_transcriptions") && model.audio_rubles_per_minute !== null) ?? [];
     const selectedTranscriptionModel = transcriptionModels.find((model) => model.id === transcriptionModelId) ?? transcriptionModels[0];
-    const selectedProject = projects.find((item) => item.id === projectFilter && !item.archived);
-    const activeProjects = projects.filter((item) => !item.archived);
-    const archivedProjects = projects.filter((item) => item.archived);
-    const shownConversations = (searchMatches === null ? conversations : conversations.filter((item) => searchMatches.includes(item.id)))
-        .filter((item) => projectFilter === null || item.project_id === (projectFilter || null));
-    const activeConversations = shownConversations.filter((item) => !item.archived);
-    const archivedConversations = shownConversations.filter((item) => item.archived);
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
     const hasImage = pendingAttachments.some((attachment) => attachment.mime.startsWith("image/"));
     const imageModelSupported = modelId === "gpt-6-luna";
@@ -1197,77 +1208,57 @@ function App() {
             {error.id.endsWith(":history") && <Button type="button" onClick={() => void reload().catch((reason) => report("history", reason))}>Загрузить историю заново</Button>}
         </OperationNotice>);
     }
+    const sidebar = <ProjectSidebar conversations={conversations} projects={projects} selectedId={conversationId}
+        projectFilter={projectFilter} busy={busy} query={conversationSearch} matches={searchMatches} recentIds={recentIds}
+        searchRef={chatSearchField} onQuery={setConversationSearch} onFilter={(id) => { setProjectFilter(id); setSearchMatches(null); }}
+        onSelect={(id) => void switchConversation(id)} onNew={() => void createConversation()} onNewProject={() => void createProject()}
+        onRename={setRenameTarget} onArchive={(item) => void archiveConversation(item)} onPin={(item) => void togglePin(item)}
+        onArchiveProject={(item) => void archiveProject(item)} onMove={(id, projectId) => void moveConversation(projectId, id)}>
+        {operationErrors("navigation")}
+    </ProjectSidebar>;
     return (
-        <main className={`app-shell${selectedArtifact ? " with-artifact" : ""}${sidebarOpen ? " sidebar-open" : ""}`}>
-            <aside className="sidebar" aria-label="Чаты">
-                {operationErrors("navigation")}
-                <div className="sidebar-heading">AI Desktop Client
-                    <button type="button" className="secondary-button sidebar-close" aria-label="Закрыть список чатов"
-                            onClick={() => setSidebarOpen(false)}>×</button>
-                </div>
-                <div className="sidebar-label">Проекты</div>
-                <div className="project-controls">
-                    <select aria-label="Выбранный проект" value={projectFilter ?? -1}
-                            onChange={(event) => { setProjectFilter(Number(event.target.value) === -1 ? null : Number(event.target.value)); setSearchMatches(null); }}>
-                        <option value={-1}>Все беседы</option><option value={0}>Без проекта</option>
-                        {activeProjects.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
-                    </select>
-                    <button type="button" className="secondary-button" aria-label="Создать проект" onClick={() => void createProject()}>+</button>
-                </div>
-                {selectedProject && <div className="project-actions">
-                    <button type="button" className="secondary-button" onClick={() => setRenameTarget({kind: "project", id: selectedProject.id, title: selectedProject.title})}>Переименовать</button>
-                    <button type="button" className="secondary-button" onClick={() => void archiveProject(selectedProject)}>Архивировать</button>
-                </div>}
-                {archivedProjects.length > 0 && <details className="archived-chats"><summary>Архив проектов</summary>
-                    {archivedProjects.map((item) => <div className="project-archived" key={item.id}>
-                        <span>{item.title}</span><button type="button" className="chat-action" onClick={() => void archiveProject(item)}>Вернуть</button>
-                    </div>)}
-                </details>}
-                {renameTarget && <form className="rename-form" onSubmit={(event) => { event.preventDefault(); void saveRename(); }}>
-                    <label htmlFor="rename-title">Название {renameTarget.kind === "project" ? "проекта" : "беседы"}</label>
-                    <input id="rename-title" autoFocus maxLength={80} value={renameTarget.title}
-                           onChange={(event) => setRenameTarget({...renameTarget, title: event.target.value})}
-                           onKeyDown={(event) => { if (event.key === "Escape") setRenameTarget(null); }}/>
-                    <div><button type="submit" disabled={!renameTarget.title.trim()}>Сохранить</button>
-                        <button type="button" onClick={() => setRenameTarget(null)}>Отмена</button></div>
-                </form>}
-                <div className="sidebar-label">Беседы</div>
-                <button type="button" className="secondary-button new-chat" disabled={busy}
-                        onClick={() => void createConversation()}>Новая беседа</button>
-                <input ref={chatSearchField} className="chat-search" type="search" aria-label="Поиск бесед" placeholder="Поиск бесед"
-                       maxLength={100} value={conversationSearch} onChange={(event) => setConversationSearch(event.target.value)}/>
-                <div className="sidebar-chats">
-                    {shownConversations.length === 0 && <p className="sidebar-empty">Ничего не найдено</p>}
-                    {activeConversations.map((item) => <div className="chat-item" key={item.id}>
-                        <button type="button" className="chat-item-title chat-select" title={item.title}
-                                aria-current={item.id === conversationId ? "page" : undefined} disabled={busy}
-                                onClick={() => void switchConversation(item.id)}>{item.title}</button>
-                        <button type="button" className="chat-action" aria-label={`${item.pinned ? "Открепить" : "Закрепить"} ${item.title}`}
-                                aria-pressed={item.pinned} onClick={() => void togglePin(item)}>{item.pinned ? "★" : "☆"}</button>
-                        <button type="button" className="chat-action" aria-label={`Переименовать ${item.title}`} disabled={busy}
-                                onClick={() => setRenameTarget({kind: "conversation", id: item.id, title: item.title})}>✎</button>
-                        <button type="button" className="chat-action" aria-label={`Архивировать ${item.title}`}
-                                disabled={busy}
-                                onClick={() => void archiveConversation(item)}>▤</button>
-                    </div>)}
-                    {archivedConversations.length > 0 && <details key={conversationSearch.trim() ? "search" : "browse"} className="archived-chats" open={!!conversationSearch.trim()}>
-                        <summary>Архив</summary>
-                        {archivedConversations.map((item) => <div className="chat-item" key={item.id}>
-                            <span className="chat-item-title" title={item.title}>{item.title}</span>
-                            <button type="button" className="chat-action" aria-label={`${item.pinned ? "Открепить" : "Закрепить"} ${item.title}`}
-                                    aria-pressed={item.pinned} onClick={() => void togglePin(item)}>{item.pinned ? "★" : "☆"}</button>
-                            <button type="button" className="chat-action" aria-label={`Вернуть ${item.title} из архива`} disabled={busy}
-                                    onClick={() => void archiveConversation(item)}>↩</button>
-                        </div>)}
-                    </details>}
-                </div>
-                <button ref={settingsButton} type="button" className="secondary-button sidebar-settings"
-                        onClick={() => { setSidebarOpen(false); setSettingsOpen(true); }}>Настройки</button>
-            </aside>
+        <main className={`app-shell${selectedArtifact ? ` with-artifact${navigation.viewport >= 48 + (navigation.open && !navigation.modal ? navigation.width : 0) + 560 + 360 ? " artifact-side" : ""}` : ""}${navigation.open && !navigation.modal ? " navigation-open" : ""}`}
+              style={{"--navigation-width": `${navigation.width}px`} as React.CSSProperties}>
+            <nav className="app-dock" aria-label="Разделы приложения">
+                <button type="button" className="dock-button dock-current" aria-label="Беседы" aria-current="page" title="Беседы · ⌘B / Ctrl+B"
+                        onClick={() => navigation.setOpen(!navigation.open)}><ShellIcon name="chat"/></button>
+                <button ref={settingsButton} type="button" className="dock-button dock-settings" aria-label="Настройки" title="Настройки"
+                        onClick={() => setSettingsOpen(true)}><ShellIcon name="settings"/></button>
+            </nav>
+            {!navigation.modal && navigation.open && <aside className="project-sidebar" aria-label="Навигация">
+                <div className="navigation-heading"><strong>Беседы</strong><button type="button" className="navigation-menu" aria-label="Скрыть навигацию" onClick={() => navigation.setOpen(false)}><ShellIcon name="panel"/></button></div>
+                {sidebar}
+                <div className="navigation-resizer" role="separator" aria-label="Ширина навигации" aria-orientation="vertical" tabIndex={0}
+                     aria-valuemin={220} aria-valuemax={320} aria-valuenow={navigation.width}
+                     onKeyDown={(event) => {
+                         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+                         event.preventDefault(); navigation.resizeWidth(event.key === "Home" ? 220 : event.key === "End" ? 320 : navigation.width + (event.key === "ArrowRight" ? 10 : -10));
+                     }} onPointerDown={(event) => { if (event.button === 0) event.currentTarget.setPointerCapture(event.pointerId); }}
+                     onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) navigation.resizeWidth(event.clientX - 48); }}
+                     onPointerUp={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}/>
+            </aside>}
+            <Dialog open={navigation.modal && navigation.open} onOpenChange={navigation.setOpen}>
+                <DialogContent className="navigation-sheet" aria-describedby={undefined}
+                               onOpenAutoFocus={(event) => { event.preventDefault(); chatSearchField.current?.focus(); }}
+                               onCloseAutoFocus={(event) => { event.preventDefault(); navigation.trigger.current?.focus(); }}>
+                    <div className="navigation-heading"><DialogTitle>Беседы</DialogTitle><button type="button" className="navigation-menu" aria-label="Закрыть навигацию" onClick={() => navigation.setOpen(false)}><ShellIcon name="close"/></button></div>
+                    {navigation.modal && sidebar}
+                    <button type="button" className="secondary-button sheet-settings" onClick={() => { navigation.setOpen(false); setSettingsOpen(true); }}>Настройки</button>
+                </DialogContent>
+            </Dialog>
+            <Dialog open={renameTarget !== null} onOpenChange={(open) => { if (!open) setRenameTarget(null); }}>
+                <DialogContent className="navigation-actions" aria-describedby={undefined} onCloseAutoFocus={(event) => { event.preventDefault(); (chatSearchField.current ?? navigation.trigger.current)?.focus(); }}>
+                    <DialogTitle>Переименовать {renameTarget?.kind === "project" ? "проект" : "беседу"}</DialogTitle>
+                    {renameTarget && <form className="rename-form" onSubmit={(event) => { event.preventDefault(); void saveRename(); }}>
+                        <label htmlFor="rename-title">Название</label><input id="rename-title" maxLength={80} value={renameTarget.title} onChange={(event) => setRenameTarget({...renameTarget, title: event.target.value})}/>
+                        <Button type="submit" disabled={!renameTarget.title.trim()}>Сохранить</Button><Button type="button" onClick={() => setRenameTarget(null)}>Отмена</Button>
+                    </form>}
+                </DialogContent>
+            </Dialog>
             <section className="chat-panel" aria-label={selectedConversation?.title ?? "Беседа"}>
                 <header className="chat-header">
-                    <button type="button" className="secondary-button sidebar-toggle" aria-label="Открыть список чатов" aria-expanded={sidebarOpen}
-                            onClick={() => setSidebarOpen((open) => !open)}>☰</button>
+                    <button ref={navigation.trigger} type="button" className="navigation-menu navigation-toggle" aria-label="Открыть навигацию" aria-expanded={navigation.open} title="Навигация · ⌘B / Ctrl+B"
+                            onClick={() => navigation.setOpen(!navigation.open)}><ShellIcon name="panel"/></button>
                     <h1>{selectedConversation?.title ?? "Беседа"}</h1>
                     <select className="conversation-project" aria-label="Проект беседы" value={selectedConversation?.project_id ?? 0}
                             disabled={busy || !selectedConversation} onChange={(event) => void moveConversation(Number(event.target.value) || null)}>
@@ -1580,6 +1571,7 @@ function App() {
                     {modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
 
                 </form>
+                <div className="legacy-tools" aria-label="Дополнительные инструменты">
                 <details className="synthetic-task-panel" open={syntheticTasks.some((task) => task.status === "awaiting_approval")}>
                     <summary>Локальная демонстрация многошаговых действий</summary>
                     {operationErrors("agent")}
@@ -1684,6 +1676,7 @@ function App() {
                         </button>
                     </div>}
                 </details>
+                </div>
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}
