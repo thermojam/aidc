@@ -1,6 +1,8 @@
 import {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {Channel, invoke} from "@tauri-apps/api/core";
+import {getCurrentWindow} from "@tauri-apps/api/window";
+import {isPermissionGranted, onAction, requestPermission, sendNotification} from "@tauri-apps/plugin-notification";
 import MarkdownMessage from "./MarkdownMessage";
 import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
 import "./style.css";
@@ -62,6 +64,9 @@ type ProjectFolderView = { folder_name: string; max_entries: number; max_file_by
 type SyntheticTask = { id: number; title: string; status: "awaiting_approval" | "completed" | "denied"; created_at: number;
     steps: { id: number; ordinal: number; action: string; decision: "pending" | "approved" | "denied"; result: string | null }[] };
 type ScheduledAgentTask = { id: number; conversation_id: number; title: string; prompt: string; interval_minutes: number; next_run_at: number; status: "active" | "awaiting_confirmation" | "stopped"; due_at: number | null };
+type PreparedScheduledAgentTask = {prompt: string; run_id: number};
+type ScheduledAgentRun = {id: number};
+type ScheduledAgentResult = {title: string; content: string};
 type AgentBoard = {
     plan: {id: number; ordinal: number; action: string; status: "pending" | "completed"}[];
     queue: {id: number; text: string; status: "queued" | "submitted"}[];
@@ -116,6 +121,14 @@ function App() {
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
     const [syntheticTasks, setSyntheticTasks] = useState<SyntheticTask[]>([]);
     const [scheduledTasks, setScheduledTasks] = useState<ScheduledAgentTask[]>([]);
+    const [scheduledRuns, setScheduledRuns] = useState<ScheduledAgentRun[]>([]);
+    const [scheduledDraft, setScheduledDraft] = useState<PreparedScheduledAgentTask | null>(null);
+    const [openedScheduledResult, setOpenedScheduledResult] = useState<ScheduledAgentResult | null>(null);
+    const [scheduleNotificationsEnabled, setScheduleNotificationsEnabled] = useState(localStorage.getItem("scheduleNotifications") === "enabled");
+    const [notificationListenerReady, setNotificationListenerReady] = useState(false);
+    const [notificationTaskId, setNotificationTaskId] = useState<number | null>(null);
+    const notifiedDueTasks = useRef(new Set<string>());
+    const notifiedRuns = useRef(new Set<number>());
     const [scheduleTitle, setScheduleTitle] = useState("");
     const [schedulePrompt, setSchedulePrompt] = useState("");
     const [scheduleInterval, setScheduleInterval] = useState("60");
@@ -228,6 +241,19 @@ function App() {
         setScheduledTasks(await invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks"));
     }
 
+    async function refreshScheduledRuns() {
+        setScheduledRuns(await invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs"));
+    }
+
+    async function enableScheduleNotifications() {
+        try {
+            const granted = await isPermissionGranted() || await requestPermission() === "granted";
+            if (!granted) { setError("Уведомления запрещены в настройках системы."); return; }
+            localStorage.setItem("scheduleNotifications", "enabled");
+            setScheduleNotificationsEnabled(true);
+        } catch (reason) { setError(String(reason)); }
+    }
+
     async function createScheduledTask() {
         try {
             await invoke("create_scheduled_agent_task", {conversationId, title: scheduleTitle, prompt: schedulePrompt, intervalMinutes: Number(scheduleInterval)});
@@ -246,8 +272,11 @@ function App() {
         if (!window.confirm(`Задача «${task.title}» наступила по расписанию. Продолжить и поместить её в черновик? При переходе текущий черновик и файлы будут убраны. Платный запрос не отправится. Проверьте модель, контекст и стоимость, затем отправьте вручную.`)) return;
         try {
             if (task.conversation_id !== conversationId && !await switchConversation(task.conversation_id, true)) return;
-            const text = await invoke<string>("prepare_scheduled_agent_task", {taskId: task.id});
-            setPrompt(text);
+            const prepared = await invoke<PreparedScheduledAgentTask>("prepare_scheduled_agent_task", {taskId: task.id});
+            setPrompt(prepared.prompt);
+            setScheduledDraft(prepared);
+            setModelId("gpt-oss-20b");
+            setAgentMode(true);
             setContextPreview(null);
             await refreshScheduledTasks();
         } catch (reason) { setError(String(reason)); }
@@ -496,6 +525,7 @@ function App() {
         invoke<boolean>("key_status").then(setKeySaved).catch((reason) => setError(String(reason)));
         invoke<SyntheticTask[]>("list_synthetic_tasks").then(setSyntheticTasks).catch((reason) => setError(String(reason)));
         invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => setError(String(reason)));
+        invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => setError(String(reason)));
         invoke<AgentBoard>("get_agent_board", {conversationId}).then(setAgentBoard).catch((reason) => setError(String(reason)));
         invoke<ModelCatalog>("refresh_models").then((result) => { setCatalog(result); setContextPreview(null); setCatalogError(""); }).catch((reason) => setCatalogError(String(reason)));
     }, []);
@@ -503,9 +533,79 @@ function App() {
     useEffect(() => {
         const timer = window.setInterval(() => {
             invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => setError(String(reason)));
+            invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => setError(String(reason)));
         }, 30_000);
         return () => window.clearInterval(timer);
     }, []);
+
+    useEffect(() => {
+        let active = true;
+        let listener: Awaited<ReturnType<typeof onAction>> | null = null;
+        onAction((event) => {
+            if (event.actionId !== "tap") return;
+            const runId = event.notification?.extra?.scheduledRunId;
+            if (typeof runId === "number") {
+                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => setError(String(reason)));
+                void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId}).then(setOpenedScheduledResult).catch((reason) => setError(String(reason)));
+                return;
+            }
+            const taskId = event.notification?.extra?.scheduledTaskId;
+            if (typeof taskId === "number") {
+                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => setError(String(reason)));
+                setNotificationTaskId(taskId);
+            }
+        }).then((registered) => {
+            if (!active) void registered.unregister();
+            else { listener = registered; setNotificationListenerReady(true); }
+        }).catch((reason) => setError(String(reason)));
+        return () => { active = false; if (listener) void listener.unregister(); };
+    }, []);
+
+    useEffect(() => {
+        if (!scheduleNotificationsEnabled || !notificationListenerReady) return;
+        let active = true;
+        isPermissionGranted().then((granted) => {
+            if (!active || !granted) return;
+            for (const task of scheduledTasks) {
+                if (task.status !== "awaiting_confirmation" || task.due_at === null) continue;
+                const key = `${task.id}:${task.due_at}`;
+                if (notifiedDueTasks.current.has(key)) continue;
+                notifiedDueTasks.current.add(key);
+                sendNotification({title: "Пора подтвердить задачу", body: "Откройте приложение, чтобы просмотреть её.", extra: {scheduledTaskId: task.id}});
+            }
+        }).catch((reason) => setError(String(reason)));
+        return () => { active = false; };
+    }, [scheduledTasks, scheduleNotificationsEnabled, notificationListenerReady]);
+
+    useEffect(() => {
+        if (!scheduleNotificationsEnabled || !notificationListenerReady) return;
+        let active = true;
+        isPermissionGranted().then((granted) => {
+            if (!active || !granted) return;
+            for (const run of scheduledRuns) {
+                if (notifiedRuns.current.has(run.id)) continue;
+                try {
+                    sendNotification({title: "Агентная задача завершена", body: "Откройте приложение, чтобы посмотреть результат.", extra: {scheduledRunId: run.id}});
+                    notifiedRuns.current.add(run.id);
+                    void invoke("mark_scheduled_agent_run_notified", {runId: run.id}).catch((reason) => setError(String(reason)));
+                } catch (reason) { setError(String(reason)); }
+            }
+        }).catch((reason) => setError(String(reason)));
+        return () => { active = false; };
+    }, [scheduledRuns, scheduleNotificationsEnabled, notificationListenerReady]);
+
+    useEffect(() => {
+        if (notificationTaskId === null || !scheduledTasks.some((task) => task.id === notificationTaskId && task.status === "awaiting_confirmation")) return;
+        const notice = document.getElementById(`scheduled-task-${notificationTaskId}`);
+        notice?.scrollIntoView({block: "center"});
+        notice?.querySelector<HTMLButtonElement>("button")?.focus();
+        setNotificationTaskId(null);
+    }, [notificationTaskId, scheduledTasks]);
+
+    useEffect(() => {
+        if (!openedScheduledResult) return;
+        document.getElementById("scheduled-task-result")?.scrollIntoView({block: "center"});
+    }, [openedScheduledResult]);
 
     useEffect(() => {
         reload(conversationId).catch((reason) => setError(String(reason)));
@@ -521,6 +621,7 @@ function App() {
             for (const attachment of pendingAttachments) await invoke("remove_text_attachment", {id: attachment.id});
             setPendingAttachments([]);
             setPrompt("");
+            setScheduledDraft(null);
             setBoardInputSource(null);
             contextRequest.current++;
             setContextPreview(null);
@@ -744,6 +845,7 @@ function App() {
                 setDraft("");
                 if (message.data.error_code) setError(`${message.data.http_status ? `HTTP ${message.data.http_status} · ` : ""}${message.data.error_code}${message.data.request_id ? ` · запрос ${message.data.request_id}` : ""}. Расход неизвестен.`);
                 reload().catch((reason) => setError(String(reason)));
+                refreshScheduledRuns().catch((reason) => setError(String(reason)));
             }
         };
         try {
@@ -769,10 +871,15 @@ function App() {
         if (!value || busy || !contextPreview || previewSignature !== signature) return;
         const tools = conversationProjectId !== null && projectFolderView ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
         if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
+        if (scheduledDraft && value === scheduledDraft.prompt && (!agentMode || modelId !== "gpt-oss-20b")) {
+            setError("Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
+            return;
+        }
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
         const inputSource = boardInputSource?.text === value ? boardInputSource : null;
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode}, value)) {
+        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
+            setScheduledDraft(null);
             if (inputSource) {
                 try {
                     await invoke("mark_agent_input_submitted", {conversationId, kind: inputSource.kind, itemId: inputSource.id});
@@ -1070,7 +1177,12 @@ function App() {
                     <button ref={compactSettingsButton} type="button" className="secondary-button compact-settings"
                             onClick={() => setSettingsOpen(true)}>Настройки</button>
                 </header>
-                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" key={task.id}>
+                {openedScheduledResult && <section className="scheduled-task-notice" role="region" aria-label="Результат агентной задачи" id="scheduled-task-result">
+                    <strong>Результат задачи: {openedScheduledResult.title}</strong>
+                    <p className="scheduled-result-content">{openedScheduledResult.content || "Ответ завершён без текста."}</p>
+                    <button type="button" className="secondary-button" onClick={() => setOpenedScheduledResult(null)}>Закрыть результат</button>
+                </section>}
+                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" id={`scheduled-task-${task.id}`} key={task.id}>
                     <strong>По расписанию наступила задача: {task.title}</strong>
                     <p>Автоматический запуск не выполнялся. После подтверждения текст попадёт в черновик; платный запрос потребует обычной проверки контекста и отдельного подтверждения.</p>
                     <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
@@ -1372,7 +1484,10 @@ function App() {
                 </details>
                 <details className="scheduled-task-panel" open={scheduledTasks.some((task) => task.conversation_id === conversationId && task.status === "awaiting_confirmation")}>
                     <summary>Расписание агентных задач</summary>
-                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Закрытое приложение не создаёт уведомления в ОС и не выполняет задачи. Отправка всегда остаётся ручной.</p>
+                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Уведомление ведёт к ожидающей задаче или готовому результату. Закрытое приложение не выполняет задачи. Отправка всегда остаётся ручной.</p>
+                    {scheduleNotificationsEnabled ?
+                        <button type="button" className="secondary-button" onClick={() => { localStorage.removeItem("scheduleNotifications"); setScheduleNotificationsEnabled(false); }}>Выключить уведомления</button> :
+                        <button type="button" className="secondary-button" onClick={() => void enableScheduleNotifications()}>Включить уведомления</button>}
                     <label>Название<input value={scheduleTitle} maxLength={120} onChange={(event) => setScheduleTitle(event.target.value)}/></label>
                     <label>Текст задачи<textarea value={schedulePrompt} maxLength={2000} rows={2} onChange={(event) => setSchedulePrompt(event.target.value)}/></label>
                     <label>Повторять каждые, минут<input type="number" min={1} max={10080} value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value)}/></label>
