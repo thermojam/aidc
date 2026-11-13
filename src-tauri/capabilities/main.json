@@ -17,6 +17,7 @@
     "allow-archive-project",
     "allow-move-conversation",
     "allow-list-project-materials",
+    "allow-preview-project-material",
     "allow-save-project-material",
     "allow-choose-project-folder",
     "allow-list-project-folder",

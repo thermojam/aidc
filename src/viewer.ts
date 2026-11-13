@@ -15,6 +15,7 @@ Promise.allSettled([
     invoke("save_project_material", {projectId: 1, attachmentId: 1}),
     invoke("choose_project_folder", {projectId: 1}),
     invoke("list_project_folder", {projectId: 1}),
+    invoke("preview_project_material", {conversationId: 1, materialId: 1}),
     invoke("preview_project_file", {projectId: 1, relativePath: "README.md"}),
     invoke("save_project_folder_material", {projectId: 1, relativePath: "README.md", expectedSha256: "invalid"}),
     invoke("create_conversation"),
@@ -26,10 +27,11 @@ Promise.allSettled([
         attachmentIds: [],
         projectMaterialIds: [],
         modelId: "local-mock",
+        confirmationId: "viewer-must-fail",
         onEvent: new Channel()
     }),
     invoke("retry_mock_generation", {conversationId: 1, assistantId: 2, modelId: "local-mock", onEvent: new Channel()}),
-    invoke("start_generation", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "synthetic-model", onEvent: new Channel()}),
+    invoke("start_generation", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "synthetic-model", agentMode: false, confirmationId: "viewer-must-fail", onEvent: new Channel()}),
     invoke("retry_generation", {conversationId: 1, assistantId: 2, modelId: "synthetic-model", onEvent: new Channel()}),
     invoke("select_branch", {conversationId: 1, messageId: 2}),
     invoke("stop_generation"),
@@ -48,7 +50,7 @@ Promise.allSettled([
     invoke("list_model_categories"),
     invoke("set_model_category", {modelId: "synthetic-model", category: "speed"}),
     invoke("refresh_models"),
-    invoke("preview_context", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "local-mock"}),
+    invoke("preview_context", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "local-mock", agentMode: false}),
     invoke("get_response_style"),
     invoke("set_response_style", {style: "concise"}),
     invoke("start_synthetic_task"),
@@ -62,6 +64,6 @@ Promise.allSettled([
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все пятьдесят одна команда отклонены"
+        ? `PASS: все команды (${calls.length}) отклонены`
         : "FAIL: хотя бы одна команда доступна";
 });

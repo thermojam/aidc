@@ -179,7 +179,7 @@ select {
 }
 
 .history-content {
-    max-width: 720px;
+    max-width: 800px;
     margin: 0 auto;
 }
 
@@ -310,15 +310,28 @@ h2 {
 .composer {
     display: grid;
     gap: 8px;
-    width: min(100% - 48px, 860px);
-    max-height: 55vh;
+    width: min(100% - 48px, 800px);
+    flex: 0 0 auto;
+    max-height: 45cqh;
     overflow: auto;
     margin: 0 auto 16px;
     padding: 12px 14px;
     background: var(--panel);
     border: 1px solid var(--control-border);
-    border-radius: 4px;
+    border-radius: 12px;
 }
+
+#prompt { min-height: 44px; max-height: 152px; line-height: 18px; resize: none; overflow-y: auto; }
+.composer-extra > summary { cursor: pointer; width: fit-content; padding: 6px 12px; border: 1px solid var(--control-border); border-radius: 6px; }
+.composer-extra[open] { display: grid; gap: 8px; }
+.composer-project { color: var(--muted); }
+.composer-chips { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; min-width: 0; }
+.composer-chips > button { grid-column: 2; grid-row: 1 / span 2; }
+.composer-chips > span { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.composer-chips > span > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-chips > span > button { flex-shrink: 0; }
+.composer-chips > button { flex-shrink: 0; }
+@media (max-height: 699px) { .composer { max-height: 35cqh; } }
 
 .composer label {
     font-weight: 600;
@@ -449,10 +462,10 @@ h2 {
 }
 
 .project-materials {
-    display: grid;
-    gap: 6px;
-    border-top: 1px solid var(--border);
-    padding-top: 8px;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 24px;
 }
 
 .project-materials-heading, .project-material {
@@ -491,7 +504,10 @@ h2 {
 }
 
 .project-material {
-    color: var(--muted);
+    align-items: flex-start;
+    justify-content: space-between;
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
     font-size: 12px;
     overflow-wrap: anywhere;
 }
@@ -941,3 +957,39 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-
 @media (max-width: 639px) {
     .navigation-sheet { left: 0; width: min(320px, 100%); }
 }
+
+/* Keep the working conversation mounted while browsing project materials. */
+.conversation-view { display: grid; flex: 1; min-height: 0; container-type: size; grid-template-rows: minmax(0, 1fr) auto auto; }
+.conversation-view[hidden] { display: none; }
+.project-materials > * + * { margin-top: 16px; }
+.project-materials h2, .project-materials h3 { margin-bottom: 0; }
+.project-materials-heading, .project-folder-heading { flex-wrap: wrap; }
+.project-material label { display: flex; gap: 8px; min-width: 0; color: var(--text); }
+.project-material input { flex-shrink: 0; }
+.project-material button { flex-shrink: 0; }
+.project-materials .folder-preview { overflow-wrap: anywhere; }
+.project-materials .folder-preview pre { max-height: 50vh; }
+.selected-materials { display: grid; gap: 8px; font-size: 12px; }
+.selected-materials > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.selected-materials span { overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+    .project-materials { padding: 16px; }
+    .project-material { flex-direction: column; }
+    .chat-header { gap: 8px; padding-inline: 8px; }
+    .conversation-project { max-width: 110px; }
+}
+
+/* Native popover stays above the scrolling composer without changing its height. */
+.model-picker { width: min(480px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 16px; color: var(--text); background: var(--panel); border: 1px solid var(--control-border); border-radius: 8px; overflow: auto; font: inherit; }
+.model-picker::backdrop { background: transparent; }
+.model-picker-heading, .model-picker-row { display: flex; align-items: center; gap: 8px; }
+.model-picker-heading { justify-content: space-between; margin-bottom: 16px; }
+.model-picker label { display: block; margin: 8px 0; }
+.model-picker input, .model-picker select { width: 100%; }
+.model-picker p { color: var(--muted); font-size: 12px; }
+.model-picker-results { display: grid; gap: 8px; }
+.model-picker-choice { display: grid; gap: 4px; text-align: left; min-width: 0; flex: 1; overflow-wrap: anywhere; white-space: normal; }
+.model-picker-choice span { font-size: 12px; }
+.model-picker-choice[aria-pressed="true"] { border-color: var(--accent); }
+.model-picker-trigger { max-width: 190px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-mode-chip { font-weight: 600; font-size: 12px; }

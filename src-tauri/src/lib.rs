@@ -68,6 +68,7 @@ struct AppState {
     key_service: String,
     drafts: Mutex<Vec<PendingAttachment>>,
     catalog_request: AtomicU64,
+    checked_context: Mutex<Option<(String, Vec<u8>)>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -120,6 +121,8 @@ struct ContextMessage {
 
 #[derive(Deserialize, Serialize)]
 struct ContextPreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confirmation_id: Option<String>,
     model_id: String,
     #[serde(default = "default_response_style")]
     response_style: String,
@@ -133,6 +136,8 @@ struct ContextPreview {
     request_bytes: usize,
     #[serde(default)]
     agent_sources: Vec<AgentSource>,
+    #[serde(default)]
+    project_search_enabled: bool,
     #[serde(default)]
     agent_files_read: Vec<String>,
     #[serde(default)]
@@ -1037,7 +1042,7 @@ fn chat_payload(db: &Connection, context: &ContextPreview, tail: Option<(&str, &
         let mut parts = vec![serde_json::json!({"type": "text", "text": message.content})];
         if message.role == "user" {
             for id in &message.attachment_ids {
-                let (mime, content) = context_attachment(db, tail, *id)?;
+                let (mime, content) = context_attachment(db, if message.source_message_id.is_none() { tail } else { None }, *id)?;
                 if !mime.starts_with("image/") { continue; }
                 if !is_supported_image_mime(&mime) { return Err("Формат изображения не поддерживается".into()); }
                 image_count += 1;
@@ -1596,6 +1601,13 @@ fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, Stri
 fn list_project_materials(project_id: i64, state: State<'_, AppState>) -> Result<Vec<ProjectMaterialSummary>, String> {
     let db = state.db.lock().map_err(|_| "База занята")?;
     list_project_materials_in_db(&db, project_id).map_err(|_| "Не удалось прочитать материалы проекта".into())
+}
+
+#[tauri::command]
+fn preview_project_material(conversation_id: i64, material_id: i64, state: State<'_, AppState>) -> Result<AttachmentPreview, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let materials = selected_project_materials(&db, conversation_id, &[material_id])?;
+    Ok(attachment_preview(&materials[0]))
 }
 
 #[tauri::command]
@@ -2182,6 +2194,12 @@ fn create_attempt_for_conversation_with_agent_skill(db: &mut Connection, convers
         let skill = get_agent_skill_in_db(&tx, conversation_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
         apply_agent_skill(&mut context, skill).map_err(|_| rusqlite::Error::InvalidQuery)?;
     }
+    context.project_search_enabled = agent_mode && tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversations c JOIN project_folders f ON f.project_id=c.project_id WHERE c.id=?1 AND c.archived=0)",
+        [conversation_id], |row| row.get::<_, bool>(0),
+    )?;
+    context.request_bytes = serde_json::to_vec(&with_agent_tools(chat_payload(&tx, &context, None).map_err(|_| rusqlite::Error::InvalidQuery)?, agent_mode, context.project_search_enabled).map_err(|_| rusqlite::Error::InvalidQuery)?)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?.len();
     tx.execute(
         "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', ?1, ?2)",
         params![conversation_id, user_message_id],
@@ -2326,6 +2344,7 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
     }
     messages.insert(0, system);
     let mut preview = ContextPreview {
+        confirmation_id: None,
         model_id: model_id.to_owned(),
         response_style,
         catalog_fetched_at: model.map(|_| catalog.as_ref().unwrap().fetched_at),
@@ -2333,6 +2352,7 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
         output_rubles_per_million: model.and_then(|model| model.output_rubles_per_million),
         messages, omitted_exchanges, bytes, request_bytes: 0,
         agent_sources: Vec::new(),
+        project_search_enabled: false,
         agent_files_read: Vec::new(),
         agent_skill: None,
         warning: "Предел контекста и токенизатор не подтверждены; размер в байтах не гарантирует, что запрос поместится в модель.".into(),
@@ -2358,32 +2378,82 @@ fn apply_agent_skill(context: &mut ContextPreview, skill: Option<AgentSkill>) ->
     Ok(())
 }
 
-#[tauri::command]
-fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, state: State<'_, AppState>) -> Result<ContextPreview, String> {
+const RECHECK_CONTEXT: &str = "Состав запроса изменился или не проверен. Проверьте контекст заново";
+static CONTEXT_CHECK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct CheckedRequest {
+    payload: serde_json::Value,
+    project_scope: Option<(i64, String)>,
+}
+
+struct PreparedContext {
+    preview: ContextPreview,
+    selected: Vec<PendingAttachment>,
+    request: CheckedRequest,
+    fingerprint: Vec<u8>,
+}
+
+fn prepare_context(db: &Connection, drafts: &[PendingAttachment], conversation_id: i64, prompt: &str, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool) -> Result<PreparedContext, String> {
     if agent_mode && model_id != VERIFIED_TOOL_MODEL_ID { return Err("Агентный режим проверен только для gpt-oss-20b".into()); }
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
-    let drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
     if attachment_ids.len() + project_material_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
         return Err("Выбранный файл не найден".into());
     }
-    let db = state.db.lock().map_err(|_| "База занята")?;
     let leaf_id: Option<i64> = db.query_row("SELECT c.active_leaf_id FROM conversations c WHERE c.id=?1 AND c.archived=0 AND
         (c.active_leaf_id IS NULL OR EXISTS (SELECT 1 FROM messages m WHERE m.id=c.active_leaf_id AND m.conversation_id=c.id))", [conversation_id], |row| row.get(0)).map_err(|_| "Беседа не найдена или в архиве")?;
     let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
-    selected.extend(selected_project_materials(&db, conversation_id, &project_material_ids)?);
-    let selected = selected.iter().collect::<Vec<_>>();
-    let mut preview = context_for(&db, conversation_id, leaf_id, Some((prompt, &selected)), &model_id)?;
+    selected.extend(selected_project_materials(db, conversation_id, project_material_ids)?);
+    let selected_refs = selected.iter().collect::<Vec<_>>();
+    let mut preview = context_for(db, conversation_id, leaf_id, Some((prompt, &selected_refs)), model_id)?;
     if agent_mode {
-        apply_agent_skill(&mut preview, get_agent_skill_in_db(&db, conversation_id)?)?;
+        apply_agent_skill(&mut preview, get_agent_skill_in_db(db, conversation_id)?)?;
     }
     let project_search_enabled = agent_mode && db.query_row(
         "SELECT EXISTS(SELECT 1 FROM conversations c JOIN project_folders f ON f.project_id=c.project_id WHERE c.id=?1 AND c.archived=0)",
         [conversation_id], |row| row.get::<_, bool>(0),
     ).map_err(|_| "Не удалось проверить папку проекта")?;
-    preview.request_bytes = serde_json::to_vec(&with_agent_tools(chat_payload(&db, &preview, Some((prompt, &selected)) )?, agent_mode, project_search_enabled)?)
-        .map_err(|_| "Не удалось собрать запрос")?.len();
-    Ok(preview)
+    preview.project_search_enabled = project_search_enabled;
+    let payload = with_agent_tools(chat_payload(db, &preview, Some((prompt, &selected_refs)))?, agent_mode, project_search_enabled)?;
+    preview.request_bytes = serde_json::to_vec(&payload).map_err(|_| "Не удалось собрать запрос")?.len();
+    let (project_id, project_archived, folder): (Option<i64>, Option<bool>, Option<String>) = db.query_row(
+        "SELECT c.project_id, p.archived, f.path FROM conversations c LEFT JOIN projects p ON p.id=c.project_id
+         LEFT JOIN project_folders f ON f.project_id=c.project_id WHERE c.id=?1", [conversation_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).map_err(|_| "Беседа не найдена или в архиве")?;
+    if project_archived == Some(true) { return Err("Проект в архиве".into()); }
+    // Include identity even when a different project/branch produces identical messages.
+    let fingerprint = Sha256::digest(serde_json::to_vec(&serde_json::json!({
+        "conversation": conversation_id, "leaf": leaf_id, "project": project_id, "folder": folder,
+        "attachments": attachment_ids, "materials": project_material_ids, "agent": agent_mode,
+        "preview": preview, "payload": payload,
+        "files": selected.iter().map(|file| (&file.name, &file.mime, format!("{:x}", Sha256::digest(&file.content)))).collect::<Vec<_>>(),
+    })).map_err(|_| "Не удалось собрать запрос")?).to_vec();
+    Ok(PreparedContext { preview, selected, request: CheckedRequest { payload, project_scope: project_id.zip(folder) }, fingerprint })
+}
+
+fn check_context(state: &AppState, conversation_id: i64, prompt: &str, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool) -> Result<ContextPreview, String> {
+    let drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let mut checked = state.checked_context.lock().map_err(|_| "Проверка контекста занята")?;
+    *checked = None;
+    let mut prepared = prepare_context(&db, &drafts, conversation_id, prompt, attachment_ids, project_material_ids, model_id, agent_mode)?;
+    let id = CONTEXT_CHECK_SEQUENCE.fetch_add(1, Ordering::SeqCst).to_string();
+    *checked = Some((id.clone(), prepared.fingerprint));
+    prepared.preview.confirmation_id = Some(id);
+    Ok(prepared.preview)
+}
+
+fn consume_context_check(state: &AppState, confirmation_id: Option<&str>, prepared: &PreparedContext) -> Result<(), String> {
+    let checked = state.checked_context.lock().map_err(|_| "Проверка контекста занята")?.take();
+    if checked.as_ref().is_some_and(|(id, fingerprint)| Some(id.as_str()) == confirmation_id && *fingerprint == prepared.fingerprint) {
+        Ok(())
+    } else { Err(RECHECK_CONTEXT.into()) }
+}
+
+#[tauri::command]
+fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, state: State<'_, AppState>) -> Result<ContextPreview, String> {
+    check_context(&state, conversation_id, &prompt, &attachment_ids, &project_material_ids, &model_id, agent_mode)
 }
 
 #[cfg(test)]
@@ -2528,20 +2598,20 @@ fn run_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>, cancel
 }
 
 #[tauri::command]
-fn start_mock_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_mock_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, confirmation_id: Option<String>, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 {
         return Err("Введите от 1 до 2000 символов".into());
     }
-    start_mock(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id)
+    start_mock(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id, confirmation_id.as_deref())
 }
 
 #[tauri::command]
 fn retry_mock_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_mock(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id)
+    start_mock(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, None)
 }
 
-fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str) -> Result<i64, String> {
+fn start_mock(state: &AppState, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, confirmation_id: Option<&str>) -> Result<i64, String> {
     let mut active = state.active.lock().map_err(|e| e.to_string())?;
     if active.is_some() {
         return Err("Дождитесь завершения текущего ответа".into());
@@ -2556,9 +2626,9 @@ fn start_mock(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conve
             create_retry_for_conversation(&mut db, conversation_id, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены".to_string())?
         } else {
             let prompt = prompt.unwrap();
-            let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
-            selected.extend(selected_project_materials(&db, conversation_id, project_material_ids)?);
-            let selected = selected.iter().collect::<Vec<_>>();
+            let prepared = prepare_context(&db, &drafts, conversation_id, prompt, attachment_ids, project_material_ids, model_id, false).map_err(|_| RECHECK_CONTEXT)?;
+            consume_context_check(state, confirmation_id, &prepared)?;
+            let selected = prepared.selected.iter().collect::<Vec<_>>();
             let attempt_id = create_attempt_for_conversation(&mut db, conversation_id, prompt, &selected, model_id).map_err(|_| "Не удалось собрать контекст: проверьте модель и размер файлов".to_string())?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             (attempt_id, prompt.to_owned())
@@ -2644,7 +2714,7 @@ fn process_http_event(db: &Db, attempt_id: i64, seq: &mut i64, data: &str, calls
     Ok(false)
 }
 
-async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>, cancel: Arc<AtomicBool>, attempt_id: i64, model_id: String, key: String, url: &str, agent_mode: bool, on_event: Channel<StreamEvent>) {
+async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)>>>, cancel: Arc<AtomicBool>, attempt_id: i64, model_id: String, key: String, url: &str, agent_mode: bool, checked_payload: Option<CheckedRequest>, on_event: Channel<StreamEvent>) {
     let mut status = "interrupted";
     let mut error_code = None;
     let mut request_id = None;
@@ -2655,14 +2725,16 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
         let context: ContextPreview = serde_json::from_str(&context_json).map_err(|_| "DATABASE_ERROR")?;
         if context.model_id != model_id { return Err("MODEL_SNAPSHOT_MISMATCH".into()); }
         if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
-        let project_search_enabled = {
+        let project_search_enabled = if let Some(payload) = &checked_payload {
+            payload.payload.get("tools").and_then(serde_json::Value::as_array).is_some_and(|tools| tools.iter().any(|tool| tool.pointer("/function/name").and_then(serde_json::Value::as_str) == Some("search_project")))
+        } else {
             let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
             connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM attempts a JOIN conversations c ON c.id=a.conversation_id JOIN project_folders f ON f.project_id=c.project_id WHERE a.id=?1 AND c.archived=0)",
                 [attempt_id], |row| row.get::<_, bool>(0),
             ).map_err(|_| "DATABASE_ERROR")?
         };
-        let payload = {
+        let payload = if let Some(request) = &checked_payload { request.payload.clone() } else {
             let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
             with_agent_tools(chat_payload(&connection, &context, None)?, agent_mode, project_search_enabled)?
         };
@@ -2739,6 +2811,15 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
                     let query = arguments.get("query").and_then(serde_json::Value::as_str).ok_or_else(|| { status = "failed"; "INVALID_TOOL_ARGUMENTS" })?;
                     let (files_read, sources) = {
                         let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
+                        if let Some(request) = &checked_payload {
+                            let scope: Option<(i64, String)> = connection.query_row(
+                                "SELECT c.project_id, f.path FROM attempts a JOIN conversations c ON c.id=a.conversation_id
+                                 JOIN projects p ON p.id=c.project_id JOIN project_folders f ON f.project_id=c.project_id
+                                 WHERE a.id=?1 AND c.archived=0 AND p.archived=0", [attempt_id],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            ).optional().map_err(|_| "DATABASE_ERROR")?;
+                            if scope != request.project_scope { status = "failed"; return Err("PROJECT_SCOPE_CHANGED".into()); }
+                        }
                         let conversation_id: i64 = connection.query_row("SELECT conversation_id FROM attempts WHERE id=?1", [attempt_id], |row| row.get(0)).map_err(|_| "DATABASE_ERROR")?;
                         search_project_files(&connection, conversation_id, query).map_err(|code| { status = "failed"; code })?
                     };
@@ -2770,47 +2851,52 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
 }
 
 #[tauri::command]
-fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, scheduled_run_id: Option<i64>, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, scheduled_run_id: Option<i64>, confirmation_id: Option<String>, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
     if agent_mode && model_id != VERIFIED_TOOL_MODEL_ID { return Err("Агентный режим проверен только для gpt-oss-20b".into()); }
-    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id, agent_mode, scheduled_run_id)
+    start_remote(&state, on_event, conversation_id, Some(prompt), None, &attachment_ids, &project_material_ids, &model_id, agent_mode, scheduled_run_id, confirmation_id.as_deref())
 }
 
 #[tauri::command]
 fn retry_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, false, None)
+    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, false, None, None)
 }
 
-fn start_remote(state: &State<'_, AppState>, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>) -> Result<i64, String> {
+fn start_remote(state: &AppState, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>, confirmation_id: Option<&str>) -> Result<i64, String> {
     if model_id == "local-mock" { return Err("Выберите модель SimpleClaw".into()); }
-    let key = {
-        let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
-        key_entry(&state.key_service)?.get_password().map_err(|_| "Сначала сохраните ключ SimpleClaw")?
-    };
     let mut active = state.active.lock().map_err(|_| "Запрос занят")?;
     if active.is_some() { return Err("Дождитесь завершения текущего ответа".into()); }
-    let attempt_id = {
+    let (attempt_id, key, checked_payload) = {
         let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
         if attachment_ids.len() + project_material_ids.len() > 5 || attachment_ids.iter().enumerate().any(|(index, id)| attachment_ids[..index].contains(id) || !drafts.iter().any(|draft| draft.id == *id)) {
             return Err("Выбранный файл не найден".into());
         }
         let mut db = state.db.lock().map_err(|_| "База занята")?;
-        if let Some(id) = retry_id {
+        let prepared = if retry_id.is_none() {
+            let prepared = prepare_context(&db, &drafts, conversation_id, prompt.unwrap(), attachment_ids, project_material_ids, model_id, agent_mode).map_err(|_| RECHECK_CONTEXT)?;
+            consume_context_check(state, confirmation_id, &prepared)?;
+            Some(prepared)
+        } else { None };
+        let key = {
+            let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
+            key_entry(&state.key_service)?.get_password().map_err(|_| "Сначала сохраните ключ SimpleClaw")?
+        };
+        let attempt_id = if let Some(id) = retry_id {
             create_retry_for_conversation(&mut db, conversation_id, id, model_id).map_err(|_| "Ответ для повтора или модель не найдены")?.0
         } else {
-            let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
-            selected.extend(selected_project_materials(&db, conversation_id, project_material_ids)?);
-            let selected = selected.iter().collect::<Vec<_>>();
+            let prepared = prepared.as_ref().unwrap();
+            let selected = prepared.selected.iter().collect::<Vec<_>>();
             let attempt_id = create_attempt_for_conversation_with_agent_skill(&mut db, conversation_id, prompt.unwrap(), &selected, model_id, agent_mode, scheduled_run_id).map_err(|_| "Не удалось собрать контекст, задачу или файлы")?;
             drafts.retain(|draft| !attachment_ids.contains(&draft.id));
             attempt_id
-        }
+        };
+        (attempt_id, key, prepared.map(|prepared| prepared.request))
     };
     let cancel = Arc::new(AtomicBool::new(false));
     *active = Some((attempt_id, cancel.clone()));
     tauri::async_runtime::spawn(run_http_stream(state.db.clone(), state.active.clone(), cancel, attempt_id,
-        model_id.to_owned(), key, "https://simple-claw.ru/v1/chat/completions", agent_mode, on_event));
+        model_id.to_owned(), key, "https://simple-claw.ru/v1/chat/completions", agent_mode, checked_payload, on_event));
     Ok(attempt_id)
 }
 
@@ -2839,10 +2925,11 @@ pub fn run() {
                 key_service: app.config().identifier.clone(),
                 drafts: Mutex::new(Vec::new()),
                 catalog_request: AtomicU64::new(0),
+                checked_context: Mutex::new(None),
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -2850,6 +2937,142 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context_test_state() -> AppState {
+        let db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        AppState {
+            db: Arc::new(Mutex::new(db)), active: Arc::new(Mutex::new(None)),
+            key_lock: Mutex::new(()), key_service: "synthetic-context-test".into(),
+            drafts: Mutex::new(Vec::new()), catalog_request: AtomicU64::new(0),
+            checked_context: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn remote_generation_rejects_unchecked_request_before_key_or_network() {
+        let state = context_test_state();
+        let result = start_remote(&state, Channel::new(|_| Ok(())), 1, Some("question"), None, &[], &[], "synthetic-model", false, None, None);
+        assert_eq!(result.unwrap_err(), RECHECK_CONTEXT);
+        assert_eq!(state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn generation_requires_context_confirmation_before_creating_attempt() {
+        let state = context_test_state();
+        let result = start_mock(&state, Channel::new(|_| Ok(())), 1, Some("question"), None, &[], &[], "local-mock", None);
+        assert!(result.is_err(), "an unchecked request must not start");
+        assert_eq!(state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn context_confirmation_rejects_forged_superseded_and_changed_prompt() {
+        for change in ["forged", "superseded", "prompt", "conversation"] {
+            let state = context_test_state();
+            let preview = check_context(&state, 1, "question", &[], &[], "local-mock", false).unwrap();
+            if change == "superseded" { check_context(&state, 1, "new question", &[], &[], "local-mock", false).unwrap(); }
+            if change == "conversation" {
+                state.db.lock().unwrap().execute("INSERT INTO conversations(id,title) VALUES(2,'Other')", []).unwrap();
+            }
+            let token = if change == "forged" { Some("forged") } else { preview.confirmation_id.as_deref() };
+            let prompt = if change == "prompt" { "changed question" } else { "question" };
+            let conversation = if change == "conversation" { 2 } else { 1 };
+            assert_eq!(start_mock(&state, Channel::new(|_| Ok(())), conversation, Some(prompt), None, &[], &[], "local-mock", token).unwrap_err(), RECHECK_CONTEXT, "{change}");
+            assert_eq!(state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn context_confirmation_rechecks_style_project_branch_and_file_content() {
+        for change in ["style", "project", "branch", "file", "selection", "archive"] {
+            let state = context_test_state();
+            state.drafts.lock().unwrap().push(PendingAttachment { id: 1, name: "note.txt".into(), mime: "text/plain".into(), content: b"original".to_vec(), preview: "original".into() });
+            let preview = check_context(&state, 1, "question", &[1], &[], "local-mock", false).unwrap();
+            match change {
+                "style" => save_response_style(&state.db.lock().unwrap(), "concise").unwrap(),
+                "project" => {
+                    let db = state.db.lock().unwrap();
+                    db.execute("INSERT INTO projects(id,title) VALUES(1,'Project')", []).unwrap();
+                    db.execute("UPDATE conversations SET project_id=1 WHERE id=1", []).unwrap();
+                }
+                "branch" => {
+                    let mut db = state.db.lock().unwrap();
+                    let id = create_attempt(&mut db, "earlier question").unwrap();
+                    finish(&db, id, "completed").unwrap();
+                }
+                "file" => state.drafts.lock().unwrap()[0].content = b"modified".to_vec(),
+                "archive" => { state.db.lock().unwrap().execute("UPDATE conversations SET archived=1 WHERE id=1", []).unwrap(); }
+                _ => (),
+            }
+            let before: i64 = state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get(0)).unwrap();
+            let ids: &[i64] = if change == "selection" { &[] } else { &[1] };
+            assert_eq!(start_mock(&state, Channel::new(|_| Ok(())), 1, Some("question"), None, ids, &[], "local-mock", preview.confirmation_id.as_deref()).unwrap_err(), RECHECK_CONTEXT, "{change}");
+            assert_eq!(state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn context_confirmation_rechecks_model_agent_skill_folder_and_material_version() {
+        for change in ["model", "agent", "skill", "folder", "version", "material_content", "project_archive"] {
+            let state = context_test_state();
+            let material = {
+                let db = state.db.lock().unwrap();
+                let catalog = ModelCatalog { fetched_at: 100, models: [VERIFIED_TOOL_MODEL_ID, "other-model"].iter().map(|id| CatalogModel {
+                    id: (*id).into(), name: (*id).into(), input_rubles_per_million: None, output_rubles_per_million: None,
+                    protocols: vec!["chat_completions".into()], request_rubles: None, audio_rubles_per_minute: None,
+                }).collect() };
+                save_catalog_if_latest(&db, &AtomicU64::new(1), 1, &catalog).unwrap();
+                let project = create_project_in_db(&db).unwrap();
+                move_conversation_in_db(&db, 1, Some(project)).unwrap();
+                let draft = PendingAttachment { id: 1, name: "SKILL.md".into(), mime: "text/plain".into(), content: b"Be concise".to_vec(), preview: "Be concise".into() };
+                let material = save_project_material_in_db(&db, project, &draft).unwrap().id;
+                db.execute("INSERT INTO project_folders(project_id,path) VALUES(?1,'/synthetic/first')", [project]).unwrap();
+                set_agent_skill_in_db(&db, 1, Some(material), true).unwrap();
+                material
+            };
+            let preview = check_context(&state, 1, "question", &[], &[material], VERIFIED_TOOL_MODEL_ID, true).unwrap();
+            {
+                let db = state.db.lock().unwrap();
+                match change {
+                    "skill" => set_agent_skill_in_db(&db, 1, Some(material), false).unwrap(),
+                    "folder" => { db.execute("UPDATE project_folders SET path='/synthetic/second'", []).unwrap(); }
+                    "version" => { db.execute("UPDATE project_materials SET version=2 WHERE id=?1", [material]).unwrap(); }
+                    "material_content" => { db.execute("UPDATE project_materials SET content=?1 WHERE id=?2", params![b"changed".as_slice(), material]).unwrap(); }
+                    "project_archive" => { db.execute("UPDATE projects SET archived=1", []).unwrap(); }
+                    _ => (),
+                }
+            }
+            let model = if change == "model" { "other-model" } else { VERIFIED_TOOL_MODEL_ID };
+            let agent = change != "agent" && change != "model";
+            let result = start_remote(&state, Channel::new(|_| Ok(())), 1, Some("question"), None, &[], &[material], model, agent, None, preview.confirmation_id.as_deref());
+            assert_eq!(result.unwrap_err(), RECHECK_CONTEXT, "{change}");
+            assert_eq!(state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn context_confirmation_starts_unchanged_request_once() {
+        let state = context_test_state();
+        let preview = check_context(&state, 1, "question", &[], &[], "local-mock", false).unwrap();
+        let (end_tx, end_rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |event| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = event {
+                if json.contains("end") { let _ = end_tx.send(()); }
+            }
+            Ok(())
+        });
+        let id = start_mock(&state, channel, 1, Some("question"), None, &[], &[], "local-mock", preview.confirmation_id.as_deref()).unwrap();
+        end_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // End is emitted immediately before releasing the active generation slot.
+        for _ in 0..100 {
+            if state.active.lock().unwrap().is_none() { break; }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let saved: String = state.db.lock().unwrap().query_row("SELECT context_json FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        let saved: ContextPreview = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved.messages.last().unwrap().content, "question");
+        assert_eq!(start_mock(&state, Channel::new(|_| Ok(())), 1, Some("question"), None, &[], &[], "local-mock", preview.confirmation_id.as_deref()).unwrap_err(), RECHECK_CONTEXT);
+    }
 
     #[test]
     fn response_style_persists_and_does_not_rewrite_existing_attempt_context() {
@@ -3183,6 +3406,13 @@ mod tests {
             move_conversation_in_db(&connection, 1, Some(project_id)).unwrap();
             connection.execute("INSERT INTO project_folders(project_id,path) VALUES(?1,?2)", params![project_id, root.canonicalize().unwrap().to_str().unwrap()]).unwrap();
         }
+        let checked = {
+            let connection = db.lock().unwrap();
+            let context: String = connection.query_row("SELECT context_json FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+            let context: ContextPreview = serde_json::from_str(&context).unwrap();
+            let scope = connection.query_row("SELECT project_id,path FROM project_folders", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            CheckedRequest { payload: with_agent_tools(chat_payload(&connection, &context, None).unwrap(), true, true).unwrap(), project_scope: Some(scope) }
+        };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
         let first = "data: {\"choices\":[{\"delta\":{\"content\":\"Checking. \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-search\",\"type\":\"function\",\"function\":{\"name\":\"search_project\",\"arguments\":\"{\\\"query\\\":\\\"release date\\\"}\"}}]}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14}}\n\ndata: [DONE]\n\n";
@@ -3205,7 +3435,7 @@ mod tests {
             }
         });
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-            VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, Channel::new(|_| Ok(()))));
+            VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, Some(checked), Channel::new(|_| Ok(()))));
         server.join().unwrap();
         let connection = db.lock().unwrap();
         let (content, status, usage, last_seq): (String, String, String, i64) = connection.query_row(
@@ -3223,6 +3453,45 @@ mod tests {
     }
 
     #[test]
+    fn checked_agent_request_rejects_scope_change_before_reading_or_second_post() {
+        use std::io::Write;
+        let (db, id) = http_attempt_for(VERIFIED_TOOL_MODEL_ID);
+        let checked = {
+            let connection = db.lock().unwrap();
+            let project = create_project_in_db(&connection).unwrap();
+            move_conversation_in_db(&connection, 1, Some(project)).unwrap();
+            connection.execute("INSERT INTO project_folders(project_id,path) VALUES(?1,'/synthetic/first')", [project]).unwrap();
+            let json: String = connection.query_row("SELECT context_json FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+            let context: ContextPreview = serde_json::from_str(&json).unwrap();
+            CheckedRequest { payload: with_agent_tools(chat_payload(&connection, &context, None).unwrap(), true, true).unwrap(), project_scope: Some((project, "/synthetic/first".into())) }
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let changed_db = db.clone();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = [0u8; 16384];
+            let size = socket.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).contains("search_project"));
+            changed_db.lock().unwrap().execute("UPDATE project_folders SET path='/synthetic/second'", []).unwrap();
+            let event = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-search","function":{"name":"search_project","arguments":"{\"query\":\"release\"}"}}]}}]});
+            let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).unwrap();
+            // Closing this listener also makes an unintended second POST fail visibly.
+        });
+        tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
+            VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, Some(checked), Channel::new(|_| Ok(()))));
+        server.join().unwrap();
+        let connection = db.lock().unwrap();
+        let error: String = connection.query_row("SELECT error_code FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        assert_eq!(error, "PROJECT_SCOPE_CHANGED");
+        let context: String = connection.query_row("SELECT context_json FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        assert!(serde_json::from_str::<ContextPreview>(&context).unwrap().agent_files_read.is_empty());
+    }
+
+    #[test]
     fn malformed_agent_search_arguments_fail_attempt() {
         let (db, id) = http_attempt_for(VERIFIED_TOOL_MODEL_ID);
         {
@@ -3235,7 +3504,7 @@ mod tests {
         let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-search\",\"type\":\"function\",\"function\":{\"name\":\"search_project\",\"arguments\":\"{\"}}]}}]}\n\ndata: [DONE]\n\n";
         let (url, server) = local_response("200 OK", body);
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-            VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, Channel::new(|_| Ok(()))));
+            VERIFIED_TOOL_MODEL_ID.into(), "synthetic-key".into(), &url, true, None, Channel::new(|_| Ok(()))));
         server.join().unwrap();
         let result: (String, Option<String>) = db.lock().unwrap().query_row(
             "SELECT status,error_code FROM attempts WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
@@ -3255,7 +3524,7 @@ mod tests {
         let stored_key = entry.get_password().unwrap();
         let (db, id) = http_attempt_for("gpt-oss-20b");
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-            "gpt-oss-20b".into(), stored_key, "https://simple-claw.ru/v1/chat/completions", false, Channel::new(|_| Ok(()))));
+            "gpt-oss-20b".into(), stored_key, "https://simple-claw.ru/v1/chat/completions", false, None, Channel::new(|_| Ok(()))));
         delete_key_for(&entry).unwrap();
         let connection = db.lock().unwrap();
         let result: (String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64) = connection.query_row(
@@ -3303,7 +3572,7 @@ mod tests {
         let received = events.clone();
         let channel = Channel::new(move |body| { received.lock().unwrap().push(body); Ok(()) });
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-            "synthetic-model".into(), "synthetic-key".into(), &url, false, channel));
+            "synthetic-model".into(), "synthetic-key".into(), &url, false, None, channel));
         server.join().unwrap();
         let connection = db.lock().unwrap();
         let saved: (String, String, String, String) = connection.query_row(
@@ -3323,7 +3592,7 @@ mod tests {
             let (db, id) = http_attempt();
             let (url, server) = local_response(status, body);
             tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)), id,
-                "synthetic-model".into(), "synthetic-key".into(), &url, false, Channel::new(|_| Ok(()))));
+                "synthetic-model".into(), "synthetic-key".into(), &url, false, None, Channel::new(|_| Ok(()))));
             server.join().unwrap();
             let connection = db.lock().unwrap();
             let saved: (String, String, Option<String>) = connection.query_row(
@@ -3359,7 +3628,7 @@ mod tests {
             Ok(())
         });
         tauri::async_runtime::block_on(run_http_stream(db.clone(), Arc::new(Mutex::new(None)), cancel, id,
-            "synthetic-model".into(), "synthetic-key".into(), &url, false, channel));
+            "synthetic-model".into(), "synthetic-key".into(), &url, false, None, channel));
         server.join().unwrap();
         let connection = db.lock().unwrap();
         let saved: (String, String) = connection.query_row("SELECT m.content, a.status FROM messages m JOIN attempts a ON a.assistant_id=m.id WHERE a.id=?1",
@@ -3513,6 +3782,25 @@ mod tests {
         assert_eq!((mime.as_str(), saved_bytes.as_slice()), ("image/png", bytes.as_slice()));
         drop(backup);
         std::fs::remove_file(backup_path).unwrap();
+    }
+
+    #[test]
+    fn checked_request_keeps_historical_image_when_draft_reuses_its_id() {
+        let (db, _) = http_attempt_for("gpt-6-luna");
+        let mut db = db.lock().unwrap();
+        use image::ImageEncoder;
+        let mut red = Vec::new();
+        let mut blue = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut red).write_image(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8).unwrap();
+        image::codecs::png::PngEncoder::new(&mut blue).write_image(&[0, 0, 255, 255], 1, 1, image::ExtendedColorType::Rgba8).unwrap();
+        let old = PendingAttachment { id: 1, name: "red.png".into(), mime: "image/png".into(), content: red.clone(), preview: String::new() };
+        let first = create_attempt_for_conversation(&mut db, 1, "red", &[&old], "gpt-6-luna").unwrap();
+        finish(&db, first, "completed").unwrap();
+        let new = PendingAttachment { id: 1, name: "blue.png".into(), mime: "image/png".into(), content: blue.clone(), preview: String::new() };
+        let prepared = prepare_context(&db, &[new], 1, "blue", &[1], &[], "gpt-6-luna", false).unwrap();
+        let images = prepared.request.payload["messages"].as_array().unwrap().iter()
+            .filter_map(|message| message.pointer("/content/1/image_url/url").and_then(serde_json::Value::as_str)).collect::<Vec<_>>();
+        assert_eq!(images, vec![format!("data:image/png;base64,{}", BASE64.encode(red)), format!("data:image/png;base64,{}", BASE64.encode(blue))]);
     }
 
     #[test]

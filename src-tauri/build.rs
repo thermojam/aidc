@@ -12,6 +12,7 @@ fn main() {
                 "archive_project",
                 "move_conversation",
                 "list_project_materials",
+                "preview_project_material",
                 "save_project_material",
                 "choose_project_folder",
                 "list_project_folder",

@@ -12,6 +12,7 @@ import {OperationNotice, OperationToaster, useOperationErrors, type ErrorArea, A
 import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
+import ModelPicker from "./ModelPicker";
 import {useNavigationLayout} from "./useNavigationLayout";
 import "./style.css";
 
@@ -22,6 +23,7 @@ type ContextMessage = { role: string; content: string; source_message_id: number
 type AgentSource = { relative_path: string; line: number; excerpt: string };
 type AgentSkill = { material_id: number; name: string; version: number; size: number; sha256: string; instructions: string; enabled: boolean };
 type ContextPreview = {
+    confirmation_id: string;
     model_id: string;
     response_style: "concise" | "balanced" | "detailed";
     catalog_fetched_at: number | null;
@@ -32,6 +34,7 @@ type ContextPreview = {
     bytes: number;
     request_bytes: number;
     agent_sources?: AgentSource[];
+    project_search_enabled?: boolean;
     agent_files_read?: string[];
     agent_skill?: AgentSkill | null;
     warning: string
@@ -89,12 +92,17 @@ const statusLabel: Record<string, string> = {
 const categoryLabel: Record<string, string> = {
     thinking: "Мышление", speed: "Скорость", economy: "Экономия", other: "Остальные"
 };
-const categoryOrder = ["thinking", "speed", "economy", "other"];
 
 function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
     const [projects, setProjects] = useState<Project[]>([]);
     const [projectFilter, setProjectFilter] = useState<number | null>(null);
+    const [materialsOpen, setMaterialsOpen] = useState(false);
+    const [materialPreview, setMaterialPreview] = useState<PendingAttachment | null>(null);
+    const materialsTrigger = useRef<HTMLButtonElement>(null);
+    const materialsBack = useRef<HTMLButtonElement>(null);
+    const materialRequest = useRef(0);
+    const [materialsLoading, setMaterialsLoading] = useState(false);
     const [projectMaterials, setProjectMaterials] = useState<ProjectMaterial[]>([]);
     const [projectFolderView, setProjectFolderView] = useState<ProjectFolderView | null>(null);
     const [folderPreview, setFolderPreview] = useState<PendingAttachment | null>(null);
@@ -112,6 +120,7 @@ function App() {
         attempts: []
     });
     const [prompt, setPrompt] = useState("");
+    const [composerToolsOpen, setComposerToolsOpen] = useState(false);
     const [busy, setBusy] = useState(false);
     const [draft, setDraft] = useState("");
     const {errors, report, clear} = useOperationErrors(conversationId);
@@ -535,13 +544,22 @@ function App() {
         return () => { current = false; window.clearTimeout(timer); };
     }, [conversationSearch, conversations, projectFilter]);
 
-    const conversationProjectId = conversations.find((item) => item.id === conversationId)?.project_id ?? null;
+    const currentConversation = conversations.find((item) => item.id === conversationId && !item.archived);
+    const conversationProjectId = projects.find((item) => item.id === currentConversation?.project_id && !item.archived)?.id ?? null;
+    const activeMaterialProject = useRef(conversationProjectId);
+    activeMaterialProject.current = conversationProjectId;
     const eligibleSkills = projectMaterials.filter((material) => material.name.toLowerCase().endsWith(".md") && material.size > 0 && material.size <= 16 * 1024);
     useEffect(() => {
         let current = true;
         setSelectedMaterialIds([]);
         setContextPreview(null);
         setFolderPreview(null);
+        setMaterialPreview(null);
+        setMaterialsLoading(false);
+        setMaterialsOpen(false);
+        materialRequest.current++;
+        setProjectMaterials([]);
+        setProjectFolderView(null);
         if (conversationProjectId === null) {
             setProjectMaterials([]);
             setProjectFolderView(null);
@@ -550,11 +568,8 @@ function App() {
         invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
             .then((items) => { if (current) setProjectMaterials(items); })
             .catch((reason) => { if (current) report("materials", reason); });
-        invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
-            .then((folder) => { if (current) setProjectFolderView(folder); })
-            .catch((reason) => { if (current) report("folder", reason); });
         return () => { current = false; };
-    }, [conversationProjectId]);
+    }, [conversationProjectId, conversationId]);
 
     useEffect(() => {
         refreshConversations().then((items) => {
@@ -777,13 +792,54 @@ function App() {
         } catch (reason) { report("moveConversation", reason); }
     }
 
+    async function openMaterials() {
+        if (conversationProjectId === null) return;
+        setMaterialsOpen(true);
+        requestAnimationFrame(() => materialsBack.current?.focus());
+        await refreshMaterials();
+    }
+
+    function closeMaterials() {
+        setMaterialsOpen(false);
+        requestAnimationFrame(() => materialsTrigger.current?.focus());
+    }
+
+    async function refreshMaterials() {
+        if (conversationProjectId === null) return;
+        const request = ++materialRequest.current;
+        setMaterialsLoading(true);
+        setFolderPreview(null);
+        setMaterialPreview(null);
+        const current = () => request === materialRequest.current && conversationId === activeConversation.current && conversationProjectId === activeMaterialProject.current;
+        await Promise.all([
+            invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
+                .then((items) => { if (current()) { setProjectMaterials(items); clear("materials"); } })
+                .catch((reason) => { if (current()) { setProjectMaterials([]); report("materials", reason); } }),
+            invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
+                .then((folder) => { if (current()) { setProjectFolderView(folder); clear("folder"); } })
+                .catch((reason) => { if (current()) { setProjectFolderView(null); report("folder", reason); } })
+        ]);
+        if (current()) setMaterialsLoading(false);
+    }
+
+    async function previewMaterial(materialId: number) {
+        const request = ++materialRequest.current;
+        setMaterialPreview(null);
+        try {
+            const result = await invoke<PendingAttachment>("preview_project_material", {conversationId, materialId});
+            if (request !== materialRequest.current || conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
+            setMaterialPreview(result);
+            clear("previewMaterial");
+        } catch (reason) { if (request === materialRequest.current) report("previewMaterial", reason); }
+    }
+
     async function addProjectMaterial() {
         if (conversationProjectId === null) return;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
             if (!attachment) return;
             const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
             setProjectMaterials((items) => [...items.filter((item) => item.id !== material.id), material]);
             setContextPreview(null);
             clear("addProjectMaterial");
@@ -796,7 +852,7 @@ function App() {
             const chosen = await invoke<string | null>("choose_project_folder", {projectId: conversationProjectId});
             if (!chosen) return;
             const folder = await invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId});
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
             setProjectFolderView(folder);
             setFolderPreview(null);
             clear("chooseProjectFolder");
@@ -805,10 +861,12 @@ function App() {
 
     async function previewProjectFile(relativePath: string) {
         if (conversationProjectId === null) return;
+        const request = ++materialRequest.current;
         try {
             setFolderPreview(null);
             const result = await invoke<PendingAttachment>("preview_project_file", {projectId: conversationProjectId, relativePath});
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
+            if (request !== materialRequest.current) return;
             setFolderPreview(result);
             clear("previewProjectFile");
         } catch (reason) { report("previewProjectFile", reason); }
@@ -820,7 +878,7 @@ function App() {
             const material = await invoke<ProjectMaterial>("save_project_folder_material", {
                 projectId: conversationProjectId, relativePath: folderPreview.name, expectedSha256: folderPreview.sha256
             });
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
             setProjectMaterials((items) => [...items, material]);
             setFolderPreview(null);
             clear("saveFolderPreview");
@@ -930,21 +988,49 @@ function App() {
             if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
             if (frame) cancelAnimationFrame(frame);
             setBusy(false);
-            if (restorePrompt !== undefined) setPrompt(restorePrompt);
+            if (restorePrompt !== undefined) setPrompt((current) => current || restorePrompt);
+            setContextPreview(null);
             report("runGeneration", reason);
             return false;
         }
     }
 
     function contextSignature() {
-        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false]);
+        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
     }
+
+    async function submitPrompt() {
+        if (busy || !prompt.trim()) return;
+        if (!contextPreview?.confirmation_id || previewSignature !== contextSignature()) {
+            notify("Проверьте состав запроса. Для отправки нажмите Enter ещё раз или «Отправить».", "composer-check", 6000);
+            await checkContext();
+            return;
+        }
+        if ((modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported)) return;
+        await send();
+    }
+
+    useEffect(() => {
+        const field = promptField.current;
+        if (!field) return;
+        const resize = () => {
+            field.style.height = "auto";
+            field.style.height = `${Math.min(field.scrollHeight, 8 * 18 + 8)}px`;
+        };
+        resize();
+        const observer = new ResizeObserver(() => {
+            if (field.clientWidth !== width) { width = field.clientWidth; resize(); }
+        });
+        let width = field.clientWidth;
+        observer.observe(field);
+        return () => observer.disconnect();
+    }, [prompt]);
 
     async function send() {
         const value = prompt.trim();
         const signature = contextSignature();
-        if (!value || busy || !contextPreview || previewSignature !== signature) return;
-        const tools = conversationProjectId !== null && projectFolderView ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
+        if (!value || busy || !contextPreview?.confirmation_id || previewSignature !== signature) return;
+        const tools = contextPreview.project_search_enabled ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
         if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
         if (scheduledDraft && value === scheduledDraft.prompt && (!agentMode || modelId !== "gpt-oss-20b")) {
             report("send", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
@@ -953,7 +1039,7 @@ function App() {
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
         const inputSource = boardInputSource?.text === value ? boardInputSource : null;
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
+        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {confirmationId: contextPreview.confirmation_id, prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
             setScheduledDraft(null);
             clear("send");
             if (inputSource) {
@@ -1096,6 +1182,7 @@ function App() {
     async function checkContext() {
         const request = ++contextRequest.current;
         const signature = contextSignature();
+        setContextPreview(null);
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
             const materialIds = selectedMaterialIds;
@@ -1266,9 +1353,57 @@ function App() {
                         {projects.filter((item) => !item.archived || item.id === selectedConversation?.project_id)
                             .map((item) => <option key={item.id} value={item.id}>{item.title}{item.archived ? " (архив)" : ""}</option>)}
                     </select>
+                    {conversationProjectId !== null && <button ref={materialsTrigger} type="button" className="secondary-button" aria-expanded={materialsOpen}
+                            onClick={() => materialsOpen ? closeMaterials() : void openMaterials()}>Материалы</button>}
                     <button ref={compactSettingsButton} type="button" className="secondary-button compact-settings"
                             onClick={() => setSettingsOpen(true)}>Настройки</button>
                 </header>
+                    {materialsOpen && conversationProjectId !== null && <section className="project-materials" aria-label="Материалы проекта">
+                        <div className="project-materials-heading"><button ref={materialsBack} type="button" className="secondary-button" onClick={closeMaterials}>Назад к беседе</button><button type="button" className="secondary-button" disabled={materialsLoading || busy} onClick={() => void refreshMaterials()}>Обновить материалы</button></div>
+                        <h2>{projects.find((item) => item.id === conversationProjectId)?.title} · Материалы</h2>
+                        <p>Выберите версии для следующего запроса. Вместе с вложениями — не больше пяти. Добавление в библиотеку само по себе ничего не отправляет.</p>
+                        {operationErrors("attachment")}
+                        {materialsLoading && <p role="status">Загрузка материалов…</p>}
+                        <div className="project-materials-heading">
+                            <h3>Библиотека версий</h3>
+                            <button type="button" className="secondary-button" disabled={busy || materialsLoading}
+                                    onClick={() => void addProjectMaterial()}>Добавить материал</button>
+                        </div>
+                        <div className="project-folder-heading">
+                            <span>{projectFolderView ? `Папка: ${projectFolderView.folder_name} · только первый уровень · максимум ${projectFolderView.max_entries} элементов, ${Math.round(projectFolderView.max_file_bytes / 1024)} КБ на файл` : "Папка проекта не выбрана"}</span>
+                            <button type="button" className="secondary-button" disabled={busy || materialsLoading} onClick={() => void chooseProjectFolder()}>
+                                {projectFolderView ? "Сменить папку" : "Выбрать папку"}
+                            </button>
+                        </div>
+                        {projectFolderView?.files.map((file) => <div className="project-folder-file" key={file.relative_path}>
+                            <span>{file.relative_path} · {file.size === null ? "размер неизвестен" : `${file.size} Б`}{file.blocked_reason ? ` · ${file.blocked_reason}` : ""}</span>
+                            {file.blocked_reason === null && <button type="button" className="secondary-button" disabled={busy || materialsLoading}
+                                    onClick={() => void previewProjectFile(file.relative_path)}>Просмотр</button>}
+                        </div>)}
+                        {projectFolderView && !projectFolderView.files.length && <p>Поддерживаемых файлов в корне папки нет.</p>}
+                        {folderPreview && <details open className="folder-preview">
+                            <summary>{folderPreview.name} · {folderPreview.size} Б · SHA-256 {folderPreview.sha256}</summary>
+                            <pre>{folderPreview.preview}</pre>
+                            <button type="button" className="secondary-button" disabled={busy || materialsLoading} onClick={() => void saveFolderPreview()}>
+                                Добавить эту версию в материалы
+                            </button>
+                        </details>}
+                        {projectMaterials.map((material) => <div className="project-material" key={material.id}><label>
+                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || materialsLoading || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
+                                   onChange={(event) => {
+                                       setSelectedMaterialIds((ids) => event.target.checked ? (pendingAttachments.length + ids.length < 5 && !ids.includes(material.id) ? [...ids, material.id] : ids) : ids.filter((id) => id !== material.id));
+                                       setContextPreview(null);
+                                   }}/>
+                            <span>{material.name} · версия {material.version} · {material.size} Б · SHA-256 {material.sha256}</span>
+                        </label><button type="button" className="secondary-button" disabled={busy || materialsLoading} onClick={() => void previewMaterial(material.id)}>Просмотр {material.name} · версия {material.version}</button></div>)}
+                        {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
+                        {materialPreview && <section className="folder-preview" aria-label="Сохранённая версия">
+                            <h3>{materialPreview.name}</h3><p>{materialPreview.size} Б · SHA-256 {materialPreview.sha256}</p>
+                            <pre>{materialPreview.preview}</pre>
+                        </section>}
+                    </section>}
+                <div className="conversation-view" hidden={materialsOpen}>
+                <div className="history" aria-label="История сообщений" role="region">
                 {openedScheduledResult && <section className="scheduled-task-notice" role="region" aria-label="Результат агентной задачи" id="scheduled-task-result">
                     <strong>Результат задачи: {openedScheduledResult.title}</strong>
                     <p className="scheduled-result-content">{openedScheduledResult.content || "Ответ завершён без текста."}</p>
@@ -1280,7 +1415,6 @@ function App() {
                     <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
                     <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить расписание</button>
                 </section>)}
-                <div className="history" aria-label="История сообщений" role="region">
                     <div className="history-content">
                     {visible.length === 0 && !busy && (
                         <div className="empty-state">
@@ -1376,18 +1510,35 @@ function App() {
                 </div>
                 <form className="composer" onSubmit={(event) => {
                     event.preventDefault();
-                    void send();
+                    void submitPrompt();
                 }}>
                     {operationErrors("attachment")}
+                    <div className="composer-project">Проект: {projects.find((project) => project.id === conversationProjectId)?.title ?? "Без проекта"}</div>
+                    {(pendingAttachments.length + selectedMaterialIds.length > 0) && <div className="composer-chips" aria-label="Выбранный контекст">
+                        {pendingAttachments.slice(0, 2).map((item) => <span key={item.id}><span>{item.name} · {item.mime} · {item.size} Б</span> <button type="button" disabled={busy} aria-label={`Убрать ${item.name}`} onClick={() => void removeAttachment(item.id)}>×</button></span>)}
+                        {selectedMaterialIds.slice(0, Math.max(0, 2 - pendingAttachments.length)).map((id) => {
+                            const item = projectMaterials.find((material) => material.id === id);
+                            return <span key={id}><span>{item?.name ?? "Материал недоступен"} · версия {item?.version} · {item?.size} Б</span> <button type="button" disabled={busy} aria-label={`Убрать ${item?.name ?? "материал"}`} onClick={() => { setSelectedMaterialIds((ids) => ids.filter((value) => value !== id)); setContextPreview(null); }}>×</button></span>;
+                        })}
+                        <button type="button" className="secondary-button" onClick={() => setComposerToolsOpen(true)}>{pendingAttachments.length + selectedMaterialIds.length > 2 ? `Ещё ${pendingAttachments.length + selectedMaterialIds.length - 2}` : "Просмотреть / убрать"}</button>
+                    </div>}
                     {captureNotice && <p role="status">{captureNotice}</p>}
                     {operationErrors("artifact")}
                     <label className="sr-only" htmlFor="prompt">Сообщение</label>
-                    <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000}
+                    <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000} rows={2}
+                              onKeyDown={(event) => {
+                                  if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || event.defaultPrevented || event.currentTarget.getAttribute("aria-expanded") === "true") return;
+                                  event.preventDefault();
+                                  void submitPrompt();
+                              }}
                               placeholder="Напишите сообщение" onChange={(event) => {
                         setPrompt(event.target.value);
                         setBoardInputSource((source) => source && source.text !== event.target.value ? null : source);
                         setContextPreview(null);
                     }}/>
+                    {prompt.length >= 1600 && <small aria-live="polite">{prompt.length}/2000</small>}
+                    <details className="composer-extra" open={composerToolsOpen} onToggle={(event) => setComposerToolsOpen(event.currentTarget.open)}>
+                    <summary>Инструменты ввода</summary>
                     <section className="voice-input" aria-label="Голосовой ввод">
                         {operationErrors("voice")}
                         <div className="voice-controls">
@@ -1449,41 +1600,7 @@ function App() {
                             </div>
                         ))}
                     </div>
-                    {conversationProjectId !== null && <div className="project-materials">
-                        <div className="project-materials-heading">
-                            <strong>Материалы проекта</strong>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                                    onClick={() => void addProjectMaterial()}>Добавить материал</button>
-                        </div>
-                        <div className="project-folder-heading">
-                            <span>{projectFolderView ? `Папка: ${projectFolderView.folder_name} · только первый уровень · максимум ${projectFolderView.max_entries} элементов, ${Math.round(projectFolderView.max_file_bytes / 1024)} КБ на файл` : "Папка проекта не выбрана"}</span>
-                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void chooseProjectFolder()}>
-                                {projectFolderView ? "Сменить папку" : "Выбрать папку"}
-                            </button>
-                        </div>
-                        {projectFolderView?.files.map((file) => <div className="project-folder-file" key={file.relative_path}>
-                            <span>{file.relative_path} · {file.size === null ? "размер неизвестен" : `${file.size} Б`}{file.blocked_reason ? ` · ${file.blocked_reason}` : ""}</span>
-                            {file.blocked_reason === null && <button type="button" className="secondary-button" disabled={busy}
-                                    onClick={() => void previewProjectFile(file.relative_path)}>Просмотр</button>}
-                        </div>)}
-                        {projectFolderView && !projectFolderView.files.length && <p>Поддерживаемых файлов в корне папки нет.</p>}
-                        {folderPreview && <details open className="folder-preview">
-                            <summary>{folderPreview.name} · {folderPreview.size} Б · SHA-256 {folderPreview.sha256}</summary>
-                            <pre>{folderPreview.preview}</pre>
-                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void saveFolderPreview()}>
-                                Добавить эту версию в материалы
-                            </button>
-                        </details>}
-                        {projectMaterials.map((material) => <label className="project-material" key={material.id}>
-                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
-                                   onChange={(event) => {
-                                       setSelectedMaterialIds((ids) => event.target.checked ? [...ids, material.id] : ids.filter((id) => id !== material.id));
-                                       setContextPreview(null);
-                                   }}/>
-                            <span>{material.name} · версия {material.version} · {material.size} Б · SHA-256 {material.sha256.slice(0, 12)}…</span>
-                        </label>)}
-                        {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
-                        <div className="agent-skill-picker">
+                    {conversationProjectId !== null && <div className="agent-skill-picker">
                             <h3>Локальный навык</h3>
                             <p>Выберите Markdown-материал этого проекта. Инструкция попадёт только в агентный запрос после явного включения; навык не добавляет доступ к файлам, командам или сети.</p>
                             <label htmlFor="agent-skill-source">Источник</label>
@@ -1502,8 +1619,23 @@ function App() {
                                 <pre>{agentSkill.instructions}</pre>
                             </details>}
                             {!eligibleSkills.length && <small>В библиотеке проекта нет Markdown-файлов до 16 КиБ.</small>}
-                        </div>
                     </div>}
+                            <label htmlFor="request-mode">Режим следующего запроса</label>
+                            <select id="request-mode" value={agentMode ? "agent" : "chat"} disabled={busy} onChange={(event) => { setAgentMode(event.target.value === "agent"); setContextPreview(null); }}>
+                                <option value="chat">Чат</option>
+                                <option value="agent" disabled={modelId !== "gpt-oss-20b"}>Агент · только gpt-oss-20b</option>
+                            </select>
+                            <small>Агент: калькулятор и поиск при явно подключённой папке; команды недоступны. До двух платных запросов с подтверждением.</small>
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void pickAttachment()}>Прикрепить файл</button>
+                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                                    onClick={() => void pickImageAttachment()}>Прикрепить изображение</button>
+                    {selectedMaterialIds.map((id) => { const item = projectMaterials.find((material) => material.id === id); return <div key={id}>
+                        <span>{item?.name ?? "Материал недоступен"} · версия {item?.version} · {item?.size} Б</span>
+                        <button type="button" disabled={busy} aria-label={`Убрать ${item?.name ?? "материал"} · версия ${item?.version ?? id}`} onClick={() => { setSelectedMaterialIds((ids) => ids.filter((value) => value !== id)); setContextPreview(null); }}>Убрать</button>
+                    </div>; })}
+                    {selectedMaterialIds.length > 0 && <button type="button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>}
+                    </details>
                     {contextPreview && <details open className="context-preview">
                         <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
@@ -1514,30 +1646,11 @@ function App() {
                     </details>}
                     <div className="composer-footer">
                         <div className="composer-tools">
-                            <label className="sr-only" htmlFor="model">Модель для следующей попытки</label>
-                            <select id="model" title={selectedModel ? `${selectedModel.name} · ${selectedModel.id}` : "Локальный тест"} value={modelId} disabled={busy} onChange={(event) => {
-                                setModelId(event.target.value);
-                                if (event.target.value !== "gpt-oss-20b") setAgentMode(false);
-                                setContextPreview(null);
-                            }}>
-                                <option value="local-mock">Локальный тест</option>
-                                {categoryOrder.map((category) => <optgroup key={category} label={categoryLabel[category]}>
-                                    {catalog?.models.filter((model) => (!model.protocols.length || model.protocols.includes("chat_completions"))
-                                        && (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
-                                        .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
-                                </optgroup>)}
-                            </select>
-                            <label className="agent-mode-toggle">
-                                <input type="checkbox" checked={agentMode} disabled={busy || modelId !== "gpt-oss-20b"} onChange={(event) => {
-                                    setAgentMode(event.target.checked);
-                                    setContextPreview(null);
-                                }}/>
-                                Агентный режим · калькулятор{conversationProjectId !== null && projectFolderView ? " и поиск по папке" : ""}
-                            </label>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                                    onClick={() => void pickAttachment()}>Прикрепить файл</button>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                                    onClick={() => void pickImageAttachment()}>Прикрепить изображение</button>
+                            <button type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
+                            <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} disabled={busy}
+                                         fetchedAt={catalog?.fetched_at ?? null} catalogFailed={errors.some((error) => error.area === "catalog")}
+                                         onChange={(id) => { setModelId(id); if (id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
+                            {agentMode && <span className="agent-mode-chip">Агент · калькулятор{conversationProjectId !== null ? " и поиск при подключённой папке" : ""}</span>}
                             {operationErrors("catalog")}
                             <details className="model-details">
                                 <summary>О модели</summary>
@@ -1560,7 +1673,7 @@ function App() {
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false])}>Отправить
+                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
                             </button>}
                         </div>
                     </div>
@@ -1676,6 +1789,7 @@ function App() {
                         </button>
                     </div>}
                 </details>
+                </div>
                 </div>
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
