@@ -12,6 +12,7 @@ import {OperationNotice, OperationToaster, useOperationErrors, type ErrorArea, A
 import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
+import ModelPicker from "./ModelPicker";
 import {useNavigationLayout} from "./useNavigationLayout";
 import "./style.css";
 
@@ -91,7 +92,6 @@ const statusLabel: Record<string, string> = {
 const categoryLabel: Record<string, string> = {
     thinking: "Мышление", speed: "Скорость", economy: "Экономия", other: "Остальные"
 };
-const categoryOrder = ["thinking", "speed", "economy", "other"];
 
 function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -1620,13 +1620,12 @@ function App() {
                             </details>}
                             {!eligibleSkills.length && <small>В библиотеке проекта нет Markdown-файлов до 16 КиБ.</small>}
                     </div>}
-                            <label className="agent-mode-toggle">
-                                <input type="checkbox" checked={agentMode} disabled={busy || modelId !== "gpt-oss-20b"} onChange={(event) => {
-                                    setAgentMode(event.target.checked);
-                                    setContextPreview(null);
-                                }}/>
-                                Агентный режим · калькулятор{conversationProjectId !== null ? "; поиск при подключённой папке" : ""}
-                            </label>
+                            <label htmlFor="request-mode">Режим следующего запроса</label>
+                            <select id="request-mode" value={agentMode ? "agent" : "chat"} disabled={busy} onChange={(event) => { setAgentMode(event.target.value === "agent"); setContextPreview(null); }}>
+                                <option value="chat">Чат</option>
+                                <option value="agent" disabled={modelId !== "gpt-oss-20b"}>Агент · только gpt-oss-20b</option>
+                            </select>
+                            <small>Агент: калькулятор и поиск при явно подключённой папке; команды недоступны. До двух платных запросов с подтверждением.</small>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
@@ -1648,19 +1647,10 @@ function App() {
                     <div className="composer-footer">
                         <div className="composer-tools">
                             <button type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
-                            <label className="sr-only" htmlFor="model">Модель для следующей попытки</label>
-                            <select id="model" title={selectedModel ? `${selectedModel.name} · ${selectedModel.id}` : "Локальный тест"} value={modelId} disabled={busy} onChange={(event) => {
-                                setModelId(event.target.value);
-                                if (event.target.value !== "gpt-oss-20b") setAgentMode(false);
-                                setContextPreview(null);
-                            }}>
-                                <option value="local-mock">Локальный тест · без сети</option>
-                                {categoryOrder.map((category) => <optgroup key={category} label={categoryLabel[category]}>
-                                    {catalog?.models.filter((model) => (!model.protocols.length || model.protocols.includes("chat_completions"))
-                                        && (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
-                                        .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
-                                </optgroup>)}
-                            </select>
+                            <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} disabled={busy}
+                                         fetchedAt={catalog?.fetched_at ?? null} catalogFailed={errors.some((error) => error.area === "catalog")}
+                                         onChange={(id) => { setModelId(id); if (id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
+                            {agentMode && <span className="agent-mode-chip">Агент · калькулятор{conversationProjectId !== null ? " и поиск при подключённой папке" : ""}</span>}
                             {operationErrors("catalog")}
                             <details className="model-details">
                                 <summary>О модели</summary>
