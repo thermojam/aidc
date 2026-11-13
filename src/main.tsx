@@ -120,6 +120,7 @@ function App() {
         attempts: []
     });
     const [prompt, setPrompt] = useState("");
+    const [composerToolsOpen, setComposerToolsOpen] = useState(false);
     const [busy, setBusy] = useState(false);
     const [draft, setDraft] = useState("");
     const {errors, report, clear} = useOperationErrors(conversationId);
@@ -987,7 +988,7 @@ function App() {
             if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
             if (frame) cancelAnimationFrame(frame);
             setBusy(false);
-            if (restorePrompt !== undefined) setPrompt(restorePrompt);
+            if (restorePrompt !== undefined) setPrompt((current) => current || restorePrompt);
             setContextPreview(null);
             report("runGeneration", reason);
             return false;
@@ -997,6 +998,33 @@ function App() {
     function contextSignature() {
         return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
     }
+
+    async function submitPrompt() {
+        if (busy || !prompt.trim()) return;
+        if (!contextPreview?.confirmation_id || previewSignature !== contextSignature()) {
+            notify("Проверьте состав запроса. Для отправки нажмите Enter ещё раз или «Отправить».", "composer-check", 6000);
+            await checkContext();
+            return;
+        }
+        if ((modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported)) return;
+        await send();
+    }
+
+    useEffect(() => {
+        const field = promptField.current;
+        if (!field) return;
+        const resize = () => {
+            field.style.height = "auto";
+            field.style.height = `${Math.min(field.scrollHeight, 8 * 18 + 8)}px`;
+        };
+        resize();
+        const observer = new ResizeObserver(() => {
+            if (field.clientWidth !== width) { width = field.clientWidth; resize(); }
+        });
+        let width = field.clientWidth;
+        observer.observe(field);
+        return () => observer.disconnect();
+    }, [prompt]);
 
     async function send() {
         const value = prompt.trim();
@@ -1375,6 +1403,7 @@ function App() {
                         </section>}
                     </section>}
                 <div className="conversation-view" hidden={materialsOpen}>
+                <div className="history" aria-label="История сообщений" role="region">
                 {openedScheduledResult && <section className="scheduled-task-notice" role="region" aria-label="Результат агентной задачи" id="scheduled-task-result">
                     <strong>Результат задачи: {openedScheduledResult.title}</strong>
                     <p className="scheduled-result-content">{openedScheduledResult.content || "Ответ завершён без текста."}</p>
@@ -1386,7 +1415,6 @@ function App() {
                     <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
                     <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить расписание</button>
                 </section>)}
-                <div className="history" aria-label="История сообщений" role="region">
                     <div className="history-content">
                     {visible.length === 0 && !busy && (
                         <div className="empty-state">
@@ -1482,27 +1510,35 @@ function App() {
                 </div>
                 <form className="composer" onSubmit={(event) => {
                     event.preventDefault();
-                    void send();
+                    void submitPrompt();
                 }}>
                     {operationErrors("attachment")}
-                    {selectedMaterialIds.length > 0 && <div className="selected-materials" aria-label="Выбранные версии">
-                        <strong>В следующий запрос: {selectedMaterialIds.length} · всего файлов {pendingAttachments.length + selectedMaterialIds.length}/5</strong>
-                        {selectedMaterialIds.map((id) => { const material = projectMaterials.find((item) => item.id === id); return <div key={id}>
-                            <span>{material ? `${material.name} · версия ${material.version} · ${material.size} Б` : "Материал недоступен"}</span>
-                            <button type="button" className="secondary-button" disabled={busy} aria-label={`Убрать ${material?.name ?? "материал"} · версия ${material?.version ?? id}`}
-                                    onClick={() => { setSelectedMaterialIds((ids) => ids.filter((item) => item !== id)); setContextPreview(null); }}>Убрать</button>
-                        </div>; })}
-                        <button type="button" className="secondary-button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>
+                    <div className="composer-project">Проект: {projects.find((project) => project.id === conversationProjectId)?.title ?? "Без проекта"}</div>
+                    {(pendingAttachments.length + selectedMaterialIds.length > 0) && <div className="composer-chips" aria-label="Выбранный контекст">
+                        {pendingAttachments.slice(0, 2).map((item) => <span key={item.id}><span>{item.name} · {item.mime} · {item.size} Б</span> <button type="button" disabled={busy} aria-label={`Убрать ${item.name}`} onClick={() => void removeAttachment(item.id)}>×</button></span>)}
+                        {selectedMaterialIds.slice(0, Math.max(0, 2 - pendingAttachments.length)).map((id) => {
+                            const item = projectMaterials.find((material) => material.id === id);
+                            return <span key={id}><span>{item?.name ?? "Материал недоступен"} · версия {item?.version} · {item?.size} Б</span> <button type="button" disabled={busy} aria-label={`Убрать ${item?.name ?? "материал"}`} onClick={() => { setSelectedMaterialIds((ids) => ids.filter((value) => value !== id)); setContextPreview(null); }}>×</button></span>;
+                        })}
+                        <button type="button" className="secondary-button" onClick={() => setComposerToolsOpen(true)}>{pendingAttachments.length + selectedMaterialIds.length > 2 ? `Ещё ${pendingAttachments.length + selectedMaterialIds.length - 2}` : "Просмотреть / убрать"}</button>
                     </div>}
                     {captureNotice && <p role="status">{captureNotice}</p>}
                     {operationErrors("artifact")}
                     <label className="sr-only" htmlFor="prompt">Сообщение</label>
-                    <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000}
+                    <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000} rows={2}
+                              onKeyDown={(event) => {
+                                  if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || event.defaultPrevented || event.currentTarget.getAttribute("aria-expanded") === "true") return;
+                                  event.preventDefault();
+                                  void submitPrompt();
+                              }}
                               placeholder="Напишите сообщение" onChange={(event) => {
                         setPrompt(event.target.value);
                         setBoardInputSource((source) => source && source.text !== event.target.value ? null : source);
                         setContextPreview(null);
                     }}/>
+                    {prompt.length >= 1600 && <small aria-live="polite">{prompt.length}/2000</small>}
+                    <details className="composer-extra" open={composerToolsOpen} onToggle={(event) => setComposerToolsOpen(event.currentTarget.open)}>
+                    <summary>Инструменты ввода</summary>
                     <section className="voice-input" aria-label="Голосовой ввод">
                         {operationErrors("voice")}
                         <div className="voice-controls">
@@ -1584,29 +1620,6 @@ function App() {
                             </details>}
                             {!eligibleSkills.length && <small>В библиотеке проекта нет Markdown-файлов до 16 КиБ.</small>}
                     </div>}
-                    {contextPreview && <details open className="context-preview">
-                        <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
-                            обменов: {contextPreview.omitted_exchanges}</summary>
-                        <p>{contextPreview.warning}</p>
-                        {contextPreview.agent_skill && <p>В этом снимке включён навык «{contextPreview.agent_skill.name}», версия {contextPreview.agent_skill.version}, SHA-256 {contextPreview.agent_skill.sha256}. Текст инструкции показан ниже в составе сообщений.</p>}
-                        {contextPreview.messages.map((part, index) => <pre
-                            key={index}>{part.role} · {part.source_message_id ?? "новое сообщение или система"} · вложения: {part.attachment_ids.join(", ") || "нет"}{"\n"}{part.content}</pre>)}
-                    </details>}
-                    <div className="composer-footer">
-                        <div className="composer-tools">
-                            <label className="sr-only" htmlFor="model">Модель для следующей попытки</label>
-                            <select id="model" title={selectedModel ? `${selectedModel.name} · ${selectedModel.id}` : "Локальный тест"} value={modelId} disabled={busy} onChange={(event) => {
-                                setModelId(event.target.value);
-                                if (event.target.value !== "gpt-oss-20b") setAgentMode(false);
-                                setContextPreview(null);
-                            }}>
-                                <option value="local-mock">Локальный тест</option>
-                                {categoryOrder.map((category) => <optgroup key={category} label={categoryLabel[category]}>
-                                    {catalog?.models.filter((model) => (!model.protocols.length || model.protocols.includes("chat_completions"))
-                                        && (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
-                                        .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
-                                </optgroup>)}
-                            </select>
                             <label className="agent-mode-toggle">
                                 <input type="checkbox" checked={agentMode} disabled={busy || modelId !== "gpt-oss-20b"} onChange={(event) => {
                                     setAgentMode(event.target.checked);
@@ -1618,6 +1631,36 @@ function App() {
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickImageAttachment()}>Прикрепить изображение</button>
+                    {selectedMaterialIds.map((id) => { const item = projectMaterials.find((material) => material.id === id); return <div key={id}>
+                        <span>{item?.name ?? "Материал недоступен"} · версия {item?.version} · {item?.size} Б</span>
+                        <button type="button" disabled={busy} aria-label={`Убрать ${item?.name ?? "материал"} · версия ${item?.version ?? id}`} onClick={() => { setSelectedMaterialIds((ids) => ids.filter((value) => value !== id)); setContextPreview(null); }}>Убрать</button>
+                    </div>; })}
+                    {selectedMaterialIds.length > 0 && <button type="button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>}
+                    </details>
+                    {contextPreview && <details open className="context-preview">
+                        <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
+                            обменов: {contextPreview.omitted_exchanges}</summary>
+                        <p>{contextPreview.warning}</p>
+                        {contextPreview.agent_skill && <p>В этом снимке включён навык «{contextPreview.agent_skill.name}», версия {contextPreview.agent_skill.version}, SHA-256 {contextPreview.agent_skill.sha256}. Текст инструкции показан ниже в составе сообщений.</p>}
+                        {contextPreview.messages.map((part, index) => <pre
+                            key={index}>{part.role} · {part.source_message_id ?? "новое сообщение или система"} · вложения: {part.attachment_ids.join(", ") || "нет"}{"\n"}{part.content}</pre>)}
+                    </details>}
+                    <div className="composer-footer">
+                        <div className="composer-tools">
+                            <button type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
+                            <label className="sr-only" htmlFor="model">Модель для следующей попытки</label>
+                            <select id="model" title={selectedModel ? `${selectedModel.name} · ${selectedModel.id}` : "Локальный тест"} value={modelId} disabled={busy} onChange={(event) => {
+                                setModelId(event.target.value);
+                                if (event.target.value !== "gpt-oss-20b") setAgentMode(false);
+                                setContextPreview(null);
+                            }}>
+                                <option value="local-mock">Локальный тест · без сети</option>
+                                {categoryOrder.map((category) => <optgroup key={category} label={categoryLabel[category]}>
+                                    {catalog?.models.filter((model) => (!model.protocols.length || model.protocols.includes("chat_completions"))
+                                        && (categories.find((item) => item.model_id === model.id)?.category ?? "other") === category)
+                                        .map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
+                                </optgroup>)}
+                            </select>
                             {operationErrors("catalog")}
                             <details className="model-details">
                                 <summary>О модели</summary>
