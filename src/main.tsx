@@ -22,6 +22,7 @@ type ContextMessage = { role: string; content: string; source_message_id: number
 type AgentSource = { relative_path: string; line: number; excerpt: string };
 type AgentSkill = { material_id: number; name: string; version: number; size: number; sha256: string; instructions: string; enabled: boolean };
 type ContextPreview = {
+    confirmation_id: string;
     model_id: string;
     response_style: "concise" | "balanced" | "detailed";
     catalog_fetched_at: number | null;
@@ -987,19 +988,20 @@ function App() {
             if (frame) cancelAnimationFrame(frame);
             setBusy(false);
             if (restorePrompt !== undefined) setPrompt(restorePrompt);
+            setContextPreview(null);
             report("runGeneration", reason);
             return false;
         }
     }
 
     function contextSignature() {
-        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false]);
+        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
     }
 
     async function send() {
         const value = prompt.trim();
         const signature = contextSignature();
-        if (!value || busy || !contextPreview || previewSignature !== signature) return;
+        if (!value || busy || !contextPreview?.confirmation_id || previewSignature !== signature) return;
         const tools = contextPreview.project_search_enabled ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
         if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
         if (scheduledDraft && value === scheduledDraft.prompt && (!agentMode || modelId !== "gpt-oss-20b")) {
@@ -1009,7 +1011,7 @@ function App() {
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
         const inputSource = boardInputSource?.text === value ? boardInputSource : null;
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
+        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {confirmationId: contextPreview.confirmation_id, prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
             setScheduledDraft(null);
             clear("send");
             if (inputSource) {
@@ -1152,6 +1154,7 @@ function App() {
     async function checkContext() {
         const request = ++contextRequest.current;
         const signature = contextSignature();
+        setContextPreview(null);
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
             const materialIds = selectedMaterialIds;
@@ -1637,7 +1640,7 @@ function App() {
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview || previewSignature !== JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false])}>Отправить
+                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
                             </button>}
                         </div>
                     </div>
