@@ -32,6 +32,7 @@ type ContextPreview = {
     bytes: number;
     request_bytes: number;
     agent_sources?: AgentSource[];
+    project_search_enabled?: boolean;
     agent_files_read?: string[];
     agent_skill?: AgentSkill | null;
     warning: string
@@ -95,6 +96,12 @@ function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
     const [projects, setProjects] = useState<Project[]>([]);
     const [projectFilter, setProjectFilter] = useState<number | null>(null);
+    const [materialsOpen, setMaterialsOpen] = useState(false);
+    const [materialPreview, setMaterialPreview] = useState<PendingAttachment | null>(null);
+    const materialsTrigger = useRef<HTMLButtonElement>(null);
+    const materialsBack = useRef<HTMLButtonElement>(null);
+    const materialRequest = useRef(0);
+    const [materialsLoading, setMaterialsLoading] = useState(false);
     const [projectMaterials, setProjectMaterials] = useState<ProjectMaterial[]>([]);
     const [projectFolderView, setProjectFolderView] = useState<ProjectFolderView | null>(null);
     const [folderPreview, setFolderPreview] = useState<PendingAttachment | null>(null);
@@ -535,13 +542,22 @@ function App() {
         return () => { current = false; window.clearTimeout(timer); };
     }, [conversationSearch, conversations, projectFilter]);
 
-    const conversationProjectId = conversations.find((item) => item.id === conversationId)?.project_id ?? null;
+    const currentConversation = conversations.find((item) => item.id === conversationId && !item.archived);
+    const conversationProjectId = projects.find((item) => item.id === currentConversation?.project_id && !item.archived)?.id ?? null;
+    const activeMaterialProject = useRef(conversationProjectId);
+    activeMaterialProject.current = conversationProjectId;
     const eligibleSkills = projectMaterials.filter((material) => material.name.toLowerCase().endsWith(".md") && material.size > 0 && material.size <= 16 * 1024);
     useEffect(() => {
         let current = true;
         setSelectedMaterialIds([]);
         setContextPreview(null);
         setFolderPreview(null);
+        setMaterialPreview(null);
+        setMaterialsLoading(false);
+        setMaterialsOpen(false);
+        materialRequest.current++;
+        setProjectMaterials([]);
+        setProjectFolderView(null);
         if (conversationProjectId === null) {
             setProjectMaterials([]);
             setProjectFolderView(null);
@@ -550,11 +566,8 @@ function App() {
         invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
             .then((items) => { if (current) setProjectMaterials(items); })
             .catch((reason) => { if (current) report("materials", reason); });
-        invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
-            .then((folder) => { if (current) setProjectFolderView(folder); })
-            .catch((reason) => { if (current) report("folder", reason); });
         return () => { current = false; };
-    }, [conversationProjectId]);
+    }, [conversationProjectId, conversationId]);
 
     useEffect(() => {
         refreshConversations().then((items) => {
@@ -777,13 +790,54 @@ function App() {
         } catch (reason) { report("moveConversation", reason); }
     }
 
+    async function openMaterials() {
+        if (conversationProjectId === null) return;
+        setMaterialsOpen(true);
+        requestAnimationFrame(() => materialsBack.current?.focus());
+        await refreshMaterials();
+    }
+
+    function closeMaterials() {
+        setMaterialsOpen(false);
+        requestAnimationFrame(() => materialsTrigger.current?.focus());
+    }
+
+    async function refreshMaterials() {
+        if (conversationProjectId === null) return;
+        const request = ++materialRequest.current;
+        setMaterialsLoading(true);
+        setFolderPreview(null);
+        setMaterialPreview(null);
+        const current = () => request === materialRequest.current && conversationId === activeConversation.current && conversationProjectId === activeMaterialProject.current;
+        await Promise.all([
+            invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
+                .then((items) => { if (current()) { setProjectMaterials(items); clear("materials"); } })
+                .catch((reason) => { if (current()) { setProjectMaterials([]); report("materials", reason); } }),
+            invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
+                .then((folder) => { if (current()) { setProjectFolderView(folder); clear("folder"); } })
+                .catch((reason) => { if (current()) { setProjectFolderView(null); report("folder", reason); } })
+        ]);
+        if (current()) setMaterialsLoading(false);
+    }
+
+    async function previewMaterial(materialId: number) {
+        const request = ++materialRequest.current;
+        setMaterialPreview(null);
+        try {
+            const result = await invoke<PendingAttachment>("preview_project_material", {conversationId, materialId});
+            if (request !== materialRequest.current || conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
+            setMaterialPreview(result);
+            clear("previewMaterial");
+        } catch (reason) { if (request === materialRequest.current) report("previewMaterial", reason); }
+    }
+
     async function addProjectMaterial() {
         if (conversationProjectId === null) return;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
             if (!attachment) return;
             const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
             setProjectMaterials((items) => [...items.filter((item) => item.id !== material.id), material]);
             setContextPreview(null);
             clear("addProjectMaterial");
@@ -796,7 +850,7 @@ function App() {
             const chosen = await invoke<string | null>("choose_project_folder", {projectId: conversationProjectId});
             if (!chosen) return;
             const folder = await invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId});
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
             setProjectFolderView(folder);
             setFolderPreview(null);
             clear("chooseProjectFolder");
@@ -805,10 +859,12 @@ function App() {
 
     async function previewProjectFile(relativePath: string) {
         if (conversationProjectId === null) return;
+        const request = ++materialRequest.current;
         try {
             setFolderPreview(null);
             const result = await invoke<PendingAttachment>("preview_project_file", {projectId: conversationProjectId, relativePath});
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
+            if (request !== materialRequest.current) return;
             setFolderPreview(result);
             clear("previewProjectFile");
         } catch (reason) { report("previewProjectFile", reason); }
@@ -820,7 +876,7 @@ function App() {
             const material = await invoke<ProjectMaterial>("save_project_folder_material", {
                 projectId: conversationProjectId, relativePath: folderPreview.name, expectedSha256: folderPreview.sha256
             });
-            if (conversationId !== activeConversation.current) return;
+            if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
             setProjectMaterials((items) => [...items, material]);
             setFolderPreview(null);
             clear("saveFolderPreview");
@@ -944,7 +1000,7 @@ function App() {
         const value = prompt.trim();
         const signature = contextSignature();
         if (!value || busy || !contextPreview || previewSignature !== signature) return;
-        const tools = conversationProjectId !== null && projectFolderView ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
+        const tools = contextPreview.project_search_enabled ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
         if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
         if (scheduledDraft && value === scheduledDraft.prompt && (!agentMode || modelId !== "gpt-oss-20b")) {
             report("send", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
@@ -1266,9 +1322,56 @@ function App() {
                         {projects.filter((item) => !item.archived || item.id === selectedConversation?.project_id)
                             .map((item) => <option key={item.id} value={item.id}>{item.title}{item.archived ? " (архив)" : ""}</option>)}
                     </select>
+                    {conversationProjectId !== null && <button ref={materialsTrigger} type="button" className="secondary-button" aria-expanded={materialsOpen}
+                            onClick={() => materialsOpen ? closeMaterials() : void openMaterials()}>Материалы</button>}
                     <button ref={compactSettingsButton} type="button" className="secondary-button compact-settings"
                             onClick={() => setSettingsOpen(true)}>Настройки</button>
                 </header>
+                    {materialsOpen && conversationProjectId !== null && <section className="project-materials" aria-label="Материалы проекта">
+                        <div className="project-materials-heading"><button ref={materialsBack} type="button" className="secondary-button" onClick={closeMaterials}>Назад к беседе</button><button type="button" className="secondary-button" disabled={materialsLoading || busy} onClick={() => void refreshMaterials()}>Обновить материалы</button></div>
+                        <h2>{projects.find((item) => item.id === conversationProjectId)?.title} · Материалы</h2>
+                        <p>Выберите версии для следующего запроса. Вместе с вложениями — не больше пяти. Добавление в библиотеку само по себе ничего не отправляет.</p>
+                        {operationErrors("attachment")}
+                        {materialsLoading && <p role="status">Загрузка материалов…</p>}
+                        <div className="project-materials-heading">
+                            <h3>Библиотека версий</h3>
+                            <button type="button" className="secondary-button" disabled={busy || materialsLoading}
+                                    onClick={() => void addProjectMaterial()}>Добавить материал</button>
+                        </div>
+                        <div className="project-folder-heading">
+                            <span>{projectFolderView ? `Папка: ${projectFolderView.folder_name} · только первый уровень · максимум ${projectFolderView.max_entries} элементов, ${Math.round(projectFolderView.max_file_bytes / 1024)} КБ на файл` : "Папка проекта не выбрана"}</span>
+                            <button type="button" className="secondary-button" disabled={busy || materialsLoading} onClick={() => void chooseProjectFolder()}>
+                                {projectFolderView ? "Сменить папку" : "Выбрать папку"}
+                            </button>
+                        </div>
+                        {projectFolderView?.files.map((file) => <div className="project-folder-file" key={file.relative_path}>
+                            <span>{file.relative_path} · {file.size === null ? "размер неизвестен" : `${file.size} Б`}{file.blocked_reason ? ` · ${file.blocked_reason}` : ""}</span>
+                            {file.blocked_reason === null && <button type="button" className="secondary-button" disabled={busy || materialsLoading}
+                                    onClick={() => void previewProjectFile(file.relative_path)}>Просмотр</button>}
+                        </div>)}
+                        {projectFolderView && !projectFolderView.files.length && <p>Поддерживаемых файлов в корне папки нет.</p>}
+                        {folderPreview && <details open className="folder-preview">
+                            <summary>{folderPreview.name} · {folderPreview.size} Б · SHA-256 {folderPreview.sha256}</summary>
+                            <pre>{folderPreview.preview}</pre>
+                            <button type="button" className="secondary-button" disabled={busy || materialsLoading} onClick={() => void saveFolderPreview()}>
+                                Добавить эту версию в материалы
+                            </button>
+                        </details>}
+                        {projectMaterials.map((material) => <div className="project-material" key={material.id}><label>
+                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || materialsLoading || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
+                                   onChange={(event) => {
+                                       setSelectedMaterialIds((ids) => event.target.checked ? (pendingAttachments.length + ids.length < 5 && !ids.includes(material.id) ? [...ids, material.id] : ids) : ids.filter((id) => id !== material.id));
+                                       setContextPreview(null);
+                                   }}/>
+                            <span>{material.name} · версия {material.version} · {material.size} Б · SHA-256 {material.sha256}</span>
+                        </label><button type="button" className="secondary-button" disabled={busy || materialsLoading} onClick={() => void previewMaterial(material.id)}>Просмотр {material.name} · версия {material.version}</button></div>)}
+                        {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
+                        {materialPreview && <section className="folder-preview" aria-label="Сохранённая версия">
+                            <h3>{materialPreview.name}</h3><p>{materialPreview.size} Б · SHA-256 {materialPreview.sha256}</p>
+                            <pre>{materialPreview.preview}</pre>
+                        </section>}
+                    </section>}
+                <div className="conversation-view" hidden={materialsOpen}>
                 {openedScheduledResult && <section className="scheduled-task-notice" role="region" aria-label="Результат агентной задачи" id="scheduled-task-result">
                     <strong>Результат задачи: {openedScheduledResult.title}</strong>
                     <p className="scheduled-result-content">{openedScheduledResult.content || "Ответ завершён без текста."}</p>
@@ -1379,6 +1482,15 @@ function App() {
                     void send();
                 }}>
                     {operationErrors("attachment")}
+                    {selectedMaterialIds.length > 0 && <div className="selected-materials" aria-label="Выбранные версии">
+                        <strong>В следующий запрос: {selectedMaterialIds.length} · всего файлов {pendingAttachments.length + selectedMaterialIds.length}/5</strong>
+                        {selectedMaterialIds.map((id) => { const material = projectMaterials.find((item) => item.id === id); return <div key={id}>
+                            <span>{material ? `${material.name} · версия ${material.version} · ${material.size} Б` : "Материал недоступен"}</span>
+                            <button type="button" className="secondary-button" disabled={busy} aria-label={`Убрать ${material?.name ?? "материал"} · версия ${material?.version ?? id}`}
+                                    onClick={() => { setSelectedMaterialIds((ids) => ids.filter((item) => item !== id)); setContextPreview(null); }}>Убрать</button>
+                        </div>; })}
+                        <button type="button" className="secondary-button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>
+                    </div>}
                     {captureNotice && <p role="status">{captureNotice}</p>}
                     {operationErrors("artifact")}
                     <label className="sr-only" htmlFor="prompt">Сообщение</label>
@@ -1449,41 +1561,7 @@ function App() {
                             </div>
                         ))}
                     </div>
-                    {conversationProjectId !== null && <div className="project-materials">
-                        <div className="project-materials-heading">
-                            <strong>Материалы проекта</strong>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                                    onClick={() => void addProjectMaterial()}>Добавить материал</button>
-                        </div>
-                        <div className="project-folder-heading">
-                            <span>{projectFolderView ? `Папка: ${projectFolderView.folder_name} · только первый уровень · максимум ${projectFolderView.max_entries} элементов, ${Math.round(projectFolderView.max_file_bytes / 1024)} КБ на файл` : "Папка проекта не выбрана"}</span>
-                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void chooseProjectFolder()}>
-                                {projectFolderView ? "Сменить папку" : "Выбрать папку"}
-                            </button>
-                        </div>
-                        {projectFolderView?.files.map((file) => <div className="project-folder-file" key={file.relative_path}>
-                            <span>{file.relative_path} · {file.size === null ? "размер неизвестен" : `${file.size} Б`}{file.blocked_reason ? ` · ${file.blocked_reason}` : ""}</span>
-                            {file.blocked_reason === null && <button type="button" className="secondary-button" disabled={busy}
-                                    onClick={() => void previewProjectFile(file.relative_path)}>Просмотр</button>}
-                        </div>)}
-                        {projectFolderView && !projectFolderView.files.length && <p>Поддерживаемых файлов в корне папки нет.</p>}
-                        {folderPreview && <details open className="folder-preview">
-                            <summary>{folderPreview.name} · {folderPreview.size} Б · SHA-256 {folderPreview.sha256}</summary>
-                            <pre>{folderPreview.preview}</pre>
-                            <button type="button" className="secondary-button" disabled={busy} onClick={() => void saveFolderPreview()}>
-                                Добавить эту версию в материалы
-                            </button>
-                        </details>}
-                        {projectMaterials.map((material) => <label className="project-material" key={material.id}>
-                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
-                                   onChange={(event) => {
-                                       setSelectedMaterialIds((ids) => event.target.checked ? [...ids, material.id] : ids.filter((id) => id !== material.id));
-                                       setContextPreview(null);
-                                   }}/>
-                            <span>{material.name} · версия {material.version} · {material.size} Б · SHA-256 {material.sha256.slice(0, 12)}…</span>
-                        </label>)}
-                        {!projectMaterials.length && <p>В проекте пока нет материалов.</p>}
-                        <div className="agent-skill-picker">
+                    {conversationProjectId !== null && <div className="agent-skill-picker">
                             <h3>Локальный навык</h3>
                             <p>Выберите Markdown-материал этого проекта. Инструкция попадёт только в агентный запрос после явного включения; навык не добавляет доступ к файлам, командам или сети.</p>
                             <label htmlFor="agent-skill-source">Источник</label>
@@ -1502,7 +1580,6 @@ function App() {
                                 <pre>{agentSkill.instructions}</pre>
                             </details>}
                             {!eligibleSkills.length && <small>В библиотеке проекта нет Markdown-файлов до 16 КиБ.</small>}
-                        </div>
                     </div>}
                     {contextPreview && <details open className="context-preview">
                         <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
@@ -1532,7 +1609,7 @@ function App() {
                                     setAgentMode(event.target.checked);
                                     setContextPreview(null);
                                 }}/>
-                                Агентный режим · калькулятор{conversationProjectId !== null && projectFolderView ? " и поиск по папке" : ""}
+                                Агентный режим · калькулятор{conversationProjectId !== null ? "; поиск при подключённой папке" : ""}
                             </label>
                             <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
                                     onClick={() => void pickAttachment()}>Прикрепить файл</button>
@@ -1676,6 +1753,7 @@ function App() {
                         </button>
                     </div>}
                 </details>
+                </div>
                 </div>
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}

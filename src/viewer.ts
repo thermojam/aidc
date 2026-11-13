@@ -15,6 +15,7 @@ Promise.allSettled([
     invoke("save_project_material", {projectId: 1, attachmentId: 1}),
     invoke("choose_project_folder", {projectId: 1}),
     invoke("list_project_folder", {projectId: 1}),
+    invoke("preview_project_material", {conversationId: 1, materialId: 1}),
     invoke("preview_project_file", {projectId: 1, relativePath: "README.md"}),
     invoke("save_project_folder_material", {projectId: 1, relativePath: "README.md", expectedSha256: "invalid"}),
     invoke("create_conversation"),
@@ -62,6 +63,6 @@ Promise.allSettled([
     invoke("export_artifact", {id: 1}),
 ]).then((calls) => {
     result.textContent = calls.every((call) => call.status === "rejected" && /not allowed|explicitly denied/i.test(String(call.reason)))
-        ? "PASS: все пятьдесят одна команда отклонены"
+        ? `PASS: все команды (${calls.length}) отклонены`
         : "FAIL: хотя бы одна команда доступна";
 });

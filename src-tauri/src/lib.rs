@@ -134,6 +134,8 @@ struct ContextPreview {
     #[serde(default)]
     agent_sources: Vec<AgentSource>,
     #[serde(default)]
+    project_search_enabled: bool,
+    #[serde(default)]
     agent_files_read: Vec<String>,
     #[serde(default)]
     agent_skill: Option<AgentSkill>,
@@ -1599,6 +1601,13 @@ fn list_project_materials(project_id: i64, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+fn preview_project_material(conversation_id: i64, material_id: i64, state: State<'_, AppState>) -> Result<AttachmentPreview, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    let materials = selected_project_materials(&db, conversation_id, &[material_id])?;
+    Ok(attachment_preview(&materials[0]))
+}
+
+#[tauri::command]
 fn save_project_material(project_id: i64, attachment_id: i64, state: State<'_, AppState>) -> Result<ProjectMaterialSummary, String> {
     let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
     let Some(index) = drafts.iter().position(|draft| draft.id == attachment_id) else { return Err("Выбранный файл не найден".into()); };
@@ -2333,6 +2342,7 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
         output_rubles_per_million: model.and_then(|model| model.output_rubles_per_million),
         messages, omitted_exchanges, bytes, request_bytes: 0,
         agent_sources: Vec::new(),
+        project_search_enabled: false,
         agent_files_read: Vec::new(),
         agent_skill: None,
         warning: "Предел контекста и токенизатор не подтверждены; размер в байтах не гарантирует, что запрос поместится в модель.".into(),
@@ -2381,6 +2391,7 @@ fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64
         "SELECT EXISTS(SELECT 1 FROM conversations c JOIN project_folders f ON f.project_id=c.project_id WHERE c.id=?1 AND c.archived=0)",
         [conversation_id], |row| row.get::<_, bool>(0),
     ).map_err(|_| "Не удалось проверить папку проекта")?;
+    preview.project_search_enabled = project_search_enabled;
     preview.request_bytes = serde_json::to_vec(&with_agent_tools(chat_payload(&db, &preview, Some((prompt, &selected)) )?, agent_mode, project_search_enabled)?)
         .map_err(|_| "Не удалось собрать запрос")?.len();
     Ok(preview)
@@ -2842,7 +2853,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
