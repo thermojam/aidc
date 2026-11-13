@@ -1,4 +1,4 @@
-import {useRef, useState, type ReactNode, type RefObject} from "react";
+import {useRef, useState, type ReactNode, type RefObject, type MouseEvent} from "react";
 import {Dialog, DialogContent, DialogTitle} from "./components/ui/dialog";
 import {Button} from "./components/ui/button";
 import ShellIcon from "./ShellIcon";
@@ -32,14 +32,17 @@ export default function ProjectSidebar(props: Props) {
     const archived = filtered.filter((item) => item.archived);
     const recent = props.recentIds.map((id) => props.conversations.find((item) => item.id === id && !item.archived)).filter((item) => item !== undefined).slice(0, 10);
     function showMenu(next: Target, trigger: HTMLElement) { menuTrigger.current = trigger; setTarget(next); }
+    function contextMenu(event: MouseEvent<HTMLDivElement>, next: Target) {
+        event.preventDefault();
+        const button = event.currentTarget.querySelector<HTMLButtonElement>(".navigation-menu");
+        if (button) showMenu(next, button);
+    }
     function toggleProject(id: number) {
         const next = collapsed.includes(id) ? collapsed.filter((value) => value !== id) : [...collapsed, id];
         setCollapsed(next); localStorage.setItem("navigation.collapsed", JSON.stringify(next));
     }
     function row(item: Conversation) {
-        return <div className="navigation-row" key={item.id} onContextMenu={(event) => {
-            event.preventDefault(); showMenu({kind: "conversation", item}, event.currentTarget.querySelector<HTMLButtonElement>(".navigation-menu")!);
-        }}>
+        return <div className="navigation-row" key={item.id} onContextMenu={(event) => contextMenu(event, {kind: "conversation", item})}>
             <button type="button" className="navigation-title" title={item.title} aria-current={item.id === props.selectedId ? "page" : undefined}
                     disabled={props.busy || item.archived} onClick={() => props.onSelect(item.id)}>
                 <ShellIcon name="chat"/><span>{item.pinned ? "Закреплено · " : ""}{item.title}</span>
@@ -61,7 +64,7 @@ export default function ProjectSidebar(props: Props) {
             {!!recent.length && !props.query.trim() && props.projectFilter === null && <section aria-label="Недавние беседы"><h2>Недавние</h2>{recent.map(row)}</section>}
             <div className="navigation-section-heading"><h2>Проекты</h2><button type="button" className="secondary-button" onClick={props.onNewProject}>Создать</button></div>
             {activeProjects.filter((project) => props.projectFilter === null || props.projectFilter === project.id).map((project) => <section key={project.id}>
-                <div className="navigation-row" onContextMenu={(event) => { event.preventDefault(); showMenu({kind: "project", item: project}, event.currentTarget.querySelector<HTMLButtonElement>(".navigation-menu")!); }}>
+                <div className="navigation-row" onContextMenu={(event) => contextMenu(event, {kind: "project", item: project})}>
                     <button type="button" className="navigation-title" aria-expanded={!collapsed.includes(project.id)} title={project.title} onClick={() => toggleProject(project.id)}><ShellIcon name="folder"/><span>{project.title}</span><span aria-hidden="true">{collapsed.includes(project.id) ? "›" : "⌄"}</span></button>
                     <button type="button" className="navigation-menu" aria-label={`Действия проекта ${project.title}`} onClick={(event) => showMenu({kind: "project", item: project}, event.currentTarget)}><ShellIcon name="more"/></button>
                 </div>
@@ -72,8 +75,8 @@ export default function ProjectSidebar(props: Props) {
             {(props.projectFilter === null || props.projectFilter === 0) && <section aria-label="Беседы без проекта"><h2>Без проекта</h2>{active.filter((item) => item.project_id === null).map(row)}</section>}
             {!filtered.length && (props.projectFilter === 0 || !activeProjects.length) && <p className="sidebar-empty">{props.query.trim() ? "Ничего не найдено" : "Пока нет бесед"}</p>}
             {!!archived.length && <details open={!!props.query.trim()}><summary>Архив бесед</summary>{archived.map(row)}</details>}
-            {props.projects.some((item) => item.archived) && <details><summary>Архив проектов</summary>{props.projects.filter((item) => item.archived).map((item) => <section key={item.id}>
-                <div className="navigation-row" onContextMenu={(event) => { event.preventDefault(); showMenu({kind: "project", item}, event.currentTarget.querySelector<HTMLButtonElement>(".navigation-menu")!); }}>
+            {props.projects.some((item) => item.archived) && <details open={!!props.query.trim()}><summary>Архив проектов</summary>{props.projects.filter((item) => item.archived).map((item) => <section key={item.id}>
+                <div className="navigation-row" onContextMenu={(event) => contextMenu(event, {kind: "project", item})}>
                     <span className="archived-project-title">{item.title}</span><button type="button" className="navigation-menu" aria-label={`Действия проекта ${item.title}`} onClick={(event) => showMenu({kind: "project", item}, event.currentTarget)}><ShellIcon name="more"/></button>
                 </div>{active.filter((conversation) => conversation.project_id === item.id).map(row)}
             </section>)}</details>}

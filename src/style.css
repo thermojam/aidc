@@ -95,8 +95,8 @@ button, select {
     overflow: hidden;
 }
 .app-shell.navigation-open { grid-template-columns: 48px var(--navigation-width) minmax(0, 1fr); }
-.app-shell.with-artifact.artifact-side { grid-template-columns: 48px minmax(560px, 1fr) minmax(360px, 36%); }
-.app-shell.navigation-open.with-artifact.artifact-side { grid-template-columns: 48px var(--navigation-width) minmax(560px, 1fr) minmax(360px, 36%); }
+.app-shell.with-artifact.artifact-side { grid-template-columns: 48px minmax(560px, 1fr) minmax(360px, 0.65fr); }
+.app-shell.navigation-open.with-artifact.artifact-side { grid-template-columns: 48px var(--navigation-width) minmax(560px, 1fr) minmax(360px, 0.65fr); }
 .with-artifact:not(.artifact-side) .chat-panel { display: none; }
 .compact-only { display: none; }
 .with-artifact:not(.artifact-side) .compact-only { display: inline-block; }
@@ -128,12 +128,10 @@ button, select {
 .archived-project-title { min-width: 0; overflow-wrap: anywhere; flex: 1; }
 .navigation-resizer { position: absolute; top: 0; bottom: 0; right: -3px; width: 6px; cursor: col-resize; touch-action: none; z-index: 1; }
 .navigation-resizer:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-.navigation-actions { display: grid; gap: 12px; padding: 16px; }
 .navigation-actions h2 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
 .navigation-actions label, .rename-form { display: grid; gap: 8px; min-width: 0; }
 .navigation-actions select, .rename-form input { width: 100%; min-width: 0; box-sizing: border-box; }
 .rename-form input { padding: 6px 8px; background: var(--field); color: var(--text); border: 1px solid var(--control-border); }
-.navigation-sheet { display: flex; flex-direction: column; top: 0; left: 48px; width: min(320px, calc(100% - 48px)); height: 100dvh; max-height: 100dvh; transform: none; border-radius: 0; overflow: hidden; }
 .sheet-settings { margin: auto 12px 12px; flex-shrink: 0; }
 .compact-settings { display: none; }
 .legacy-tools { flex: 0 1 auto; max-height: 30%; overflow: auto; min-height: 40px; }
@@ -882,7 +880,6 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-
     .app-dock { display: none; }
     .compact-settings { display: inline-block; margin-left: auto; }
     .conversation-project { max-width: 110px; }
-    .navigation-sheet { left: 0; width: min(320px, 100%); }
 }
 
 @media (max-width: 700px) {
@@ -937,3 +934,10 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-
     font: 13px/18px system-ui, sans-serif;
 }
 .operation-toast-content button { flex-shrink: 0; margin-inline-start: auto; }
+
+/* Override the shared dialog geometry for the navigation Sheet and menus. */
+.navigation-actions { display: grid; gap: 12px; padding: 16px; }
+.navigation-sheet { display: flex; flex-direction: column; top: 0; left: 48px; width: min(320px, calc(100% - 48px)); height: 100dvh; max-height: 100dvh; border-radius: 0; overflow: hidden; }
+@media (max-width: 639px) {
+    .navigation-sheet { left: 0; width: min(320px, 100%); }
+}

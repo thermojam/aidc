@@ -1221,7 +1221,7 @@ function App() {
               style={{"--navigation-width": `${navigation.width}px`} as React.CSSProperties}>
             <nav className="app-dock" aria-label="Разделы приложения">
                 <button type="button" className="dock-button dock-current" aria-label="Беседы" aria-current="page" title="Беседы · ⌘B / Ctrl+B"
-                        onClick={() => navigation.setOpen(!navigation.open)}><ShellIcon name="chat"/></button>
+                        onClick={(event) => navigation.setOpen(!navigation.open, event.currentTarget)}><ShellIcon name="chat"/></button>
                 <button ref={settingsButton} type="button" className="dock-button dock-settings" aria-label="Настройки" title="Настройки"
                         onClick={() => setSettingsOpen(true)}><ShellIcon name="settings"/></button>
             </nav>
@@ -1238,9 +1238,9 @@ function App() {
                      onPointerUp={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}/>
             </aside>}
             <Dialog open={navigation.modal && navigation.open} onOpenChange={navigation.setOpen}>
-                <DialogContent className="navigation-sheet" aria-describedby={undefined}
+                <DialogContent className="navigation-sheet top-0 left-12 translate-x-0 translate-y-0" aria-describedby={undefined}
                                onOpenAutoFocus={(event) => { event.preventDefault(); chatSearchField.current?.focus(); }}
-                               onCloseAutoFocus={(event) => { event.preventDefault(); navigation.trigger.current?.focus(); }}>
+                               onCloseAutoFocus={(event) => { event.preventDefault(); navigation.restoreFocus(); }}>
                     <div className="navigation-heading"><DialogTitle>Беседы</DialogTitle><button type="button" className="navigation-menu" aria-label="Закрыть навигацию" onClick={() => navigation.setOpen(false)}><ShellIcon name="close"/></button></div>
                     {navigation.modal && sidebar}
                     <button type="button" className="secondary-button sheet-settings" onClick={() => { navigation.setOpen(false); setSettingsOpen(true); }}>Настройки</button>
@@ -1258,7 +1258,7 @@ function App() {
             <section className="chat-panel" aria-label={selectedConversation?.title ?? "Беседа"}>
                 <header className="chat-header">
                     <button ref={navigation.trigger} type="button" className="navigation-menu navigation-toggle" aria-label="Открыть навигацию" aria-expanded={navigation.open} title="Навигация · ⌘B / Ctrl+B"
-                            onClick={() => navigation.setOpen(!navigation.open)}><ShellIcon name="panel"/></button>
+                            onClick={(event) => navigation.setOpen(!navigation.open, event.currentTarget)}><ShellIcon name="panel"/></button>
                     <h1>{selectedConversation?.title ?? "Беседа"}</h1>
                     <select className="conversation-project" aria-label="Проект беседы" value={selectedConversation?.project_id ?? 0}
                             disabled={busy || !selectedConversation} onChange={(event) => void moveConversation(Number(event.target.value) || null)}>
