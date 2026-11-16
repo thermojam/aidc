@@ -11,7 +11,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use tauri::{ipc::Channel, Manager, State};
+use tauri::{ipc::Channel, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 type Db = Arc<Mutex<Connection>>;
@@ -67,6 +67,8 @@ struct AppState {
     key_lock: Mutex<()>,
     key_service: String,
     drafts: Mutex<Vec<PendingAttachment>>,
+    dropped_files: Mutex<BTreeMap<u64, Vec<PathBuf>>>,
+    drop_sequence: AtomicU64,
     catalog_request: AtomicU64,
     checked_context: Mutex<Option<(String, Vec<u8>)>>,
 }
@@ -242,6 +244,13 @@ struct AttachmentPreview {
     size: usize,
     sha256: String,
     preview: String,
+}
+
+#[derive(Serialize)]
+struct DroppedFileResult {
+    name: String,
+    attachment: Option<AttachmentPreview>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -994,6 +1003,42 @@ fn attachment_preview(draft: &PendingAttachment) -> AttachmentPreview {
     }
 }
 
+fn add_attachment(drafts: &mut Vec<PendingAttachment>, draft: PendingAttachment) -> Result<AttachmentPreview, String> {
+    if drafts.iter().any(|existing| existing.name == draft.name && existing.content == draft.content) {
+        return Err("Этот файл уже добавлен".into());
+    }
+    let preview = attachment_preview(&draft);
+    drafts.push(draft);
+    Ok(preview)
+}
+
+#[tauri::command]
+async fn accept_dropped_files(sequence: u64, slots: usize, state: State<'_, AppState>) -> Result<Vec<DroppedFileResult>, String> {
+    let paths = {
+        let mut pending = state.dropped_files.lock().map_err(|_| "Список файлов занят")?;
+        pending.remove(&sequence).ok_or("Перетаскивание уже обработано")?
+    };
+    let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
+    let mut remaining = slots.min(5usize.saturating_sub(drafts.len()));
+    Ok(paths.into_iter().map(|path| {
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("Неизвестный файл").to_owned();
+        let result = if remaining == 0 { Err("Можно выбрать не больше пяти файлов и материалов".into()) }
+        else if path.is_dir() { Err("Папки не поддерживаются. Выберите отдельные файлы".into()) }
+        else {
+            let id = drafts.last().map_or(1, |draft| draft.id + 1);
+            let extension = path.extension().and_then(|part| part.to_str()).unwrap_or("").to_ascii_lowercase();
+            let draft = if ["png", "jpg", "jpeg", "webp"].contains(&extension.as_str()) {
+                prepare_image_attachment(&path, id)
+            } else { prepare_attachment(&path, id) };
+            draft.and_then(|draft| add_attachment(&mut drafts, draft))
+        };
+        match result {
+            Ok(attachment) => { remaining -= 1; DroppedFileResult { name, attachment: Some(attachment), error: None } }
+            Err(error) => DroppedFileResult { name, attachment: None, error: Some(error) },
+        }
+    }).collect())
+}
+
 fn supports_image_input(model_id: &str) -> bool { model_id == "gpt-6-luna" }
 
 fn is_supported_image_mime(mime: &str) -> bool { ["image/png", "image/jpeg", "image/webp"].contains(&mime) }
@@ -1289,16 +1334,18 @@ async fn transcribe_audio(model_id: String, audio_base64: String, mime_type: Str
 }
 
 #[tauri::command]
-async fn pick_text_attachment(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Option<AttachmentPreview>, String> {
+async fn pick_text_attachment(app: tauri::AppHandle, state: State<'_, AppState>, allow_duplicate: Option<bool>) -> Result<Option<AttachmentPreview>, String> {
     let Some(path) = app.dialog().file().blocking_pick_file() else { return Ok(None); };
     let path = path.into_path().map_err(|_| "Выберите локальный файл")?;
     let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
     if drafts.len() >= 5 { return Err("Можно выбрать не больше пяти файлов".into()); }
     let id = drafts.last().map_or(1, |draft| draft.id + 1);
     let draft = prepare_attachment(&path, id)?;
-    let preview = attachment_preview(&draft);
-    drafts.push(draft);
-    Ok(Some(preview))
+    if allow_duplicate.unwrap_or(false) {
+        let preview = attachment_preview(&draft);
+        drafts.push(draft);
+        Ok(Some(preview))
+    } else { Ok(Some(add_attachment(&mut drafts, draft)?)) }
 }
 
 #[tauri::command]
@@ -1310,9 +1357,7 @@ async fn pick_image_attachment(app: tauri::AppHandle, state: State<'_, AppState>
     if drafts.iter().filter(|draft| draft.mime.starts_with("image/")).count() >= 8 { return Err("В одном запросе можно использовать не больше восьми изображений".into()); }
     let id = drafts.last().map_or(1, |draft| draft.id + 1);
     let draft = prepare_image_attachment(&path, id)?;
-    let preview = attachment_preview(&draft);
-    drafts.push(draft);
-    Ok(Some(preview))
+    Ok(Some(add_attachment(&mut drafts, draft)?))
 }
 
 #[tauri::command]
@@ -2924,12 +2969,27 @@ pub fn run() {
                 key_lock: Mutex::new(()),
                 key_service: app.config().identifier.clone(),
                 drafts: Mutex::new(Vec::new()),
+                dropped_files: Mutex::new(BTreeMap::new()),
+                drop_sequence: AtomicU64::new(0),
                 catalog_request: AtomicU64::new(0),
                 checked_context: Mutex::new(None),
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .on_webview_event(|webview, event| {
+            if webview.label() != "main" { return; }
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
+                let state = webview.state::<AppState>();
+                let sequence = state.drop_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+                let names: Vec<_> = paths.iter().map(|path| path.file_name().and_then(|name| name.to_str()).unwrap_or("Неизвестный файл").to_owned()).collect();
+                if let Ok(mut pending) = state.dropped_files.lock() {
+                    if pending.len() >= 64 { pending.pop_first(); }
+                    pending.insert(sequence, paths.clone());
+                    let _ = webview.emit("attachment-drop", serde_json::json!({"sequence": sequence, "x": position.x, "y": position.y, "names": names}));
+                };
+            }
+        })
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, accept_dropped_files, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -2944,7 +3004,7 @@ mod tests {
         AppState {
             db: Arc::new(Mutex::new(db)), active: Arc::new(Mutex::new(None)),
             key_lock: Mutex::new(()), key_service: "synthetic-context-test".into(),
-            drafts: Mutex::new(Vec::new()), catalog_request: AtomicU64::new(0),
+            drafts: Mutex::new(Vec::new()), dropped_files: Mutex::new(BTreeMap::new()), drop_sequence: AtomicU64::new(0), catalog_request: AtomicU64::new(0),
             checked_context: Mutex::new(None),
         }
     }

@@ -138,10 +138,15 @@ button, select {
 .chat-panel { min-width: 0; min-height: 0; overflow: hidden; }
 
 .chat-panel {
+    position: relative;
     display: flex;
     flex-direction: column;
     background: var(--canvas);
 }
+
+.chat-panel.file-dragging { outline: 2px solid var(--accent); outline-offset: -3px; }
+.file-drop-hint { position: absolute; z-index: 10; inset: 48px 12px auto; padding: 12px; border: 1px solid var(--border); background: var(--canvas); text-align: center; pointer-events: none; }
+.file-drop-results { max-height: 120px; overflow: auto; }
 
 .chat-header {
     display: flex;

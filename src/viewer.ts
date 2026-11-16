@@ -42,6 +42,7 @@ Promise.allSettled([
     invoke("list_backups"),
     invoke("restore_backup", {name: "history-missing.sqlite"}),
     invoke("pick_text_attachment"),
+    invoke("accept_dropped_files", {sequence: 1, slots: 5}),
     invoke("pick_image_attachment"),
     invoke("capture_window_snapshot"),
     invoke("add_captured_snapshot", {dataUrl: "invalid"}),

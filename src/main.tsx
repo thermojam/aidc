@@ -2,6 +2,8 @@ import {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {Channel, invoke} from "@tauri-apps/api/core";
 import {getCurrentWindow} from "@tauri-apps/api/window";
+import {getCurrentWebview} from "@tauri-apps/api/webview";
+import {listen} from "@tauri-apps/api/event";
 import {isPermissionGranted, onAction, requestPermission, sendNotification} from "@tauri-apps/plugin-notification";
 import MarkdownMessage from "./MarkdownMessage";
 import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
@@ -19,6 +21,7 @@ import "./style.css";
 type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
 type Attachment = { message_id: number; name: string; mime: string; size: number; sha256: string };
 type PendingAttachment = { id: number; name: string; mime: string; size: number; sha256: string; preview: string };
+type DropResult = {name: string; attachment: PendingAttachment | null; error: string | null};
 type ContextMessage = { role: string; content: string; source_message_id: number | null; attachment_ids: number[] };
 type AgentSource = { relative_path: string; line: number; excerpt: string };
 type AgentSkill = { material_id: number; name: string; version: number; size: number; sha256: string; instructions: string; enabled: boolean };
@@ -135,6 +138,14 @@ function App() {
     const [backups, setBackups] = useState<string[]>([]);
     const [selectedBackup, setSelectedBackup] = useState("");
     const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+    const [draggingFiles, setDraggingFiles] = useState(false);
+    const [dropResults, setDropResults] = useState<{batch: number; name: string; status: string}[]>([]);
+    const [dropLoading, setDropLoading] = useState(false);
+    const dropBusy = useRef(false);
+    const pickerBusy = useRef(false);
+    const chatPanel = useRef<HTMLElement>(null);
+    const dropState = useRef({busy, conversationId, slots: 5});
+    dropState.current = {busy: busy || materialsOpen, conversationId, slots: Math.max(0, 5 - pendingAttachments.length - selectedMaterialIds.length)};
     const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
     const [categories, setCategories] = useState<ModelCategory[]>([]);
 
@@ -238,6 +249,50 @@ function App() {
         media.addEventListener("change", applyTheme);
         return () => media.removeEventListener("change", applyTheme);
     }, [theme]);
+
+    useEffect(() => {
+        let disposed = false;
+        const cleanups: (() => void)[] = [];
+        const register = (promise: Promise<() => void>) => void promise.then((unlisten) => disposed ? unlisten() : cleanups.push(unlisten));
+        const inChat = (x: number, y: number) => {
+            const rect = chatPanel.current?.getBoundingClientRect();
+            const scale = window.devicePixelRatio;
+            return !!rect && x / scale >= rect.left && x / scale < rect.right && y / scale >= rect.top && y / scale < rect.bottom;
+        };
+        register(getCurrentWebview().onDragDropEvent(({payload}) => {
+            if (payload.type === "leave" || payload.type === "drop") setDraggingFiles(false);
+            else setDraggingFiles(inChat(payload.position.x, payload.position.y));
+        }));
+        register(listen<{sequence: number; x: number; y: number; names: string[]}>("attachment-drop", async ({payload}) => {
+            if (!inChat(payload.x, payload.y) || dropState.current.busy || dropBusy.current || pickerBusy.current) {
+                if (inChat(payload.x, payload.y)) setDropResults((current) => [...current, ...payload.names.map((name) => ({batch: payload.sequence, name, status: "Дождитесь завершения текущего действия и повторите"}))]);
+                void invoke("accept_dropped_files", {sequence: payload.sequence, slots: 0}).catch(() => {});
+                return;
+            }
+            dropBusy.current = true;
+            setDropLoading(true);
+            setDropResults(payload.names.map((name) => ({batch: payload.sequence, name, status: "Проверка…"})));
+            setContextPreview(null);
+            const {conversationId: target, slots} = dropState.current;
+            try {
+                const results = await invoke<DropResult[]>("accept_dropped_files", {sequence: payload.sequence, slots});
+                const attachments = results.flatMap((item) => item.attachment ? [item.attachment] : []);
+                if (disposed || target !== activeConversation.current) {
+                    await Promise.all(attachments.map((item) => invoke("remove_text_attachment", {id: item.id})));
+                } else {
+                    setPendingAttachments((current) => [...current, ...attachments]);
+                    setContextPreview(null);
+                    setDropResults((current) => [...results.map((item) => ({batch: payload.sequence, name: item.name, status: item.error ?? "Добавлен"})), ...current.filter((item) => item.batch !== payload.sequence)]);
+                }
+            } catch {
+                if (!disposed) setDropResults((current) => [...payload.names.map((name) => ({batch: payload.sequence, name, status: "Не удалось проверить файл"})), ...current.filter((item) => item.batch !== payload.sequence)]);
+            } finally {
+                dropBusy.current = false;
+                if (!disposed) setDropLoading(false);
+            }
+        }));
+        return () => { disposed = true; cleanups.forEach((unlisten) => unlisten()); };
+    }, []);
 
     useEffect(() => {
         if (paletteOpen) {
@@ -729,7 +784,7 @@ function App() {
     }, [conversationId]);
 
     async function switchConversation(id: number, discardConfirmed = false) {
-        if (busy) return false;
+        if (busy || dropBusy.current) return false;
         if (id === conversationId) { if (navigation.modal) navigation.setOpen(false); return true; }
         if (!discardConfirmed && (prompt.trim() || pendingAttachments.length) && !window.confirm("Перейти в другую беседу? Черновик и выбранные файлы будут убраны.")) return false;
         const request = ++navigationRequest.current;
@@ -737,6 +792,7 @@ function App() {
             for (const attachment of pendingAttachments) await invoke("remove_text_attachment", {id: attachment.id});
             if (request !== navigationRequest.current) return false;
             setPendingAttachments([]);
+            setDropResults([]);
             setPrompt("");
             setScheduledDraft(null);
             setCaptureNotice("");
@@ -755,7 +811,7 @@ function App() {
     }
 
     async function createConversation() {
-        if (busy) return;
+        if (busy || dropBusy.current) return;
         if ((prompt.trim() || pendingAttachments.length) && !window.confirm("Создать беседу? Черновик и выбранные файлы будут убраны.")) return;
         try {
             const id = await invoke<number>("create_conversation");
@@ -889,7 +945,7 @@ function App() {
     async function addProjectMaterial() {
         if (conversationProjectId === null) return;
         try {
-            const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
+            const attachment = await invoke<PendingAttachment | null>("pick_text_attachment", {allowDuplicate: true});
             if (!attachment) return;
             const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
             if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
@@ -1053,7 +1109,7 @@ function App() {
     }
 
     async function submitPrompt() {
-        if (busy || !prompt.trim()) return;
+        if (busy || dropBusy.current || !prompt.trim()) return;
         if (!contextPreview?.confirmation_id || previewSignature !== contextSignature()) {
             notify("Проверьте состав запроса. Для отправки нажмите Enter ещё раз или «Отправить».", "composer-check", 6000);
             await checkContext();
@@ -1109,6 +1165,8 @@ function App() {
     }
 
     async function pickAttachment() {
+        if (dropBusy.current || pickerBusy.current) return;
+        pickerBusy.current = true;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
             if (!attachment) return;
@@ -1123,10 +1181,12 @@ function App() {
             clear("pickAttachment");
         } catch (reason) {
             report("pickAttachment", reason);
-        }
+        } finally { pickerBusy.current = false; }
     }
 
     async function pickImageAttachment() {
+        if (dropBusy.current || pickerBusy.current) return;
+        pickerBusy.current = true;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_image_attachment");
             if (!attachment) return;
@@ -1151,6 +1211,7 @@ function App() {
             }
             clear("pickImageAttachment");
         } catch (reason) { report("pickImageAttachment", reason); }
+        finally { pickerBusy.current = false; }
     }
 
     async function captureWindowSnapshot() {
@@ -1170,7 +1231,8 @@ function App() {
     }
 
     async function attachCapturedSnapshot() {
-        if (!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
+        if (dropBusy.current || pickerBusy.current || !capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
+        pickerBusy.current = true;
         try {
             const attachment = await invoke<PendingAttachment>("add_captured_snapshot", {dataUrl: capturedSnapshot.preview});
             if (conversationId !== activeConversation.current) {
@@ -1182,6 +1244,7 @@ function App() {
             setContextPreview(null);
             clear("attachCapturedSnapshot");
         } catch (reason) { report("attachCapturedSnapshot", reason); }
+        finally { pickerBusy.current = false; }
     }
 
     async function removeAttachment(id: number) {
@@ -1233,6 +1296,7 @@ function App() {
     liveContextSignature.current = contextSignature();
 
     async function checkContext() {
+        if (dropBusy.current) return;
         const request = ++contextRequest.current;
         const signature = contextSignature();
         setContextPreview(null);
@@ -1395,7 +1459,8 @@ function App() {
                     </form>}
                 </DialogContent>
             </Dialog>
-            <section className="chat-panel" aria-label={selectedConversation?.title ?? "Беседа"}>
+            <section ref={chatPanel} className={`chat-panel${draggingFiles ? " file-dragging" : ""}`} aria-label={selectedConversation?.title ?? "Беседа"}>
+                {draggingFiles && <div className="file-drop-hint" role="status">Добавить файлы в сообщение</div>}
                 <header className="chat-header">
                     <button ref={navigation.trigger} type="button" className="navigation-menu navigation-toggle" aria-label="Открыть навигацию" aria-expanded={navigation.open} title="Навигация · ⌘B / Ctrl+B"
                             onClick={(event) => navigation.setOpen(!navigation.open, event.currentTarget)}><ShellIcon name="panel"/></button>
@@ -1442,7 +1507,7 @@ function App() {
                             </button>
                         </details>}
                         {projectMaterials.map((material) => <div className="project-material" key={material.id}><label>
-                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || materialsLoading || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
+                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || dropLoading || materialsLoading || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
                                    onChange={(event) => {
                                        setSelectedMaterialIds((ids) => event.target.checked ? (pendingAttachments.length + ids.length < 5 && !ids.includes(material.id) ? [...ids, material.id] : ids) : ids.filter((id) => id !== material.id));
                                        setContextPreview(null);
@@ -1566,6 +1631,7 @@ function App() {
                     void submitPrompt();
                 }}>
                     {operationErrors("attachment")}
+                    {dropResults.length > 0 && <div className="file-drop-results" aria-live="polite">{dropResults.map((item, index) => <div key={index}>{item.name}: {item.status}</div>)}</div>}
                     <div className="composer-project">Проект: {projects.find((project) => project.id === conversationProjectId)?.title ?? "Без проекта"}</div>
                     {(pendingAttachments.length + selectedMaterialIds.length > 0) && <div className="composer-chips" aria-label="Выбранный контекст">
                         {pendingAttachments.slice(0, 2).map((item) => <span key={item.id}><span>{item.name} · {item.mime} · {item.size} Б</span> <button type="button" disabled={busy} aria-label={`Убрать ${item.name}`} onClick={() => void removeAttachment(item.id)}>×</button></span>)}
@@ -1600,8 +1666,8 @@ function App() {
                             buttons[(index + (event.key === "ArrowDown" ? 1 : buttons.length - 1)) % buttons.length]?.focus();
                         }
                     }}>
-                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickAttachment(); }}>Прикрепить файл</button>
-                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickImageAttachment(); }}>Прикрепить изображение</button>
+                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickAttachment(); }}>Прикрепить файл</button>
+                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickImageAttachment(); }}>Прикрепить изображение</button>
                         <button type="button" className="secondary-button" role="menuitem" onClick={() => { setVoiceOpen(true); setComposerToolsOpen(false); }}>Голосовой ввод…</button>
                         <button type="button" className="secondary-button" role="menuitem" disabled={busy || !!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5 || !isMac} onClick={() => { setComposerToolsOpen(false); void captureWindowSnapshot(); }}>Снимок окна…</button>
                         {!isMac && <small>Снимок окна доступен только на macOS.</small>}
@@ -1735,11 +1801,11 @@ function App() {
                             </details>
                         </div>
                         <div className="actions">
-                            <button type="button" className="secondary-button" disabled={busy || !prompt.trim()}
+                            <button type="button" className="secondary-button" disabled={busy || dropLoading || !prompt.trim()}
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
+                                    disabled={busy || dropLoading || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
                             </button>}
                         </div>
                     </div>
