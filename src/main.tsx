@@ -2,6 +2,8 @@ import {useEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {Channel, invoke} from "@tauri-apps/api/core";
 import {getCurrentWindow} from "@tauri-apps/api/window";
+import {getCurrentWebview} from "@tauri-apps/api/webview";
+import {listen} from "@tauri-apps/api/event";
 import {isPermissionGranted, onAction, requestPermission, sendNotification} from "@tauri-apps/plugin-notification";
 import MarkdownMessage from "./MarkdownMessage";
 import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
@@ -19,6 +21,7 @@ import "./style.css";
 type Message = { id: number; parent_id: number | null; role: "user" | "assistant"; content: string; status: string };
 type Attachment = { message_id: number; name: string; mime: string; size: number; sha256: string };
 type PendingAttachment = { id: number; name: string; mime: string; size: number; sha256: string; preview: string };
+type DropResult = {name: string; attachment: PendingAttachment | null; error: string | null};
 type ContextMessage = { role: string; content: string; source_message_id: number | null; attachment_ids: number[] };
 type AgentSource = { relative_path: string; line: number; excerpt: string };
 type AgentSkill = { material_id: number; name: string; version: number; size: number; sha256: string; instructions: string; enabled: boolean };
@@ -121,12 +124,28 @@ function App() {
     });
     const [prompt, setPrompt] = useState("");
     const [composerToolsOpen, setComposerToolsOpen] = useState(false);
+    const [composerSettingsOpen, setComposerSettingsOpen] = useState(false);
+    const composerMenu = useRef<HTMLDivElement>(null);
+    const composerMenuButton = useRef<HTMLButtonElement>(null);
+    const [closeVoiceConfirm, setCloseVoiceConfirm] = useState(false);
+    const [replaceVoiceConfirm, setReplaceVoiceConfirm] = useState(false);
+    const [transcriptionConfirm, setTranscriptionConfirm] = useState(false);
+    const [microphoneNotice, setMicrophoneNotice] = useState("");
+    const isMac = /Macintosh|Mac OS X/.test(navigator.userAgent);
     const [busy, setBusy] = useState(false);
     const [draft, setDraft] = useState("");
     const {errors, report, clear} = useOperationErrors(conversationId);
     const [backups, setBackups] = useState<string[]>([]);
     const [selectedBackup, setSelectedBackup] = useState("");
     const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+    const [draggingFiles, setDraggingFiles] = useState(false);
+    const [dropResults, setDropResults] = useState<{batch: number; name: string; status: string}[]>([]);
+    const [dropLoading, setDropLoading] = useState(false);
+    const dropBusy = useRef(false);
+    const pickerBusy = useRef(false);
+    const chatPanel = useRef<HTMLElement>(null);
+    const dropState = useRef({busy, conversationId, slots: 5});
+    dropState.current = {busy: busy || materialsOpen, conversationId, slots: Math.max(0, 5 - pendingAttachments.length - selectedMaterialIds.length)};
     const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
     const [categories, setCategories] = useState<ModelCategory[]>([]);
 
@@ -158,9 +177,15 @@ function App() {
     const [imageGenerationBusy, setImageGenerationBusy] = useState(false);
     const [imageSaved, setImageSaved] = useState(false);
     const [uncertainImageSignature, setUncertainImageSignature] = useState("");
+    const [voiceOpen, setVoiceOpen] = useState(false);
+    const [voicePreparing, setVoicePreparing] = useState(false);
+    const voicePending = useRef(false);
+    const [recordingSeconds, setRecordingSeconds] = useState(0);
+    const cancelRecording = useRef(false);
     const [recording, setRecording] = useState(false);
     const [recordedAudio, setRecordedAudio] = useState<{id: string; base64: string; mime: string; seconds: number} | null>(null);
     const [transcriptionText, setTranscriptionText] = useState("");
+    const [transcriptionAvailable, setTranscriptionAvailable] = useState(false);
     const [transcribing, setTranscribing] = useState(false);
     const [uncertainTranscription, setUncertainTranscription] = useState("");
     const [captureNotice, setCaptureNotice] = useState("");
@@ -224,6 +249,50 @@ function App() {
         media.addEventListener("change", applyTheme);
         return () => media.removeEventListener("change", applyTheme);
     }, [theme]);
+
+    useEffect(() => {
+        let disposed = false;
+        const cleanups: (() => void)[] = [];
+        const register = (promise: Promise<() => void>) => void promise.then((unlisten) => disposed ? unlisten() : cleanups.push(unlisten));
+        const inChat = (x: number, y: number) => {
+            const rect = chatPanel.current?.getBoundingClientRect();
+            const scale = window.devicePixelRatio;
+            return !!rect && x / scale >= rect.left && x / scale < rect.right && y / scale >= rect.top && y / scale < rect.bottom;
+        };
+        register(getCurrentWebview().onDragDropEvent(({payload}) => {
+            if (payload.type === "leave" || payload.type === "drop") setDraggingFiles(false);
+            else setDraggingFiles(inChat(payload.position.x, payload.position.y));
+        }));
+        register(listen<{sequence: number; x: number; y: number; names: string[]}>("attachment-drop", async ({payload}) => {
+            if (!inChat(payload.x, payload.y) || dropState.current.busy || dropBusy.current || pickerBusy.current) {
+                if (inChat(payload.x, payload.y)) setDropResults((current) => [...current, ...payload.names.map((name) => ({batch: payload.sequence, name, status: "Дождитесь завершения текущего действия и повторите"}))]);
+                void invoke("accept_dropped_files", {sequence: payload.sequence, slots: 0}).catch(() => {});
+                return;
+            }
+            dropBusy.current = true;
+            setDropLoading(true);
+            setDropResults(payload.names.map((name) => ({batch: payload.sequence, name, status: "Проверка…"})));
+            setContextPreview(null);
+            const {conversationId: target, slots} = dropState.current;
+            try {
+                const results = await invoke<DropResult[]>("accept_dropped_files", {sequence: payload.sequence, slots});
+                const attachments = results.flatMap((item) => item.attachment ? [item.attachment] : []);
+                if (disposed || target !== activeConversation.current) {
+                    await Promise.all(attachments.map((item) => invoke("remove_text_attachment", {id: item.id})));
+                } else {
+                    setPendingAttachments((current) => [...current, ...attachments]);
+                    setContextPreview(null);
+                    setDropResults((current) => [...results.map((item) => ({batch: payload.sequence, name: item.name, status: item.error ?? "Добавлен"})), ...current.filter((item) => item.batch !== payload.sequence)]);
+                }
+            } catch {
+                if (!disposed) setDropResults((current) => [...payload.names.map((name) => ({batch: payload.sequence, name, status: "Не удалось проверить файл"})), ...current.filter((item) => item.batch !== payload.sequence)]);
+            } finally {
+                dropBusy.current = false;
+                if (!disposed) setDropLoading(false);
+            }
+        }));
+        return () => { disposed = true; cleanups.forEach((unlisten) => unlisten()); };
+    }, []);
 
     useEffect(() => {
         if (paletteOpen) {
@@ -433,13 +502,19 @@ function App() {
         } catch (reason) { report("saveGeneratedImage", reason); }
     }
 
-    async function startVoiceRecording() {
+    async function startVoiceRecording(replace = false) {
+        if (voicePending.current) return;
+        if (!replace && (recordedAudio || transcriptionText)) { setReplaceVoiceConfirm(true); return; }
+        voicePending.current = true;
+        setMicrophoneNotice("");
+        setVoicePreparing(true);
         try {
             if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error("Запись аудио в этом окне не поддерживается");
             const stream = await navigator.mediaDevices.getUserMedia({audio: true});
             recordingStream.current = stream;
             audioChunks.current = [];
             audioSize.current = 0;
+            cancelRecording.current = false;
             const options = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? {mimeType: "audio/webm;codecs=opus"} : {};
             const nextRecorder = new MediaRecorder(stream, options);
             recorder.current = nextRecorder;
@@ -456,26 +531,59 @@ function App() {
                 stream.getTracks().forEach((track) => track.stop());
                 recordingStream.current = null;
                 setRecording(false);
-                if (audioSize.current > 25 * 1024 * 1024) { setRecordedAudio(null); return; }
+                setVoicePreparing(true);
+                if (cancelRecording.current) { audioChunks.current = []; voicePending.current = false; setVoicePreparing(false); return; }
+                if (audioSize.current > 25 * 1024 * 1024) { setRecordedAudio(null); voicePending.current = false; setVoicePreparing(false); return; }
                 const seconds = Math.min(600, (Date.now() - startedAt.current) / 1000);
                 void new Blob(audioChunks.current, {type: nextRecorder.mimeType}).arrayBuffer().then((buffer) => {
                     const bytes = new Uint8Array(buffer);
                     let binary = "";
                     for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
                     setRecordedAudio({id: crypto.randomUUID(), base64: btoa(binary), mime: nextRecorder.mimeType.split(";")[0] || "audio/webm", seconds});
-                });
+                }).catch(() => report("startVoiceRecording", "Не удалось подготовить запись."))
+                    .finally(() => { voicePending.current = false; setVoicePreparing(false); });
             };
             startedAt.current = Date.now();
             setRecordedAudio(null);
             setTranscriptionText("");
+            setTranscriptionAvailable(false);
             clear("startVoiceRecording");
             nextRecorder.start(1000);
             setRecording(true);
+            setVoicePreparing(false);
             window.setTimeout(() => { if (recorder.current === nextRecorder && nextRecorder.state === "recording") nextRecorder.stop(); }, 600_000);
-        } catch (reason) { report("startVoiceRecording", `Не удалось начать запись: ${String(reason)}`); }
+        } catch (reason) { voicePending.current = false; setVoicePreparing(false); recordingStream.current?.getTracks().forEach((track) => track.stop()); recordingStream.current = null; setMicrophoneNotice(isMac ? "Проверьте доступ к микрофону: Системные настройки → Конфиденциальность и безопасность → Микрофон." : "Проверьте доступ к микрофону в настройках системы."); report("startVoiceRecording", reason); }
     }
 
+    const voiceAtRisk = useRef(false);
+    voiceAtRisk.current = recording || voicePreparing || !!recordedAudio || !!transcriptionText || transcribing;
+    useEffect(() => {
+        let unlisten: (() => void) | undefined;
+        let disposed = false;
+        void getCurrentWindow().onCloseRequested((event) => {
+            if (voiceAtRisk.current || voicePending.current) { event.preventDefault(); setCloseVoiceConfirm(true); }
+        }).then((stop) => { if (disposed) stop(); else unlisten = stop; });
+        return () => { disposed = true; unlisten?.(); };
+    }, []);
+
+    useEffect(() => {
+        if (!composerToolsOpen) return;
+        composerMenu.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+        function dismiss(event: PointerEvent) {
+            if (!composerMenu.current?.contains(event.target as Node) && !composerMenuButton.current?.contains(event.target as Node)) setComposerToolsOpen(false);
+        }
+        document.addEventListener("pointerdown", dismiss);
+        return () => document.removeEventListener("pointerdown", dismiss);
+    }, [composerToolsOpen]);
+
     const startedAt = useRef(0);
+
+    useEffect(() => {
+        if (!recording) return;
+        setRecordingSeconds(0);
+        const timer = window.setInterval(() => setRecordingSeconds(Math.min(600, Math.floor((Date.now() - startedAt.current) / 1000))), 1000);
+        return () => window.clearInterval(timer);
+    }, [recording]);
 
     useEffect(() => () => {
         if (recorder.current?.state === "recording") recorder.current.stop();
@@ -486,14 +594,13 @@ function App() {
         if (recorder.current?.state === "recording") recorder.current.stop();
     }
 
-    async function transcribeVoice() {
+    async function transcribeVoice(confirmed = false) {
         if (!recordedAudio) return;
         const model = selectedTranscriptionModel;
         if (!model || model.audio_rubles_per_minute === null || !model.protocols.includes("audio_transcriptions")) return;
         const signature = recordedAudio.id;
         if (uncertainTranscription === signature) return;
-        const estimate = (Math.ceil(recordedAudio.seconds) + 1) / 60 * model.audio_rubles_per_minute;
-        if (!window.confirm(`Отправить запись в SimpleClaw для распознавания?\nМодель: ${model.name} (${model.id})\nДлительность записи: ${recordedAudio.seconds.toFixed(1)} с\nТариф: ${model.audio_rubles_per_minute} ₽/мин\nОценка по записи с запасом 1 с: ${estimate.toFixed(2)} ₽. Сервис считает декодированную длительность; итог может отличаться. Автоповтора не будет.`)) return;
+        if (!confirmed) { setTranscriptionConfirm(true); return; }
         setTranscribing(true);
         clear("transcribeVoice");
         try {
@@ -502,6 +609,7 @@ function App() {
                 durationSeconds: recordedAudio.seconds, expectedRatePerMinute: model.audio_rubles_per_minute
             });
             setTranscriptionText(result.text);
+            setTranscriptionAvailable(true);
             setRecordedAudio(null);
         } catch (reason) {
             const message = String(reason);
@@ -676,7 +784,7 @@ function App() {
     }, [conversationId]);
 
     async function switchConversation(id: number, discardConfirmed = false) {
-        if (busy) return false;
+        if (busy || dropBusy.current) return false;
         if (id === conversationId) { if (navigation.modal) navigation.setOpen(false); return true; }
         if (!discardConfirmed && (prompt.trim() || pendingAttachments.length) && !window.confirm("Перейти в другую беседу? Черновик и выбранные файлы будут убраны.")) return false;
         const request = ++navigationRequest.current;
@@ -684,6 +792,7 @@ function App() {
             for (const attachment of pendingAttachments) await invoke("remove_text_attachment", {id: attachment.id});
             if (request !== navigationRequest.current) return false;
             setPendingAttachments([]);
+            setDropResults([]);
             setPrompt("");
             setScheduledDraft(null);
             setCaptureNotice("");
@@ -702,7 +811,7 @@ function App() {
     }
 
     async function createConversation() {
-        if (busy) return;
+        if (busy || dropBusy.current) return;
         if ((prompt.trim() || pendingAttachments.length) && !window.confirm("Создать беседу? Черновик и выбранные файлы будут убраны.")) return;
         try {
             const id = await invoke<number>("create_conversation");
@@ -836,7 +945,7 @@ function App() {
     async function addProjectMaterial() {
         if (conversationProjectId === null) return;
         try {
-            const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
+            const attachment = await invoke<PendingAttachment | null>("pick_text_attachment", {allowDuplicate: true});
             if (!attachment) return;
             const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
             if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
@@ -1000,7 +1109,7 @@ function App() {
     }
 
     async function submitPrompt() {
-        if (busy || !prompt.trim()) return;
+        if (busy || dropBusy.current || !prompt.trim()) return;
         if (!contextPreview?.confirmation_id || previewSignature !== contextSignature()) {
             notify("Проверьте состав запроса. Для отправки нажмите Enter ещё раз или «Отправить».", "composer-check", 6000);
             await checkContext();
@@ -1056,6 +1165,8 @@ function App() {
     }
 
     async function pickAttachment() {
+        if (dropBusy.current || pickerBusy.current) return;
+        pickerBusy.current = true;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
             if (!attachment) return;
@@ -1070,10 +1181,12 @@ function App() {
             clear("pickAttachment");
         } catch (reason) {
             report("pickAttachment", reason);
-        }
+        } finally { pickerBusy.current = false; }
     }
 
     async function pickImageAttachment() {
+        if (dropBusy.current || pickerBusy.current) return;
+        pickerBusy.current = true;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_image_attachment");
             if (!attachment) return;
@@ -1098,10 +1211,11 @@ function App() {
             }
             clear("pickImageAttachment");
         } catch (reason) { report("pickImageAttachment", reason); }
+        finally { pickerBusy.current = false; }
     }
 
     async function captureWindowSnapshot() {
-        setCapturedSnapshot(null);
+        if (capturedSnapshot) return;
         setCaptureNotice("");
         try {
             const snapshot = await invoke<CapturedSnapshot | null>("capture_window_snapshot");
@@ -1117,7 +1231,8 @@ function App() {
     }
 
     async function attachCapturedSnapshot() {
-        if (!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
+        if (dropBusy.current || pickerBusy.current || !capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
+        pickerBusy.current = true;
         try {
             const attachment = await invoke<PendingAttachment>("add_captured_snapshot", {dataUrl: capturedSnapshot.preview});
             if (conversationId !== activeConversation.current) {
@@ -1129,6 +1244,7 @@ function App() {
             setContextPreview(null);
             clear("attachCapturedSnapshot");
         } catch (reason) { report("attachCapturedSnapshot", reason); }
+        finally { pickerBusy.current = false; }
     }
 
     async function removeAttachment(id: number) {
@@ -1180,6 +1296,7 @@ function App() {
     liveContextSignature.current = contextSignature();
 
     async function checkContext() {
+        if (dropBusy.current) return;
         const request = ++contextRequest.current;
         const signature = contextSignature();
         setContextPreview(null);
@@ -1342,7 +1459,8 @@ function App() {
                     </form>}
                 </DialogContent>
             </Dialog>
-            <section className="chat-panel" aria-label={selectedConversation?.title ?? "Беседа"}>
+            <section ref={chatPanel} className={`chat-panel${draggingFiles ? " file-dragging" : ""}`} aria-label={selectedConversation?.title ?? "Беседа"}>
+                {draggingFiles && <div className="file-drop-hint" role="status">Добавить файлы в сообщение</div>}
                 <header className="chat-header">
                     <button ref={navigation.trigger} type="button" className="navigation-menu navigation-toggle" aria-label="Открыть навигацию" aria-expanded={navigation.open} title="Навигация · ⌘B / Ctrl+B"
                             onClick={(event) => navigation.setOpen(!navigation.open, event.currentTarget)}><ShellIcon name="panel"/></button>
@@ -1389,7 +1507,7 @@ function App() {
                             </button>
                         </details>}
                         {projectMaterials.map((material) => <div className="project-material" key={material.id}><label>
-                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || materialsLoading || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
+                            <input type="checkbox" checked={selectedMaterialIds.includes(material.id)} disabled={busy || dropLoading || materialsLoading || (!selectedMaterialIds.includes(material.id) && pendingAttachments.length + selectedMaterialIds.length >= 5)}
                                    onChange={(event) => {
                                        setSelectedMaterialIds((ids) => event.target.checked ? (pendingAttachments.length + ids.length < 5 && !ids.includes(material.id) ? [...ids, material.id] : ids) : ids.filter((id) => id !== material.id));
                                        setContextPreview(null);
@@ -1513,6 +1631,7 @@ function App() {
                     void submitPrompt();
                 }}>
                     {operationErrors("attachment")}
+                    {dropResults.length > 0 && <div className="file-drop-results" aria-live="polite">{dropResults.map((item, index) => <div key={index}>{item.name}: {item.status}</div>)}</div>}
                     <div className="composer-project">Проект: {projects.find((project) => project.id === conversationProjectId)?.title ?? "Без проекта"}</div>
                     {(pendingAttachments.length + selectedMaterialIds.length > 0) && <div className="composer-chips" aria-label="Выбранный контекст">
                         {pendingAttachments.slice(0, 2).map((item) => <span key={item.id}><span>{item.name} · {item.mime} · {item.size} Б</span> <button type="button" disabled={busy} aria-label={`Убрать ${item.name}`} onClick={() => void removeAttachment(item.id)}>×</button></span>)}
@@ -1520,9 +1639,10 @@ function App() {
                             const item = projectMaterials.find((material) => material.id === id);
                             return <span key={id}><span>{item?.name ?? "Материал недоступен"} · версия {item?.version} · {item?.size} Б</span> <button type="button" disabled={busy} aria-label={`Убрать ${item?.name ?? "материал"}`} onClick={() => { setSelectedMaterialIds((ids) => ids.filter((value) => value !== id)); setContextPreview(null); }}>×</button></span>;
                         })}
-                        <button type="button" className="secondary-button" onClick={() => setComposerToolsOpen(true)}>{pendingAttachments.length + selectedMaterialIds.length > 2 ? `Ещё ${pendingAttachments.length + selectedMaterialIds.length - 2}` : "Просмотреть / убрать"}</button>
+                        <button type="button" className="secondary-button" onClick={() => setComposerSettingsOpen(true)}>{pendingAttachments.length + selectedMaterialIds.length > 2 ? `Ещё ${pendingAttachments.length + selectedMaterialIds.length - 2}` : "Просмотреть / убрать"}</button>
                     </div>}
                     {captureNotice && <p role="status">{captureNotice}</p>}
+                    {!voiceOpen && (recording || voicePreparing || recordedAudio || transcriptionText || transcribing) && <button type="button" className="secondary-button" onClick={() => setVoiceOpen(true)}>Открыть голосовой ввод · {recording ? "идёт запись" : "есть несохранённые данные"}</button>}
                     {operationErrors("artifact")}
                     <label className="sr-only" htmlFor="prompt">Сообщение</label>
                     <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000} rows={2}
@@ -1537,14 +1657,30 @@ function App() {
                         setContextPreview(null);
                     }}/>
                     {prompt.length >= 1600 && <small aria-live="polite">{prompt.length}/2000</small>}
-                    <details className="composer-extra" open={composerToolsOpen} onToggle={(event) => setComposerToolsOpen(event.currentTarget.open)}>
-                    <summary>Инструменты ввода</summary>
-                    <section className="voice-input" aria-label="Голосовой ввод">
+                    {composerToolsOpen && <div ref={composerMenu} className="composer-menu" role="menu" aria-label="Добавить к сообщению" onKeyDown={(event) => {
+                        if (event.key === "Escape") { event.preventDefault(); setComposerToolsOpen(false); composerMenuButton.current?.focus(); }
+                        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                            event.preventDefault();
+                            const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+                            const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+                            buttons[(index + (event.key === "ArrowDown" ? 1 : buttons.length - 1)) % buttons.length]?.focus();
+                        }
+                    }}>
+                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickAttachment(); }}>Прикрепить файл</button>
+                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickImageAttachment(); }}>Прикрепить изображение</button>
+                        <button type="button" className="secondary-button" role="menuitem" onClick={() => { setVoiceOpen(true); setComposerToolsOpen(false); }}>Голосовой ввод…</button>
+                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || !!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5 || !isMac} onClick={() => { setComposerToolsOpen(false); void captureWindowSnapshot(); }}>Снимок окна…</button>
+                        {!isMac && <small>Снимок окна доступен только на macOS.</small>}
+                        {capturedSnapshot && <small>Сначала прикрепите или удалите текущий снимок.</small>}
+                        <button type="button" className="secondary-button" role="menuitem" onClick={() => { setComposerToolsOpen(false); setComposerSettingsOpen(true); }}>Дополнительные настройки…</button>
+                    </div>}
+                    {voiceOpen && <section className="voice-input" aria-label="Голосовой ввод">
                         {operationErrors("voice")}
+                        {microphoneNotice && <p role="status">{microphoneNotice}</p>}
                         <div className="voice-controls">
                             {recording ? <button type="button" className="secondary-button" onClick={stopVoiceRecording}>Остановить запись</button> :
-                                <button type="button" className="secondary-button" disabled={busy || transcribing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
-                            {recording && <span role="status">Идёт запись · максимум 10 минут</span>}
+                                <button type="button" className="secondary-button" disabled={busy || transcribing || voicePreparing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
+                            {recording && <><span role="status">Идёт запись · {Math.floor(recordingSeconds / 60)}:{String(recordingSeconds % 60).padStart(2, "0")} / 10:00</span><button type="button" className="secondary-button" onClick={() => { cancelRecording.current = true; stopVoiceRecording(); }}>Отменить запись</button></>}
             {recordedAudio && <span>Запись: {recordedAudio.seconds.toFixed(1)} с · {(recordedAudio.base64.length * 0.75 / 1024).toFixed(0)} КБ</span>}
                         </div>
                         {transcriptionModels.length > 0 && <>
@@ -1556,27 +1692,25 @@ function App() {
                                 <button type="button" className="secondary-button" disabled={!recordedAudio || transcribing || !keySaved || !selectedTranscriptionModel || uncertainTranscription === recordedAudio?.id} onClick={() => void transcribeVoice()}>
                                     {transcribing ? "Распознавание…" : "Распознать"}
                                 </button>
-                                {recordedAudio && <button type="button" className="secondary-button" disabled={transcribing} onClick={() => setRecordedAudio(null)}>Удалить запись</button>}
                             </div>
                             <small>SimpleClaw · тариф из <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">Provider API</a>, каталог от {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестной даты"}. Сначала покажем оценку и запросим подтверждение. Аудио временно хранится в памяти этого окна.</small>
                         </>}
                         {!transcriptionModels.length && <small>Нет моделей распознавания с опубликованным тарифом.</small>}
-                        {transcriptionText && <div className="transcription-result">
+                        {recordedAudio && <button type="button" className="secondary-button" disabled={transcribing} onClick={() => setRecordedAudio(null)}>Удалить запись</button>}
+                        {transcriptionAvailable && <div className="transcription-result">
                             <label htmlFor="transcription-text">Распознанный текст — проверьте и исправьте</label>
                             <textarea id="transcription-text" value={transcriptionText} maxLength={2000} onChange={(event) => setTranscriptionText(event.target.value)}/>
                             <button type="button" className="secondary-button" disabled={!transcriptionText.trim() || prompt.length + transcriptionText.trim().length + (prompt ? 1 : 0) > 2000} onClick={() => {
                                 setPrompt((current) => current ? `${current}\n${transcriptionText.trim()}` : transcriptionText.trim());
                                 setContextPreview(null);
+                                setTranscriptionText("");
+                                setTranscriptionAvailable(false);
                                 promptField.current?.focus();
                             }}>Вставить в сообщение</button>
                         </div>}
-                    </section>
+                    <button type="button" className="secondary-button" onClick={() => setVoiceOpen(false)}>Скрыть голосовой ввод</button>
+                    </section>}
                     <div className="attachment-controls">
-                        <div className="snapshot-controls">
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                                    onClick={() => void captureWindowSnapshot()}>Снимок выбранного окна…</button>
-                            <small>macOS откроет системный выбор окна и при необходимости запросит разрешение «Запись экрана».</small>
-                        </div>
                         {capturedSnapshot && <div className="snapshot-preview">
                             <img src={capturedSnapshot.preview} alt="Предпросмотр снимка окна"/>
                             <div><strong>Снимок пока не прикреплён</strong>
@@ -1600,6 +1734,8 @@ function App() {
                             </div>
                         ))}
                     </div>
+                    {composerSettingsOpen && <section className="composer-extra" aria-label="Дополнительные настройки">
+                    <button type="button" className="secondary-button" onClick={() => setComposerSettingsOpen(false)}>Скрыть дополнительные настройки</button>
                     {conversationProjectId !== null && <div className="agent-skill-picker">
                             <h3>Локальный навык</h3>
                             <p>Выберите Markdown-материал этого проекта. Инструкция попадёт только в агентный запрос после явного включения; навык не добавляет доступ к файлам, командам или сети.</p>
@@ -1626,16 +1762,12 @@ function App() {
                                 <option value="agent" disabled={modelId !== "gpt-oss-20b"}>Агент · только gpt-oss-20b</option>
                             </select>
                             <small>Агент: калькулятор и поиск при явно подключённой папке; команды недоступны. До двух платных запросов с подтверждением.</small>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                                    onClick={() => void pickAttachment()}>Прикрепить файл</button>
-                            <button type="button" className="secondary-button" disabled={busy || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                                    onClick={() => void pickImageAttachment()}>Прикрепить изображение</button>
                     {selectedMaterialIds.map((id) => { const item = projectMaterials.find((material) => material.id === id); return <div key={id}>
                         <span>{item?.name ?? "Материал недоступен"} · версия {item?.version} · {item?.size} Б</span>
                         <button type="button" disabled={busy} aria-label={`Убрать ${item?.name ?? "материал"} · версия ${item?.version ?? id}`} onClick={() => { setSelectedMaterialIds((ids) => ids.filter((value) => value !== id)); setContextPreview(null); }}>Убрать</button>
                     </div>; })}
                     {selectedMaterialIds.length > 0 && <button type="button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>}
-                    </details>
+                    </section>}
                     {contextPreview && <details open className="context-preview">
                         <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
@@ -1646,7 +1778,7 @@ function App() {
                     </details>}
                     <div className="composer-footer">
                         <div className="composer-tools">
-                            <button type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
+                            <button ref={composerMenuButton} type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-haspopup="menu" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
                             <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} disabled={busy}
                                          fetchedAt={catalog?.fetched_at ?? null} catalogFailed={errors.some((error) => error.area === "catalog")}
                                          onChange={(id) => { setModelId(id); if (id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
@@ -1669,11 +1801,11 @@ function App() {
                             </details>
                         </div>
                         <div className="actions">
-                            <button type="button" className="secondary-button" disabled={busy || !prompt.trim()}
+                            <button type="button" className="secondary-button" disabled={busy || dropLoading || !prompt.trim()}
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
+                                    disabled={busy || dropLoading || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
                             </button>}
                         </div>
                     </div>
@@ -1825,6 +1957,32 @@ function App() {
                 </div>
                 <p className="palette-hint">↑ ↓ выбрать · Enter открыть · Esc закрыть · ⌘K / Ctrl+K</p>
             </dialog>
+            <Dialog open={replaceVoiceConfirm} onOpenChange={setReplaceVoiceConfirm}>
+                <DialogContent aria-describedby={undefined}>
+                    <DialogTitle>Начать новую запись?</DialogTitle>
+                    <p>Текущая запись и распознанный текст будут удалены.</p>
+                    <div className="actions"><button type="button" className="secondary-button" onClick={() => setReplaceVoiceConfirm(false)}>Отмена</button>
+                        <button type="button" onClick={() => { setReplaceVoiceConfirm(false); void startVoiceRecording(true); }}>Удалить и записать</button></div>
+                </DialogContent>
+            </Dialog>
+            <Dialog open={transcriptionConfirm} onOpenChange={setTranscriptionConfirm}>
+                <DialogContent aria-describedby={undefined}>
+                    <DialogTitle>Отправить запись на распознавание?</DialogTitle>
+                    {recordedAudio && selectedTranscriptionModel && <p>SimpleClaw · {selectedTranscriptionModel.name} ({selectedTranscriptionModel.id}) · {recordedAudio.seconds.toFixed(1)} с · {selectedTranscriptionModel.audio_rubles_per_minute} ₽/мин. Оценка с запасом 1 с: {((Math.ceil(recordedAudio.seconds) + 1) / 60 * (selectedTranscriptionModel.audio_rubles_per_minute ?? 0)).toFixed(2)} ₽. Итог может отличаться; автоматического повтора не будет.</p>}
+                    <div className="actions"><button type="button" className="secondary-button" onClick={() => setTranscriptionConfirm(false)}>Отмена</button>
+                        <button type="button" onClick={() => { setTranscriptionConfirm(false); void transcribeVoice(true); }}>Подтвердить отправку</button></div>
+                </DialogContent>
+            </Dialog>
+            <Dialog open={closeVoiceConfirm} onOpenChange={setCloseVoiceConfirm}>
+                <DialogContent aria-describedby={undefined}>
+                    <DialogTitle>Закрыть приложение?</DialogTitle>
+                    <p>Запись и распознанный текст будут потеряны. Если распознавание выполняется, запрос мог быть оплачен.</p>
+                    <div className="actions">
+                        <button type="button" className="secondary-button" onClick={() => setCloseVoiceConfirm(false)}>Вернуться</button>
+                        <button type="button" onClick={() => void getCurrentWindow().destroy()}>Закрыть и потерять данные</button>
+                    </div>
+                </DialogContent>
+            </Dialog>
             <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
                 <DialogContent className="settings-content" aria-describedby={undefined}
                                onCloseAutoFocus={(event) => {

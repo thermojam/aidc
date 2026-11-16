@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "core:window:allow-show",
+    "core:window:allow-destroy",
     "core:window:allow-set-focus",
     "allow-list-history",
     "allow-list-conversations",
@@ -40,6 +41,7 @@
     "allow-restore-backup",
     "allow-pick-text-attachment",
     "allow-pick-image-attachment",
+    "allow-accept-dropped-files",
     "allow-capture-window-snapshot",
     "allow-add-captured-snapshot",
     "allow-remove-text-attachment",
