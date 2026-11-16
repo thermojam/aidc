@@ -322,8 +322,8 @@ h2 {
 }
 
 #prompt { min-height: 44px; max-height: 152px; line-height: 18px; resize: none; overflow-y: auto; }
-.composer-extra > summary { cursor: pointer; width: fit-content; padding: 6px 12px; border: 1px solid var(--control-border); border-radius: 6px; }
-.composer-extra[open] { display: grid; gap: 8px; }
+.composer-menu { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.composer-extra { display: grid; gap: 8px; }
 .composer-project { color: var(--muted); }
 .composer-chips { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; min-width: 0; }
 .composer-chips > button { grid-column: 2; grid-row: 1 / span 2; }
@@ -383,14 +383,7 @@ h2 {
     gap: 6px;
 }
 
-.snapshot-controls {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-}
-
-.snapshot-controls small, .snapshot-preview small {
+.snapshot-preview small {
     color: var(--muted);
     font-size: 12px;
 }

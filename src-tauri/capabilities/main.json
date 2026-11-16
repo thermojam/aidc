@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "core:window:allow-show",
+    "core:window:allow-destroy",
     "core:window:allow-set-focus",
     "allow-list-history",
     "allow-list-conversations",
