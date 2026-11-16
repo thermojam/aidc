@@ -2976,16 +2976,16 @@ pub fn run() {
             });
             Ok(())
         })
-        .on_webview_event(|webview, event| {
-            if webview.label() != "main" { return; }
-            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
-                let state = webview.state::<AppState>();
+        .on_window_event(|window, event| {
+            if window.label() != "main" { return; }
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
+                let state = window.state::<AppState>();
                 let sequence = state.drop_sequence.fetch_add(1, Ordering::SeqCst) + 1;
                 let names: Vec<_> = paths.iter().map(|path| path.file_name().and_then(|name| name.to_str()).unwrap_or("Неизвестный файл").to_owned()).collect();
                 if let Ok(mut pending) = state.dropped_files.lock() {
                     if pending.len() >= 64 { pending.pop_first(); }
                     pending.insert(sequence, paths.clone());
-                    let _ = webview.emit("attachment-drop", serde_json::json!({"sequence": sequence, "x": position.x, "y": position.y, "names": names}));
+                    let _ = window.emit("attachment-drop", serde_json::json!({"sequence": sequence, "x": position.x, "y": position.y, "names": names}));
                 };
             }
         })
