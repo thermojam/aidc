@@ -1338,7 +1338,7 @@ function App() {
 
     function closeArtifact() {
         setSelectedArtifactId(null);
-        requestAnimationFrame(() => (artifactTrigger.current?.isConnected ? artifactTrigger.current : promptField.current)?.focus());
+        requestAnimationFrame(() => (artifactTrigger.current?.isConnected ? artifactTrigger.current : promptField.current)?.focus({preventScroll: true}));
     }
 
     function runPaletteCommand(command: string) {
@@ -1383,6 +1383,7 @@ function App() {
     }
     const visible = history.messages.filter((message) => activeIds.has(message.id) && (!busy || message.status !== "streaming"));
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
+    const artifactSide = navigation.viewport >= 48 + (navigation.open && !navigation.modal ? navigation.width : 0) + 560 + 360;
     const selectedConversation = conversations.find((item) => item.id === conversationId);
     const imageModels = catalog?.models.filter((model) => model.protocols.includes("images_generations")) ?? [];
     const transcriptionModels = catalog?.models.filter((model) => model.protocols.includes("audio_transcriptions") && model.audio_rubles_per_minute !== null) ?? [];
@@ -1421,7 +1422,7 @@ function App() {
         {operationErrors("navigation")}
     </ProjectSidebar>;
     return (
-        <main className={`app-shell${selectedArtifact ? ` with-artifact${navigation.viewport >= 48 + (navigation.open && !navigation.modal ? navigation.width : 0) + 560 + 360 ? " artifact-side" : ""}` : ""}${navigation.open && !navigation.modal ? " navigation-open" : ""}`}
+        <main className={`app-shell${selectedArtifact ? ` with-artifact${artifactSide ? " artifact-side" : ""}` : ""}${navigation.open && !navigation.modal ? " navigation-open" : ""}`}
               style={{"--navigation-width": `${navigation.width}px`} as React.CSSProperties}>
             <nav className="app-dock" aria-label="Разделы приложения">
                 <button type="button" className="dock-button dock-current" aria-label="Беседы" aria-current="page" title="Беседы · ⌘B / Ctrl+B"
@@ -1643,7 +1644,7 @@ function App() {
                     </div>}
                     {captureNotice && <p role="status">{captureNotice}</p>}
                     {!voiceOpen && (recording || voicePreparing || recordedAudio || transcriptionText || transcribing) && <button type="button" className="secondary-button" onClick={() => setVoiceOpen(true)}>Открыть голосовой ввод · {recording ? "идёт запись" : "есть несохранённые данные"}</button>}
-                    {operationErrors("artifact")}
+                    {!selectedArtifact && operationErrors("artifact")}
                     <label className="sr-only" htmlFor="prompt">Сообщение</label>
                     <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000} rows={2}
                               onKeyDown={(event) => {
@@ -1926,7 +1927,7 @@ function App() {
             </section>
             {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}
-                                                 onExport={(id) => void exportArtifact(id)} onError={(reason) => report("artifact", reason)}/>}
+                                                 onExport={(id) => void exportArtifact(id)} side={artifactSide} errorNotice={operationErrors("artifact")}/>}
             <dialog ref={paletteDialog} className="command-palette" aria-labelledby="command-palette-title"
                     onCancel={(event) => { event.preventDefault(); closePalette(); }}>
                 <h2 id="command-palette-title">Команды</h2>

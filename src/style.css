@@ -97,7 +97,8 @@ button, select {
 .app-shell.navigation-open { grid-template-columns: 48px var(--navigation-width) minmax(0, 1fr); }
 .app-shell.with-artifact.artifact-side { grid-template-columns: 48px minmax(560px, 1fr) minmax(360px, 0.65fr); }
 .app-shell.navigation-open.with-artifact.artifact-side { grid-template-columns: 48px var(--navigation-width) minmax(560px, 1fr) minmax(360px, 0.65fr); }
-.with-artifact:not(.artifact-side) .chat-panel { display: none; }
+.with-artifact:not(.artifact-side) .chat-panel { grid-column: -2 / -1; grid-row: 1; visibility: hidden; }
+.with-artifact:not(.artifact-side) .artifact-panel { grid-column: -2 / -1; grid-row: 1; }
 .compact-only { display: none; }
 .with-artifact:not(.artifact-side) .compact-only { display: inline-block; }
 .with-artifact:not(.artifact-side) .wide-only { display: none; }
