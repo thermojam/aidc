@@ -1,4 +1,4 @@
-import {useEffect, useRef, useState} from "react";
+import {useEffect, useLayoutEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {Channel, invoke} from "@tauri-apps/api/core";
 import {getCurrentWindow} from "@tauri-apps/api/window";
@@ -77,7 +77,7 @@ type SyntheticTask = { id: number; title: string; status: "awaiting_approval" | 
     steps: { id: number; ordinal: number; action: string; decision: "pending" | "approved" | "denied"; result: string | null }[] };
 type ScheduledAgentTask = { id: number; conversation_id: number; title: string; prompt: string; interval_minutes: number; next_run_at: number; status: "active" | "awaiting_confirmation" | "stopped"; due_at: number | null };
 type PreparedScheduledAgentTask = {prompt: string; run_id: number};
-type ScheduledAgentRun = {id: number};
+type ScheduledAgentRun = {id: number; title: string; due_at: number; notified_at: number | null};
 type ScheduledAgentResult = {title: string; content: string};
 type AgentBoard = {
     plan: {id: number; ordinal: number; action: string; status: "pending" | "completed"}[];
@@ -107,6 +107,7 @@ function App() {
     const materialRequest = useRef(0);
     const [materialsLoading, setMaterialsLoading] = useState(false);
     const [projectMaterials, setProjectMaterials] = useState<ProjectMaterial[]>([]);
+    const materialListProject = useRef<number | null>(null);
     const [projectFolderView, setProjectFolderView] = useState<ProjectFolderView | null>(null);
     const [folderPreview, setFolderPreview] = useState<PendingAttachment | null>(null);
     const [selectedMaterialIds, setSelectedMaterialIds] = useState<number[]>([]);
@@ -123,6 +124,10 @@ function App() {
         attempts: []
     });
     const [prompt, setPrompt] = useState("");
+    const [createConversationConfirm, setCreateConversationConfirm] = useState(false);
+    const [confirmationMessage, setConfirmationMessage] = useState<string | null>(null);
+    const confirmationResolve = useRef<((confirmed: boolean) => void) | null>(null);
+    const confirmationTrigger = useRef<HTMLElement | null>(null);
     const [composerToolsOpen, setComposerToolsOpen] = useState(false);
     const [composerSettingsOpen, setComposerSettingsOpen] = useState(false);
     const composerMenu = useRef<HTMLDivElement>(null);
@@ -130,10 +135,20 @@ function App() {
     const [closeVoiceConfirm, setCloseVoiceConfirm] = useState(false);
     const [replaceVoiceConfirm, setReplaceVoiceConfirm] = useState(false);
     const [transcriptionConfirm, setTranscriptionConfirm] = useState(false);
-    const [microphoneNotice, setMicrophoneNotice] = useState("");
     const isMac = /Macintosh|Mac OS X/.test(navigator.userAgent);
     const [busy, setBusy] = useState(false);
     const [draft, setDraft] = useState("");
+    const historyRef = useRef<HTMLDivElement>(null);
+    const historyAtBottom = useRef(true);
+    const [showNewMessages, setShowNewMessages] = useState(false);
+    useLayoutEffect(() => {
+        historyAtBottom.current = true;
+        setShowNewMessages(false);
+    }, [conversationId]);
+    useLayoutEffect(() => {
+        const element = historyRef.current;
+        if (element && historyAtBottom.current) element.scrollTop = element.scrollHeight;
+    }, [history, draft, busy, conversationId]);
     const {errors, report, clear} = useOperationErrors(conversationId);
     const [backups, setBackups] = useState<string[]>([]);
     const [selectedBackup, setSelectedBackup] = useState("");
@@ -154,6 +169,13 @@ function App() {
     const [agentSkill, setAgentSkill] = useState<AgentSkill | null>(null);
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
     const [syntheticTasks, setSyntheticTasks] = useState<SyntheticTask[]>([]);
+    const [view, setView] = useState<"chat" | "tasks" | "image">("chat");
+    const tasksView = view === "tasks";
+    const imageView = view === "image";
+    const setTasksView = (open: boolean) => setView(open ? "tasks" : "chat");
+    const imageBack = useRef<HTMLButtonElement>(null);
+    const tasksBack = useRef<HTMLButtonElement>(null);
+    const scheduledResultRequest = useRef(0);
     const [scheduledTasks, setScheduledTasks] = useState<ScheduledAgentTask[]>([]);
     const [scheduledRuns, setScheduledRuns] = useState<ScheduledAgentRun[]>([]);
     const [scheduledDraft, setScheduledDraft] = useState<PreparedScheduledAgentTask | null>(null);
@@ -176,7 +198,10 @@ function App() {
     const [generatedImage, setGeneratedImage] = useState<GeneratedImage | null>(null);
     const [imageGenerationBusy, setImageGenerationBusy] = useState(false);
     const [imageSaved, setImageSaved] = useState(false);
-    const [uncertainImageSignature, setUncertainImageSignature] = useState("");
+    const [imageSaving, setImageSaving] = useState(false);
+    const imageSavePending = useRef(false);
+    const [uncertainImageSignatures, setUncertainImageSignatures] = useState<Set<string>>(new Set());
+    const imageRequestPending = useRef(false);
     const [voiceOpen, setVoiceOpen] = useState(false);
     const [voicePreparing, setVoicePreparing] = useState(false);
     const voicePending = useRef(false);
@@ -203,7 +228,15 @@ function App() {
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [paletteQuery, setPaletteQuery] = useState("");
+    const [slashDismissed, setSlashDismissed] = useState(false);
+    const [slashIndex, setSlashIndex] = useState(0);
+    const [mentionDismissed, setMentionDismissed] = useState(false);
+    const [mentionIndex, setMentionIndex] = useState(0);
+    const [promptCaret, setPromptCaret] = useState(0);
+    const checkAfterSlash = useRef(false);
     const navigation = useNavigationLayout();
+    const closeNavigationSheet = useRef(() => {});
+    closeNavigationSheet.current = () => { if (navigation.modal) navigation.setOpen(false); };
     const [recentIds, setRecentIds] = useState<number[]>(() => {
         try { const saved = JSON.parse(localStorage.getItem("navigation.recent") ?? "[]"); return Array.isArray(saved) ? saved.filter(Number.isInteger).slice(0, 10) : []; }
         catch { return []; }
@@ -219,9 +252,9 @@ function App() {
     useEffect(() => { localStorage.setItem("navigation.recent", JSON.stringify(recentIds)); }, [recentIds]);
     const settingsButton = useRef<HTMLButtonElement>(null);
     const compactSettingsButton = useRef<HTMLButtonElement>(null);
-    const paletteDialog = useRef<HTMLDialogElement>(null);
     const paletteInput = useRef<HTMLInputElement>(null);
     const paletteTrigger = useRef<HTMLElement | null>(null);
+    const settingsTrigger = useRef<HTMLElement | null>(null);
     const chatSearchField = navigation.search;
     const artifactTrigger = useRef<HTMLElement | null>(null);
     const promptField = useRef<HTMLTextAreaElement>(null);
@@ -233,6 +266,8 @@ function App() {
     const generationRequest = useRef(0);
     const catalogRequest = useRef(0);
     const historyRequest = useRef(0);
+    const boardRequest = useRef(0);
+    const skillRequest = useRef(0);
     const contextRequest = useRef(0);
     const [theme, setTheme] = useState<Theme>(() => {
         const saved = localStorage.getItem("appearance");
@@ -295,33 +330,27 @@ function App() {
     }, []);
 
     useEffect(() => {
-        if (paletteOpen) {
-            paletteDialog.current?.showModal();
-            paletteInput.current?.focus();
-        } else paletteDialog.current?.close();
-    }, [paletteOpen]);
-
-    useEffect(() => {
         function onShortcut(event: KeyboardEvent) {
             const target = event.target;
             const typing = target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
-            if (!paletteOpen && !settingsOpen && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b" && !document.querySelector('[role="dialog"]')) {
-                event.preventDefault(); navigation.setOpen(!navigation.open); return;
-            }
-            if (typing || paletteOpen || settingsOpen || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
+            if (event.defaultPrevented || event.isComposing || event.altKey || event.shiftKey || !(event.metaKey || event.ctrlKey) || paletteOpen || settingsOpen) return;
+            const shortcut = event.key.toLowerCase();
+            const dialogs = document.querySelectorAll('[role="dialog"], dialog[open]');
+            if (dialogs.length && !(shortcut === "b" && dialogs.length === 1 && dialogs[0].classList.contains("navigation-sheet"))) return;
+            if (shortcut === "k" && typing) return;
+            if (!["k", "n", "b", ","].includes(shortcut)) return;
             event.preventDefault();
-            paletteTrigger.current = target instanceof HTMLElement ? target : null;
-            setPaletteQuery("");
-            setPaletteOpen(true);
+            if (shortcut === "b") navigation.setOpen(!navigation.open);
+            else if (shortcut === "n") void createConversation();
+            else if (shortcut === ",") { settingsTrigger.current = target instanceof HTMLElement ? target : null; setSettingsOpen(true); }
+            else { paletteTrigger.current = target instanceof HTMLElement ? target : null; setPaletteQuery(""); setPaletteOpen(true); }
         }
         window.addEventListener("keydown", onShortcut);
         return () => window.removeEventListener("keydown", onShortcut);
-    }, [paletteOpen, settingsOpen, navigation.open, navigation.modal]);
+    });
 
     function closePalette() {
-        if (paletteDialog.current?.open) paletteDialog.current.close();
         setPaletteOpen(false);
-        requestAnimationFrame(() => (paletteTrigger.current?.isConnected ? paletteTrigger.current : promptField.current)?.focus());
     }
 
     function closeSettings() {
@@ -377,9 +406,25 @@ function App() {
         catch (reason) { report("stopScheduledTask", reason); }
     }
 
+    function confirmAction(message: string): Promise<boolean> {
+        if (confirmationResolve.current) return Promise.resolve(false);
+        confirmationTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        return new Promise((resolve) => {
+            confirmationResolve.current = resolve;
+            setConfirmationMessage(message);
+        });
+    }
+
+    function finishConfirmation(confirmed: boolean) {
+        const resolve = confirmationResolve.current;
+        confirmationResolve.current = null;
+        setConfirmationMessage(null);
+        resolve?.(confirmed);
+    }
+
     async function prepareScheduledTask(task: ScheduledAgentTask) {
         if (busy) return;
-        if (!window.confirm(`Задача «${task.title}» наступила по расписанию. Продолжить и поместить её в черновик? При переходе текущий черновик и файлы будут убраны. Платный запрос не отправится. Проверьте модель, контекст и стоимость, затем отправьте вручную.`)) return;
+        if (!await confirmAction(`Задача «${task.title}» наступила по расписанию. Продолжить и поместить её в черновик? При переходе текущий черновик, несохранённые записи плана и файлы будут убраны. Платный запрос не отправится. Проверьте модель, контекст и стоимость, затем отправьте вручную.`)) return;
         try {
             if (task.conversation_id !== conversationId && !await switchConversation(task.conversation_id, true)) return;
             const prepared = await invoke<PreparedScheduledAgentTask>("prepare_scheduled_agent_task", {taskId: task.id});
@@ -389,26 +434,33 @@ function App() {
             setModelId("gpt-oss-20b");
             setAgentMode(true);
             setContextPreview(null);
+            setSelectedArtifactId(null);
+            setTasksView(false);
+            requestAnimationFrame(() => promptField.current?.focus());
             await refreshScheduledTasks();
             clear("prepareScheduledTask");
         } catch (reason) { report("prepareScheduledTask", reason); }
     }
 
     async function refreshAgentBoard(id = conversationId) {
+        const request = ++boardRequest.current;
         const board = await invoke<AgentBoard>("get_agent_board", {conversationId: id});
-        if (id === activeConversation.current) { setAgentBoard(board); clear("agentBoard"); }
+        if (request === boardRequest.current && id === activeConversation.current) { setAgentBoard(board); clear("agentBoard"); }
     }
 
     async function refreshAgentSkill(id = conversationId) {
+        const request = ++skillRequest.current;
         const skill = await invoke<AgentSkill | null>("get_agent_skill", {conversationId: id});
-        if (id === activeConversation.current) { setAgentSkill(skill); clear("agentSkill"); }
+        if (request === skillRequest.current && id === activeConversation.current) { setAgentSkill(skill); clear("agentSkill"); }
     }
 
     async function saveAgentSkill(materialId: number | null, enabled: boolean) {
         try {
             await invoke("set_agent_skill", {conversationId, materialId, enabled});
-            await refreshAgentSkill();
-            setContextPreview(null);
+            if (conversationId === activeConversation.current) {
+                await refreshAgentSkill(conversationId);
+                setContextPreview(null);
+            }
             clear("saveAgentSkill");
         } catch (reason) { report("saveAgentSkill", reason); }
     }
@@ -416,8 +468,8 @@ function App() {
     async function addPlanStep() {
         try {
             await invoke("add_agent_plan_step", {conversationId, action: planDraft});
-            setPlanDraft("");
-            await refreshAgentBoard();
+            if (conversationId === activeConversation.current) setPlanDraft("");
+            if (conversationId === activeConversation.current) await refreshAgentBoard(conversationId);
             clear("addPlanStep");
         } catch (reason) { report("addPlanStep", reason); }
     }
@@ -425,7 +477,7 @@ function App() {
     async function completePlanStep(stepId: number) {
         try {
             await invoke("complete_agent_plan_step", {conversationId, stepId});
-            await refreshAgentBoard();
+            if (conversationId === activeConversation.current) await refreshAgentBoard(conversationId);
             clear("completePlanStep");
         } catch (reason) { report("completePlanStep", reason); }
     }
@@ -435,17 +487,22 @@ function App() {
         try {
             await invoke(kind === "queue" ? "add_agent_queue_item" : "add_agent_steering_note",
                 {conversationId, [kind === "queue" ? "request" : "note"]: text});
-            if (kind === "queue") setQueueDraft(""); else setSteeringDraft("");
-            await refreshAgentBoard();
+            if (conversationId === activeConversation.current) {
+                if (kind === "queue") setQueueDraft(""); else setSteeringDraft("");
+                await refreshAgentBoard(conversationId);
+            }
             clear("addBoardInput");
         } catch (reason) { report("addBoardInput", reason); }
     }
 
     function useBoardInput(kind: "queue" | "steering", item: {id: number; text: string; status: string}) {
         if (item.status !== (kind === "queue" ? "queued" : "pending")) return;
-        setPrompt(item.text);
-        setBoardInputSource({kind, id: item.id, text: item.text});
+        if (prompt.length + (prompt ? 1 : 0) + item.text.length > 2000) return;
+        const nextPrompt = prompt ? `${prompt}\n${item.text}` : item.text;
+        setPrompt(nextPrompt);
+        setBoardInputSource({kind, id: item.id, text: nextPrompt.trim()});
         setContextPreview(null);
+        requestAnimationFrame(() => promptField.current?.focus());
     }
 
     async function startSyntheticTask() {
@@ -465,12 +522,13 @@ function App() {
     }
 
     async function generateImage() {
-        const selectedImageModelId = imageModelId || imageModels[0]?.id || "";
+        const selectedImageModelId = selectedImageModel?.id || "";
         const model = catalog?.models.find((item) => item.id === selectedImageModelId);
         if (!model || !model.protocols.includes("images_generations") || model.request_rubles === null) return;
         const signature = JSON.stringify([selectedImageModelId, imagePrompt.trim()]);
-        if (uncertainImageSignature === signature) return;
-        if (!window.confirm(`Отправить запрос в SimpleClaw?\nМодель: ${model.name} (${model.id})\nЦена: ${model.request_rubles} ₽ за успешный запрос. Автоповтора не будет.`)) return;
+        if (imageRequestPending.current || imageSavePending.current || uncertainImageSignatures.has(signature)) return;
+        if (!await confirmAction(`Отправить запрос в SimpleClaw?\nМодель: ${model.name} (${model.id})\nЦена: ${model.request_rubles} ₽ за успешный запрос. Автоповтора не будет.`)) return;
+        imageRequestPending.current = true;
         setImageGenerationBusy(true);
         setGeneratedImage(null);
         setImageSaved(false);
@@ -482,7 +540,7 @@ function App() {
         } catch (reason) {
             const message = String(reason);
             if (message.includes("NETWORK_RESULT_UNKNOWN") || message.includes("GENERATION_RESULT_UNKNOWN") || /GENERATION_HTTP_5\d\d/.test(message)) {
-                setUncertainImageSignature(signature);
+                setUncertainImageSignatures((current) => new Set(current).add(signature));
                 report("generateImage", "Результат генерации неизвестен; запрос мог быть принят и оплачен. Для продолжения измените описание или модель, чтобы не повторить тот же запрос.");
             } else if (message.includes("Цена изменилась")) {
                 try {
@@ -491,25 +549,29 @@ function App() {
                 } catch (refreshReason) { report("generateImage", `Не удалось обновить цену: ${String(refreshReason)}`); }
             } else report("generateImage", message);
         }
-        finally { setImageGenerationBusy(false); }
+        finally { imageRequestPending.current = false; setImageGenerationBusy(false); }
     }
 
     async function saveGeneratedImage() {
-        if (!generatedImage) return;
+        if (!generatedImage || imageSavePending.current) return;
+        imageSavePending.current = true;
+        setImageSaving(true);
+        setImageSaved(false);
+        clear("saveGeneratedImage");
         try {
             const saved = await invoke<boolean>("save_generated_image", {dataUrl: generatedImage.data_url});
             setImageSaved(saved);
         } catch (reason) { report("saveGeneratedImage", reason); }
+        finally { imageSavePending.current = false; setImageSaving(false); }
     }
 
     async function startVoiceRecording(replace = false) {
         if (voicePending.current) return;
         if (!replace && (recordedAudio || transcriptionText)) { setReplaceVoiceConfirm(true); return; }
         voicePending.current = true;
-        setMicrophoneNotice("");
         setVoicePreparing(true);
         try {
-            if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error("Запись аудио в этом окне не поддерживается");
+            if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new DOMException("", "NotSupportedError");
             const stream = await navigator.mediaDevices.getUserMedia({audio: true});
             recordingStream.current = stream;
             audioChunks.current = [];
@@ -552,7 +614,7 @@ function App() {
             setRecording(true);
             setVoicePreparing(false);
             window.setTimeout(() => { if (recorder.current === nextRecorder && nextRecorder.state === "recording") nextRecorder.stop(); }, 600_000);
-        } catch (reason) { voicePending.current = false; setVoicePreparing(false); recordingStream.current?.getTracks().forEach((track) => track.stop()); recordingStream.current = null; setMicrophoneNotice(isMac ? "Проверьте доступ к микрофону: Системные настройки → Конфиденциальность и безопасность → Микрофон." : "Проверьте доступ к микрофону в настройках системы."); report("startVoiceRecording", reason); }
+        } catch (reason) { voicePending.current = false; setVoicePreparing(false); recordingStream.current?.getTracks().forEach((track) => track.stop()); recordingStream.current = null; report("startVoiceRecording", reason); }
     }
 
     const voiceAtRisk = useRef(false);
@@ -666,6 +728,7 @@ function App() {
         setMaterialsLoading(false);
         setMaterialsOpen(false);
         materialRequest.current++;
+        materialListProject.current = null;
         setProjectMaterials([]);
         setProjectFolderView(null);
         if (conversationProjectId === null) {
@@ -674,7 +737,7 @@ function App() {
             return () => { current = false; };
         }
         invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
-            .then((items) => { if (current) setProjectMaterials(items); })
+            .then((items) => { if (current) { materialListProject.current = conversationProjectId; setProjectMaterials(items); } })
             .catch((reason) => { if (current) report("materials", reason); });
         return () => { current = false; };
     }, [conversationProjectId, conversationId]);
@@ -713,14 +776,19 @@ function App() {
         let listener: Awaited<ReturnType<typeof onAction>> | null = null;
         onAction((event) => {
             if (event.actionId !== "tap") return;
+            closeNavigationSheet.current();
             const runId = event.notification?.extra?.scheduledRunId;
             if (typeof runId === "number") {
+                setTasksView(true);
                 void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => report("notifications", reason));
-                void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId}).then(setOpenedScheduledResult).catch((reason) => report("scheduledRuns", reason));
+                const request = ++scheduledResultRequest.current;
+                void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId}).then((result) => { if (request === scheduledResultRequest.current) setOpenedScheduledResult(result); }).catch((reason) => { if (request === scheduledResultRequest.current) report("scheduledRuns", reason); });
                 return;
             }
             const taskId = event.notification?.extra?.scheduledTaskId;
             if (typeof taskId === "number") {
+                setTasksView(true);
+                scheduledResultRequest.current++;
                 void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => report("scheduledRuns", reason));
                 setNotificationTaskId(taskId);
             }
@@ -753,7 +821,7 @@ function App() {
         isPermissionGranted().then((granted) => {
             if (!active || !granted) return;
             for (const run of scheduledRuns) {
-                if (notifiedRuns.current.has(run.id)) continue;
+                if (run.notified_at !== null || notifiedRuns.current.has(run.id)) continue;
                 try {
                     sendNotification({title: "Агентная задача завершена", body: "Откройте приложение, чтобы посмотреть результат.", extra: {scheduledRunId: run.id}});
                     notifiedRuns.current.add(run.id);
@@ -770,12 +838,12 @@ function App() {
         notice?.scrollIntoView({block: "center"});
         notice?.querySelector<HTMLButtonElement>("button")?.focus();
         setNotificationTaskId(null);
-    }, [notificationTaskId, scheduledTasks]);
+    }, [notificationTaskId, scheduledTasks, tasksView]);
 
     useEffect(() => {
         if (!openedScheduledResult) return;
         document.getElementById("scheduled-task-result")?.scrollIntoView({block: "center"});
-    }, [openedScheduledResult]);
+    }, [openedScheduledResult, tasksView]);
 
     useEffect(() => {
         reload(conversationId).catch((reason) => report("history", reason));
@@ -786,7 +854,7 @@ function App() {
     async function switchConversation(id: number, discardConfirmed = false) {
         if (busy || dropBusy.current) return false;
         if (id === conversationId) { if (navigation.modal) navigation.setOpen(false); return true; }
-        if (!discardConfirmed && (prompt.trim() || pendingAttachments.length) && !window.confirm("Перейти в другую беседу? Черновик и выбранные файлы будут убраны.")) return false;
+        if (!discardConfirmed && (prompt.trim() || pendingAttachments.length || planDraft.trim() || queueDraft.trim() || steeringDraft.trim()) && !await confirmAction("Перейти в другую беседу? Черновик, несохранённые записи плана и выбранные файлы будут убраны.")) return false;
         const request = ++navigationRequest.current;
         try {
             for (const attachment of pendingAttachments) await invoke("remove_text_attachment", {id: attachment.id});
@@ -797,6 +865,11 @@ function App() {
             setScheduledDraft(null);
             setCaptureNotice("");
             setBoardInputSource(null);
+            boardRequest.current++;
+            skillRequest.current++;
+            setAgentBoard({plan: [], queue: [], steering: []});
+            setAgentSkill(null);
+            setPlanDraft(""); setQueueDraft(""); setSteeringDraft("");
             contextRequest.current++;
             setContextPreview(null);
             setSelectedArtifactId(null);
@@ -810,14 +883,14 @@ function App() {
         } catch (reason) { report("switchConversation", reason); return false; }
     }
 
-    async function createConversation() {
+    async function createConversation(draftForConfirmation = prompt, confirmed = false) {
         if (busy || dropBusy.current) return;
-        if ((prompt.trim() || pendingAttachments.length) && !window.confirm("Создать беседу? Черновик и выбранные файлы будут убраны.")) return;
+        if (!confirmed && (draftForConfirmation.trim() || pendingAttachments.length || planDraft.trim() || queueDraft.trim() || steeringDraft.trim())) { setCreateConversationConfirm(true); return; }
         try {
             const id = await invoke<number>("create_conversation");
             if (projectFilter && projectFilter > 0) await invoke("move_conversation", {conversationId: id, projectId: projectFilter});
             await refreshConversations();
-            await switchConversation(id, true);
+            if (await switchConversation(id, true)) { setTasksView(false); requestAnimationFrame(() => promptField.current?.focus()); }
             clear("createConversation");
         } catch (reason) { report("createConversation", reason); }
     }
@@ -848,8 +921,8 @@ function App() {
 
     async function archiveConversation(item: Conversation) {
         if (busy) return;
-        if (item.id === conversationId && !item.archived && (prompt.trim() || pendingAttachments.length)
-            && !window.confirm("Архивировать беседу? Черновик и выбранные файлы будут убраны.")) return;
+        if (item.id === conversationId && !item.archived && (prompt.trim() || pendingAttachments.length || planDraft.trim() || queueDraft.trim() || steeringDraft.trim())
+            && !await confirmAction("Архивировать беседу? Черновик, несохранённые записи плана и выбранные файлы будут убраны.")) return;
         try {
             await invoke("archive_conversation", {conversationId: item.id, archived: !item.archived});
             const items = await refreshConversations();
@@ -922,7 +995,7 @@ function App() {
         const current = () => request === materialRequest.current && conversationId === activeConversation.current && conversationProjectId === activeMaterialProject.current;
         await Promise.all([
             invoke<ProjectMaterial[]>("list_project_materials", {projectId: conversationProjectId})
-                .then((items) => { if (current()) { setProjectMaterials(items); clear("materials"); } })
+                .then((items) => { if (current()) { materialListProject.current = conversationProjectId; setProjectMaterials(items); clear("materials"); } })
                 .catch((reason) => { if (current()) { setProjectMaterials([]); report("materials", reason); } }),
             invoke<ProjectFolderView | null>("list_project_folder", {projectId: conversationProjectId})
                 .then((folder) => { if (current()) { setProjectFolderView(folder); clear("folder"); } })
@@ -949,6 +1022,7 @@ function App() {
             if (!attachment) return;
             const material = await invoke<ProjectMaterial>("save_project_material", {projectId: conversationProjectId, attachmentId: attachment.id});
             if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
+            materialListProject.current = conversationProjectId;
             setProjectMaterials((items) => [...items.filter((item) => item.id !== material.id), material]);
             setContextPreview(null);
             clear("addProjectMaterial");
@@ -988,6 +1062,7 @@ function App() {
                 projectId: conversationProjectId, relativePath: folderPreview.name, expectedSha256: folderPreview.sha256
             });
             if (conversationId !== activeConversation.current || conversationProjectId !== activeMaterialProject.current) return;
+            materialListProject.current = conversationProjectId;
             setProjectMaterials((items) => [...items, material]);
             setFolderPreview(null);
             clear("saveFolderPreview");
@@ -1005,15 +1080,31 @@ function App() {
     }
 
     async function restoreBackup() {
-        if (!selectedBackup || busy || !window.confirm(`Восстановить копию ${selectedBackup}? Текущая история будет сохранена отдельной копией.`)) return;
+        if (!selectedBackup || busy || !await confirmAction(`Восстановить копию ${selectedBackup}? Текущая история будет сохранена отдельной копией. Выбранные файлы и несохранённые записи плана, очереди и уточнений будут убраны.`)) return;
         try {
             await invoke("restore_backup", {name: selectedBackup});
+            scheduledResultRequest.current++;
+            setOpenedScheduledResult(null);
+            setScheduledDraft(null);
+            setNotificationTaskId(null);
+            setScheduledTasks([]);
+            setScheduledRuns([]);
+            notifiedDueTasks.current.clear();
+            notifiedRuns.current.clear();
+            await Promise.all([refreshScheduledTasks(), refreshScheduledRuns()]);
             const items = await refreshConversations();
             setProjects(await invoke<Project[]>("list_projects"));
             setProjectFilter(null);
             const nextId = items.some((item) => item.id === conversationId && !item.archived)
                 ? conversationId : items.find((item) => !item.archived)?.id ?? items[0]?.id ?? 1;
+            boardRequest.current++;
+            skillRequest.current++;
+            setAgentBoard({plan: [], queue: [], steering: []});
+            setAgentSkill(null);
+            setPlanDraft(""); setQueueDraft(""); setSteeringDraft(""); setBoardInputSource(null);
+            activeConversation.current = nextId;
             setConversationId(nextId);
+            await Promise.all([refreshAgentBoard(nextId), refreshAgentSkill(nextId), refreshSyntheticTasks()]);
             await reload(nextId);
             setCatalog(await invoke<ModelCatalog | null>("list_models"));
             setCategories(await invoke<ModelCategory[]>("list_model_categories"));
@@ -1140,7 +1231,7 @@ function App() {
         const signature = contextSignature();
         if (!value || busy || !contextPreview?.confirmation_id || previewSignature !== signature) return;
         const tools = contextPreview.project_search_enabled ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
-        if (agentMode && !window.confirm(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
+        if (agentMode && !await confirmAction(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
         if (scheduledDraft && value === scheduledDraft.prompt && (!agentMode || modelId !== "gpt-oss-20b")) {
             report("send", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
             return;
@@ -1259,7 +1350,7 @@ function App() {
     }
 
     async function retry(assistantId: number) {
-        if (modelId !== "local-mock" && !window.confirm("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
+        if (modelId !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
         await runGeneration(modelId === "local-mock" ? "retry_mock_generation" : "retry_generation", {assistantId, modelId});
     }
 
@@ -1315,6 +1406,13 @@ function App() {
         }
     }
 
+    useEffect(() => {
+        if (!checkAfterSlash.current) return;
+        checkAfterSlash.current = false;
+        if (prompt.trim() && !busy) void checkContext();
+        else promptField.current?.focus();
+    }, [prompt]);
+
     async function openArtifact(messageId: number, kind: "code" | "html" | "svg", title: string, content: string) {
         artifactTrigger.current = document.activeElement as HTMLElement;
         try {
@@ -1338,20 +1436,24 @@ function App() {
 
     function closeArtifact() {
         setSelectedArtifactId(null);
-        requestAnimationFrame(() => (artifactTrigger.current?.isConnected ? artifactTrigger.current : promptField.current)?.focus());
+        requestAnimationFrame(() => (artifactTrigger.current?.isConnected ? artifactTrigger.current : promptField.current)?.focus({preventScroll: true}));
     }
 
-    function runPaletteCommand(command: string) {
-        closePalette();
+    function runCommand(command: string) {
         if (command === "new") {
             void createConversation();
-            requestAnimationFrame(() => promptField.current?.focus());
         } else if (command === "search") {
             navigation.setOpen(true);
             requestAnimationFrame(() => chatSearchField.current?.focus());
         } else if (command === "settings") {
             if (navigation.modal) navigation.setOpen(false);
+            settingsTrigger.current = paletteTrigger.current;
             setSettingsOpen(true);
+        } else if (command === "navigation") {
+            navigation.setOpen(!navigation.open);
+        } else if (command === "context") {
+            if (prompt.trim() && !busy) void checkContext();
+            else promptField.current?.focus();
         } else if (command === "attach") {
             requestAnimationFrame(() => void pickAttachment());
         } else if (command === "attach-image") {
@@ -1365,13 +1467,64 @@ function App() {
     }
 
     const paletteCommands = [
-        {id: "new", label: "Новая беседа"},
+        {id: "new", label: "Новая беседа", shortcut: "⌘N / Ctrl+N"},
         {id: "search", label: "Найти беседу"},
-        {id: "settings", label: "Настройки"},
+        {id: "context", label: "Проверить контекст"},
+        {id: "navigation", label: "Показать или скрыть навигацию", shortcut: "⌘B / Ctrl+B"},
+        {id: "settings", label: "Настройки", shortcut: "⌘, / Ctrl+,"},
         {id: "attach", label: "Прикрепить текстовый файл"},
         {id: "attach-image", label: "Прикрепить изображение"},
         {id: "artifact", label: "Открыть последний результат"},
     ].filter((command) => command.label.toLocaleLowerCase().includes(paletteQuery.trim().toLocaleLowerCase()));
+
+    const lineStart = prompt.lastIndexOf("\n", Math.max(0, promptCaret - 1)) + 1;
+    const lineEnd = prompt.indexOf("\n", promptCaret);
+    const line = prompt.slice(lineStart, lineEnd < 0 ? undefined : lineEnd);
+    const slashQuery = /^\/([^\n]*)$/.exec(line);
+    const slashCommands = [
+        {id: "new", label: "Новая беседа"},
+        {id: "search", label: "Найти беседу"},
+        {id: "context", label: "Проверить контекст"},
+    ].filter((command) => command.label.toLocaleLowerCase().includes((slashQuery?.[1] ?? "").trim().toLocaleLowerCase()));
+    const mentionMatch = /(?:^|\s)@([^@\n]*)$/.exec(prompt.slice(0, promptCaret));
+    const mentionStart = mentionMatch ? promptCaret - mentionMatch[1].length - 1 : 0;
+    const mentionQuery = (mentionMatch?.[1] ?? "").toLocaleLowerCase();
+    const mentionItems = (conversationProjectId !== null
+        ? (materialListProject.current === conversationProjectId ? projectMaterials : []).map((item) => ({kind: "material" as const, id: item.id, name: item.name, detail: `версия ${item.version} · ${item.name.includes(".") ? item.name.split(".").pop() : "файл"}`}))
+        : pendingAttachments.map((item) => ({kind: "attachment" as const, id: item.id, name: item.name, detail: item.mime})))
+        .filter((item) => item.name.toLocaleLowerCase().includes(mentionQuery));
+    const mentionOpen = !!mentionMatch && !mentionDismissed;
+    const activeMention = Math.min(mentionIndex, mentionItems.length - 1);
+    const mentionDisabled = (item: typeof mentionItems[number]) => busy || dropLoading || (item.kind === "material" && !selectedMaterialIds.includes(item.id) && pendingAttachments.length + selectedMaterialIds.length >= 5);
+    function chooseMention(item: typeof mentionItems[number]) {
+        if (mentionDisabled(item)) return;
+        const replacement = "";
+        const next = prompt.slice(0, mentionStart) + replacement + prompt.slice(promptCaret);
+        if (next.length > 2000) return;
+        if (item.kind === "material") setSelectedMaterialIds((ids) => ids.includes(item.id) ? ids : [...ids, item.id]);
+        const caret = mentionStart + replacement.length;
+        setPrompt(next);
+        setPromptCaret(caret);
+        setMentionDismissed(true);
+        setContextPreview(null);
+        requestAnimationFrame(() => { promptField.current?.focus(); promptField.current?.setSelectionRange(caret, caret); });
+    }
+    useEffect(() => {
+        if (mentionOpen && activeMention >= 0) document.getElementById(`mention-${mentionItems[activeMention].kind}-${mentionItems[activeMention].id}`)?.scrollIntoView({block: "nearest"});
+    }, [mentionOpen, activeMention, mentionQuery]);
+    const slashOpen = !!slashQuery && !mentionOpen && !slashDismissed;
+    const activeSlash = Math.min(slashIndex, slashCommands.length - 1);
+    const slashRemainder = prompt.slice(0, lineStart) + (lineEnd < 0 ? "" : prompt.slice(lineEnd + 1));
+    const slashDisabled = (command: string) => (busy && ["new", "context"].includes(command)) || (command === "context" && !slashRemainder.trim());
+
+    function runSlashCommand(command: string) {
+        setSlashDismissed(true);
+        if (command === "new") { void createConversation(slashRemainder); return; }
+        if (command === "context") checkAfterSlash.current = true;
+        setPrompt(slashRemainder);
+        setContextPreview(null);
+        if (command !== "context") runCommand(command);
+    }
 
     const byId = new Map(history.messages.map((message) => [message.id, message]));
     const activeIds = new Set<number>();
@@ -1383,8 +1536,10 @@ function App() {
     }
     const visible = history.messages.filter((message) => activeIds.has(message.id) && (!busy || message.status !== "streaming"));
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
+    const artifactSide = navigation.viewport >= 48 + (navigation.open && !navigation.modal ? navigation.width : 0) + 560 + 360;
     const selectedConversation = conversations.find((item) => item.id === conversationId);
     const imageModels = catalog?.models.filter((model) => model.protocols.includes("images_generations")) ?? [];
+    const selectedImageModel = imageModels.find((model) => model.id === imageModelId) ?? imageModels[0];
     const transcriptionModels = catalog?.models.filter((model) => model.protocols.includes("audio_transcriptions") && model.audio_rubles_per_minute !== null) ?? [];
     const selectedTranscriptionModel = transcriptionModels.find((model) => model.id === transcriptionModelId) ?? transcriptionModels[0];
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
@@ -1398,8 +1553,8 @@ function App() {
         }
         return false;
     }
-    function operationErrors(area: ErrorArea) {
-        return errors.filter((error) => error.area === area).map((error) => <OperationNotice key={error.id} error={error}>
+    function operationErrors(area: ErrorArea, operations?: string[]) {
+        return errors.filter((error) => error.area === area && (!operations || operations.some((operation) => error.id.endsWith(`:${operation}`)))).map((error) => <OperationNotice key={error.id} error={error}>
             {area === "connection" && <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button>}
             {area === "catalog" && error.id.endsWith(":catalog") && <>
                 <p>{catalog ? `Каталог устарел. Сохранённый список от ${new Date(catalog.fetched_at * 1000).toLocaleString()} доступен.` : "Не удалось загрузить модели. Локальный тест остаётся доступным."}</p>
@@ -1415,18 +1570,20 @@ function App() {
     const sidebar = <ProjectSidebar conversations={conversations} projects={projects} selectedId={conversationId}
         projectFilter={projectFilter} busy={busy} query={conversationSearch} matches={searchMatches} recentIds={recentIds}
         searchRef={chatSearchField} onQuery={setConversationSearch} onFilter={(id) => { setProjectFilter(id); setSearchMatches(null); }}
-        onSelect={(id) => void switchConversation(id)} onNew={() => void createConversation()} onNewProject={() => void createProject()}
+        onSelect={(id) => void switchConversation(id).then((switched) => { if (switched) setTasksView(false); })} onNew={() => void createConversation()} onNewProject={() => void createProject()}
         onRename={setRenameTarget} onArchive={(item) => void archiveConversation(item)} onPin={(item) => void togglePin(item)}
         onArchiveProject={(item) => void archiveProject(item)} onMove={(id, projectId) => void moveConversation(projectId, id)}>
         {operationErrors("navigation")}
     </ProjectSidebar>;
     return (
-        <main className={`app-shell${selectedArtifact ? ` with-artifact${navigation.viewport >= 48 + (navigation.open && !navigation.modal ? navigation.width : 0) + 560 + 360 ? " artifact-side" : ""}` : ""}${navigation.open && !navigation.modal ? " navigation-open" : ""}`}
+        <main className={`app-shell${tasksView || imageView ? " tasks-view-open" : ""}${selectedArtifact && !tasksView && !imageView ? ` with-artifact${artifactSide ? " artifact-side" : ""}` : ""}${navigation.open && !navigation.modal ? " navigation-open" : ""}`}
               style={{"--navigation-width": `${navigation.width}px`} as React.CSSProperties}>
             <nav className="app-dock" aria-label="Разделы приложения">
-                <button type="button" className="dock-button dock-current" aria-label="Беседы" aria-current="page" title="Беседы · ⌘B / Ctrl+B"
-                        onClick={(event) => navigation.setOpen(!navigation.open, event.currentTarget)}><ShellIcon name="chat"/></button>
-                <button ref={settingsButton} type="button" className="dock-button dock-settings" aria-label="Настройки" title="Настройки"
+                <button type="button" className={`dock-button${view === "chat" ? " dock-current" : ""}`} aria-label="Беседы" aria-current={view === "chat" ? "page" : undefined} title="Беседы · ⌘B / Ctrl+B"
+                        onClick={(event) => { if (view !== "chat") setTasksView(false); else navigation.setOpen(!navigation.open, event.currentTarget); }}><ShellIcon name="chat"/></button>
+                <button type="button" className={`dock-button${tasksView ? " dock-current" : ""}`} aria-label={scheduledTasks.some((task) => task.status === "awaiting_confirmation") ? "Задачи: ожидают подтверждения" : "Задачи"} aria-current={tasksView ? "page" : undefined} title="Задачи" onClick={() => { setTasksView(true); requestAnimationFrame(() => tasksBack.current?.focus()); }}><ShellIcon name="clock"/>{scheduledTasks.some((task) => task.status === "awaiting_confirmation") && <span className="task-indicator" aria-hidden="true"/>}</button>
+                <button type="button" className={`dock-button${imageView ? " dock-current" : ""}`} aria-label="Генерация изображений" aria-current={imageView ? "page" : undefined} title="Генерация изображений" onClick={() => { setView("image"); requestAnimationFrame(() => imageBack.current?.focus()); }}><ShellIcon name="image"/></button>
+                <button ref={settingsButton} type="button" className="dock-button dock-settings" aria-label="Настройки" title="Настройки · ⌘, / Ctrl+,"
                         onClick={() => setSettingsOpen(true)}><ShellIcon name="settings"/></button>
             </nav>
             {!navigation.modal && navigation.open && <aside className="project-sidebar" aria-label="Навигация">
@@ -1444,9 +1601,11 @@ function App() {
             <Dialog open={navigation.modal && navigation.open} onOpenChange={navigation.setOpen}>
                 <DialogContent className="navigation-sheet top-0 left-12 translate-x-0 translate-y-0" aria-describedby={undefined}
                                onOpenAutoFocus={(event) => { event.preventDefault(); chatSearchField.current?.focus(); }}
-                               onCloseAutoFocus={(event) => { event.preventDefault(); navigation.restoreFocus(); }}>
+                               onCloseAutoFocus={(event) => { event.preventDefault(); if (tasksView) tasksBack.current?.focus(); else if (imageView) imageBack.current?.focus(); else navigation.restoreFocus(); }}>
                     <div className="navigation-heading"><DialogTitle>Беседы</DialogTitle><button type="button" className="navigation-menu" aria-label="Закрыть навигацию" onClick={() => navigation.setOpen(false)}><ShellIcon name="close"/></button></div>
                     {navigation.modal && sidebar}
+                    <button type="button" className="secondary-button" onClick={() => { navigation.setOpen(false); setTasksView(true); }}>Задачи{scheduledTasks.some((task) => task.status === "awaiting_confirmation") ? " · ожидают подтверждения" : ""}</button>
+                    <button type="button" className="secondary-button" onClick={() => { navigation.setOpen(false); setView("image"); }}>Генерация изображений</button>
                     <button type="button" className="secondary-button sheet-settings" onClick={() => { navigation.setOpen(false); setSettingsOpen(true); }}>Настройки</button>
                 </DialogContent>
             </Dialog>
@@ -1462,8 +1621,8 @@ function App() {
             <section ref={chatPanel} className={`chat-panel${draggingFiles ? " file-dragging" : ""}`} aria-label={selectedConversation?.title ?? "Беседа"}>
                 {draggingFiles && <div className="file-drop-hint" role="status">Добавить файлы в сообщение</div>}
                 <header className="chat-header">
-                    <button ref={navigation.trigger} type="button" className="navigation-menu navigation-toggle" aria-label="Открыть навигацию" aria-expanded={navigation.open} title="Навигация · ⌘B / Ctrl+B"
-                            onClick={(event) => navigation.setOpen(!navigation.open, event.currentTarget)}><ShellIcon name="panel"/></button>
+                    <button ref={navigation.trigger} type="button" className="navigation-menu navigation-toggle" aria-label={scheduledTasks.some((task) => task.status === "awaiting_confirmation") ? "Открыть навигацию: задачи ожидают подтверждения" : "Открыть навигацию"} aria-expanded={navigation.open} title="Навигация · ⌘B / Ctrl+B"
+                            onClick={(event) => navigation.setOpen(!navigation.open, event.currentTarget)}><ShellIcon name="panel"/>{scheduledTasks.some((task) => task.status === "awaiting_confirmation") && <span className="compact-task-indicator" aria-hidden="true"/>}</button>
                     <h1>{selectedConversation?.title ?? "Беседа"}</h1>
                     <select className="conversation-project" aria-label="Проект беседы" value={selectedConversation?.project_id ?? 0}
                             disabled={busy || !selectedConversation} onChange={(event) => void moveConversation(Number(event.target.value) || null)}>
@@ -1521,18 +1680,11 @@ function App() {
                         </section>}
                     </section>}
                 <div className="conversation-view" hidden={materialsOpen}>
-                <div className="history" aria-label="История сообщений" role="region">
-                {openedScheduledResult && <section className="scheduled-task-notice" role="region" aria-label="Результат агентной задачи" id="scheduled-task-result">
-                    <strong>Результат задачи: {openedScheduledResult.title}</strong>
-                    <p className="scheduled-result-content">{openedScheduledResult.content || "Ответ завершён без текста."}</p>
-                    <button type="button" className="secondary-button" onClick={() => setOpenedScheduledResult(null)}>Закрыть результат</button>
-                </section>}
-                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" id={`scheduled-task-${task.id}`} key={task.id}>
-                    <strong>По расписанию наступила задача: {task.title}</strong>
-                    <p>Автоматический запуск не выполнялся. После подтверждения текст попадёт в черновик; платный запрос потребует обычной проверки контекста и отдельного подтверждения.</p>
-                    <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
-                    <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить расписание</button>
-                </section>)}
+                <div className="history" aria-label="История сообщений" role="region" ref={historyRef} onScroll={(event) => {
+                    const element = event.currentTarget;
+                    historyAtBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 48;
+                    setShowNewMessages(!historyAtBottom.current);
+                }}>
                     <div className="history-content">
                     {visible.length === 0 && !busy && (
                         <div className="empty-state">
@@ -1620,11 +1772,58 @@ function App() {
                             )}
                         </article>
                     ))}
+                <details className="agent-board-panel">
+                    <summary>План и очередь этой беседы</summary>
+                    {operationErrors("agent", ["agentBoard", "addPlanStep", "completePlanStep", "addBoardInput"])}
+                    <p>Локальные записи сохраняются в этой беседе. Использование очереди или уточнения только вставляет текст в черновик; запрос отправится лишь после проверки контекста и нажатия «Отправить».</p>
+                    <p>Текст добавляется к текущему черновику. Если превышен предел 2000 символов, сократите черновик.</p>
+                    <section>
+                        <h2>План</h2>
+                        <div className="agent-board-entry">
+                            <input value={planDraft} maxLength={200} placeholder="Следующий шаг плана" onChange={(event) => setPlanDraft(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!planDraft.trim()} onClick={() => void addPlanStep()}>Сохранить шаг</button>
+                        </div>
+                        {agentBoard.plan.map((step) => <div className="agent-board-item" key={step.id}>
+                            <span>{step.ordinal + 1}. {step.action} · {step.status === "completed" ? "выполнено" : "ожидает"}</span>
+                            {step.status === "pending" && <button type="button" className="secondary-button" onClick={() => void completePlanStep(step.id)}>Отметить выполненным</button>}
+                        </div>)}
+                        {!agentBoard.plan.length && <p>Шаги ещё не добавлены.</p>}
+                    </section>
+                    <section>
+                        <h2>Очередь</h2>
+                        <div className="agent-board-entry">
+                            <input value={queueDraft} maxLength={2000} placeholder="Следующая просьба" onChange={(event) => setQueueDraft(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!queueDraft.trim()} onClick={() => void addBoardInput("queue")}>Добавить</button>
+                        </div>
+                        {agentBoard.queue.map((item) => <div className="agent-board-item" key={item.id}>
+                            <span>{item.text} · {item.status === "submitted" ? "отправлено" : "ожидает"}</span>
+                            {item.status === "queued" && <button type="button" className="secondary-button" disabled={prompt.length + (prompt ? 1 : 0) + item.text.length > 2000} onClick={() => useBoardInput("queue", item)}>Вставить в черновик</button>}
+                        </div>)}
+                        {!agentBoard.queue.length && <p>Очередь пуста.</p>}
+                    </section>
+                    <section>
+                        <h2>Уточнения</h2>
+                        <div className="agent-board-entry">
+                            <input value={steeringDraft} maxLength={1000} placeholder="Уточнить направление" onChange={(event) => setSteeringDraft(event.target.value)}/>
+                            <button type="button" className="secondary-button" disabled={!steeringDraft.trim()} onClick={() => void addBoardInput("steering")}>Сохранить уточнение</button>
+                        </div>
+                        {agentBoard.steering.map((item) => <div className="agent-board-item" key={item.id}>
+                            <span>{item.text} · {item.status === "submitted" ? "отправлено" : "ожидает"}</span>
+                            {item.status === "pending" && <button type="button" className="secondary-button" disabled={prompt.length + (prompt ? 1 : 0) + item.text.length > 2000} onClick={() => useBoardInput("steering", item)}>Вставить в черновик</button>}
+                        </div>)}
+                        {!agentBoard.steering.length && <p>Уточнений нет.</p>}
+                    </section>
+                </details>
                     {!busy && draft && <article className="message message-assistant"><strong>Полученный текст</strong><p>{draft}</p>
                         <small>Загрузка сохранённого ответа не завершена. Проверьте историю; расход без usage неизвестен.</small></article>}
                     {busy && <article className="message message-assistant"><strong>Ответ</strong>
-                        <p>{draft || "Ожидание ответа…"}</p><small>Ответ продолжается</small></article>}
+                        <p>{draft || "Ожидание ответа…"}</p><small>Модель: {modelId} · Ответ продолжается</small></article>}
                     </div>
+                {showNewMessages && <button type="button" className="history-latest secondary-button" onClick={() => {
+                    historyAtBottom.current = true;
+                    historyRef.current?.scrollTo({top: historyRef.current.scrollHeight});
+                    setShowNewMessages(false);
+                }}>К новым сообщениям</button>}
                 </div>
                 <form className="composer" onSubmit={(event) => {
                     event.preventDefault();
@@ -1643,19 +1842,55 @@ function App() {
                     </div>}
                     {captureNotice && <p role="status">{captureNotice}</p>}
                     {!voiceOpen && (recording || voicePreparing || recordedAudio || transcriptionText || transcribing) && <button type="button" className="secondary-button" onClick={() => setVoiceOpen(true)}>Открыть голосовой ввод · {recording ? "идёт запись" : "есть несохранённые данные"}</button>}
-                    {operationErrors("artifact")}
+                    {!selectedArtifact && operationErrors("artifact")}
                     <label className="sr-only" htmlFor="prompt">Сообщение</label>
                     <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000} rows={2}
+                              aria-autocomplete="list" aria-controls={mentionOpen ? "material-mentions" : slashOpen ? "slash-commands" : undefined}
+                              aria-activedescendant={mentionOpen && activeMention >= 0 ? `mention-${mentionItems[activeMention].kind}-${mentionItems[activeMention].id}` : slashOpen && activeSlash >= 0 ? `slash-command-${slashCommands[activeSlash].id}` : undefined}
+                              onSelect={(event) => setPromptCaret(event.currentTarget.selectionStart)}
+                              onBlur={(event) => { setSlashDismissed(true); if (!(event.relatedTarget instanceof HTMLElement && event.relatedTarget.id === "mention-pick-file")) setMentionDismissed(true); }}
                               onKeyDown={(event) => {
-                                  if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || event.defaultPrevented || event.currentTarget.getAttribute("aria-expanded") === "true") return;
+                                  if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+                                  if (mentionOpen) {
+                                      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setMentionDismissed(true); return; }
+                                      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) { event.preventDefault(); if (mentionItems.length) setMentionIndex((index) => (index + (event.key === "ArrowDown" ? 1 : -1) + mentionItems.length) % mentionItems.length); return; }
+                                      if ((event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) || (event.key === "Tab" && !event.shiftKey && activeMention >= 0 && !mentionDisabled(mentionItems[activeMention]))) { event.preventDefault(); if (activeMention >= 0) chooseMention(mentionItems[activeMention]); return; }
+                                  }
+                                  if (slashOpen) {
+                                      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setSlashDismissed(true); return; }
+                                      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) { event.preventDefault(); if (slashCommands.length) setSlashIndex((index) => (index + (event.key === "ArrowDown" ? 1 : -1) + slashCommands.length) % slashCommands.length); return; }
+                                      if ((event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) || (event.key === "Tab" && !event.shiftKey && activeSlash >= 0 && !slashDisabled(slashCommands[activeSlash].id))) { event.preventDefault(); if (activeSlash >= 0 && !slashDisabled(slashCommands[activeSlash].id)) runSlashCommand(slashCommands[activeSlash].id); return; }
+                                  }
+                                  if (event.key !== "Enter" || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || event.defaultPrevented || slashOpen || mentionOpen) return;
                                   event.preventDefault();
                                   void submitPrompt();
                               }}
                               placeholder="Напишите сообщение" onChange={(event) => {
                         setPrompt(event.target.value);
+                        setPromptCaret(event.target.selectionStart);
+                        setSlashDismissed(false);
+                        setSlashIndex(0);
+                        setMentionDismissed(false);
+                        setMentionIndex(0);
                         setBoardInputSource((source) => source && source.text !== event.target.value ? null : source);
                         setContextPreview(null);
                     }}/>
+                    {mentionOpen && <div className="slash-commands mention-commands">
+                        <div id="material-mentions" role="listbox" aria-label="Материалы для сообщения">
+                            {mentionItems.map((item, index) => <div id={`mention-${item.kind}-${item.id}`} key={`${item.kind}-${item.id}`} role="option"
+                                aria-selected={index === activeMention} aria-disabled={mentionDisabled(item)}
+                                onMouseDown={(event) => event.preventDefault()} onClick={() => chooseMention(item)}>{item.name} · {item.detail}</div>)}
+                        </div>
+                        {!mentionItems.length && <><p role="status">Нет доступных материалов</p><button id="mention-pick-file" type="button" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5}
+                            onBlur={() => setMentionDismissed(true)} onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setMentionDismissed(true); promptField.current?.focus(); } }} onClick={() => { setMentionDismissed(true); void pickAttachment(); }}>Выбрать файл…</button></>}
+                    </div>}
+                    {slashOpen && <div id="slash-commands" className="slash-commands" role="listbox" aria-label="Команды сообщения">
+                        {slashCommands.map((command, index) => <div id={`slash-command-${command.id}`} key={command.id} role="option"
+                            aria-selected={index === activeSlash} aria-disabled={slashDisabled(command.id)}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => { if (!slashDisabled(command.id)) runSlashCommand(command.id); }}>{command.label}{command.id === "context" && !slashRemainder.trim() ? " · добавьте текст сообщения" : ""}</div>)}
+                        {!slashCommands.length && <p role="status">Команды не найдены.</p>}
+                    </div>}
                     {prompt.length >= 1600 && <small aria-live="polite">{prompt.length}/2000</small>}
                     {composerToolsOpen && <div ref={composerMenu} className="composer-menu" role="menu" aria-label="Добавить к сообщению" onKeyDown={(event) => {
                         if (event.key === "Escape") { event.preventDefault(); setComposerToolsOpen(false); composerMenuButton.current?.focus(); }
@@ -1676,7 +1911,6 @@ function App() {
                     </div>}
                     {voiceOpen && <section className="voice-input" aria-label="Голосовой ввод">
                         {operationErrors("voice")}
-                        {microphoneNotice && <p role="status">{microphoneNotice}</p>}
                         <div className="voice-controls">
                             {recording ? <button type="button" className="secondary-button" onClick={stopVoiceRecording}>Остановить запись</button> :
                                 <button type="button" className="secondary-button" disabled={busy || transcribing || voicePreparing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
@@ -1737,6 +1971,7 @@ function App() {
                     {composerSettingsOpen && <section className="composer-extra" aria-label="Дополнительные настройки">
                     <button type="button" className="secondary-button" onClick={() => setComposerSettingsOpen(false)}>Скрыть дополнительные настройки</button>
                     {conversationProjectId !== null && <div className="agent-skill-picker">
+                            {operationErrors("agent", ["agentSkill", "saveAgentSkill"])}
                             <h3>Локальный навык</h3>
                             <p>Выберите Markdown-материал этого проекта. Инструкция попадёт только в агентный запрос после явного включения; навык не добавляет доступ к файлам, командам или сети.</p>
                             <label htmlFor="agent-skill-source">Источник</label>
@@ -1816,87 +2051,17 @@ function App() {
                     {modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
 
                 </form>
-                <div className="legacy-tools" aria-label="Дополнительные инструменты">
-                <details className="synthetic-task-panel" open={syntheticTasks.some((task) => task.status === "awaiting_approval")}>
-                    <summary>Локальная демонстрация многошаговых действий</summary>
-                    {operationErrors("agent")}
-                    <p>Синтетические шаги работают только в SQLite. Здесь нет сетевых запросов, файловых команд или внешних инструментов.</p>
-                    <button type="button" className="secondary-button" onClick={() => void startSyntheticTask()}>Создать демонстрацию</button>
-                    {syntheticTasks.map((task) => <article className="synthetic-task" key={task.id}>
-                        <h2>{task.title} · {task.status === "awaiting_approval" ? "ожидает решения" : task.status === "completed" ? "завершена" : "отклонена"}</h2>
-                        {task.steps.map((step) => <div className="synthetic-task-step" key={step.id}>
-                            <p>{step.ordinal + 1}. {step.action} · {step.decision === "pending" ? "ожидает разрешения" : step.decision === "approved" ? "разрешено" : "отклонено"}</p>
-                            {step.result && <p>{step.result}</p>}
-                            {step.decision === "pending" && <div className="actions">
-                                <button type="button" onClick={() => void decideSyntheticStep(task.id, step.id, "approve")}>Разрешить и выполнить</button>
-                                <button type="button" className="secondary-button" onClick={() => void decideSyntheticStep(task.id, step.id, "deny")}>Отклонить</button>
-                            </div>}
-                        </div>)}
-                    </article>)}
-                </details>
-                <details className="scheduled-task-panel" open={scheduledTasks.some((task) => task.conversation_id === conversationId && task.status === "awaiting_confirmation")}>
-                    <summary>Расписание агентных задач</summary>
-                    {operationErrors("schedule")}
-                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Уведомление ведёт к ожидающей задаче или готовому результату. Закрытое приложение не выполняет задачи. Отправка всегда остаётся ручной.</p>
-                    {scheduleNotificationsEnabled ?
-                        <button type="button" className="secondary-button" onClick={() => { localStorage.removeItem("scheduleNotifications"); setScheduleNotificationsEnabled(false); }}>Выключить уведомления</button> :
-                        <button type="button" className="secondary-button" onClick={() => void enableScheduleNotifications()}>Включить уведомления</button>}
-                    <label>Название<input value={scheduleTitle} maxLength={120} onChange={(event) => setScheduleTitle(event.target.value)}/></label>
-                    <label>Текст задачи<textarea value={schedulePrompt} maxLength={2000} rows={2} onChange={(event) => setSchedulePrompt(event.target.value)}/></label>
-                    <label>Повторять каждые, минут<input type="number" min={1} max={10080} value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value)}/></label>
-                    <button type="button" className="secondary-button" disabled={!scheduleTitle.trim() || !schedulePrompt.trim() || !scheduleInterval}
-                            onClick={() => void createScheduledTask()}>Сохранить расписание</button>
-                    {scheduledTasks.filter((task) => task.conversation_id === conversationId).map((task) => <div className="scheduled-task-row" key={task.id}>
-                        <span>{task.title} · каждые {task.interval_minutes} мин · {task.status === "active" ? `следующий срок ${new Date(task.next_run_at * 1000).toLocaleString()}` : task.status === "awaiting_confirmation" ? "ожидает подтверждения" : "остановлено"}</span>
-                        {task.status !== "stopped" && <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить</button>}
-                    </div>)}
-                </details>
-                <details className="agent-board-panel" open={busy || agentBoard.plan.length > 0 || agentBoard.queue.some((item) => item.status === "queued") || agentBoard.steering.some((item) => item.status === "pending")}>
-                    <summary>План, очередь и уточнения для агента</summary>
-                    <p>Локальные записи сохраняются в этой беседе. Использование очереди или уточнения только вставляет текст в черновик; запрос отправится лишь после проверки контекста и нажатия «Отправить».</p>
-                    <section>
-                        <h2>План</h2>
-                        <div className="agent-board-entry">
-                            <input value={planDraft} maxLength={200} placeholder="Следующий шаг плана" onChange={(event) => setPlanDraft(event.target.value)}/>
-                            <button type="button" className="secondary-button" disabled={!planDraft.trim()} onClick={() => void addPlanStep()}>Сохранить шаг</button>
-                        </div>
-                        {agentBoard.plan.map((step) => <div className="agent-board-item" key={step.id}>
-                            <span>{step.ordinal + 1}. {step.action} · {step.status === "completed" ? "выполнено" : "ожидает"}</span>
-                            {step.status === "pending" && <button type="button" className="secondary-button" onClick={() => void completePlanStep(step.id)}>Отметить выполненным</button>}
-                        </div>)}
-                        {!agentBoard.plan.length && <p>Шаги ещё не добавлены.</p>}
-                    </section>
-                    <section>
-                        <h2>Очередь</h2>
-                        <div className="agent-board-entry">
-                            <input value={queueDraft} maxLength={2000} placeholder="Следующая просьба" onChange={(event) => setQueueDraft(event.target.value)}/>
-                            <button type="button" className="secondary-button" disabled={!queueDraft.trim()} onClick={() => void addBoardInput("queue")}>Добавить</button>
-                        </div>
-                        {agentBoard.queue.map((item) => <div className="agent-board-item" key={item.id}>
-                            <span>{item.text} · {item.status === "submitted" ? "отправлено" : "ожидает"}</span>
-                            {item.status === "queued" && <button type="button" className="secondary-button" onClick={() => useBoardInput("queue", item)}>Вставить в черновик</button>}
-                        </div>)}
-                        {!agentBoard.queue.length && <p>Очередь пуста.</p>}
-                    </section>
-                    <section>
-                        <h2>Уточнения</h2>
-                        <div className="agent-board-entry">
-                            <input value={steeringDraft} maxLength={1000} placeholder="Уточнить направление" onChange={(event) => setSteeringDraft(event.target.value)}/>
-                            <button type="button" className="secondary-button" disabled={!steeringDraft.trim()} onClick={() => void addBoardInput("steering")}>Сохранить уточнение</button>
-                        </div>
-                        {agentBoard.steering.map((item) => <div className="agent-board-item" key={item.id}>
-                            <span>{item.text} · {item.status === "submitted" ? "отправлено" : "ожидает"}</span>
-                            {item.status === "pending" && <button type="button" className="secondary-button" onClick={() => useBoardInput("steering", item)}>Вставить в черновик</button>}
-                        </div>)}
-                        {!agentBoard.steering.length && <p>Уточнений нет.</p>}
-                    </section>
-                </details>
-                <details className="image-generation-panel">
-                    <summary>Генерация изображения</summary>
+                </div>
+            </section>
+            {imageView && <section className="tasks-view" aria-label="Генерация изображений">
+                <header className="chat-header"><button ref={imageBack} type="button" className="secondary-button" onClick={() => { setSelectedArtifactId(null); setView("chat"); requestAnimationFrame(() => promptField.current?.focus()); }}>К беседе</button><h1>Генерация изображений</h1></header>
+                <div className="tasks-content"><div className="image-generation-panel">
                     {operationErrors("image")}
+                    {operationErrors("connection", ["generateImage"])}
+                    {operationErrors("catalog")}
                     <p>Поставщик: SimpleClaw. Один запрос создаёт одно изображение. Перед каждым платным запросом потребуется подтверждение.</p>
                     <label htmlFor="image-generation-model">Модель</label>
-                    <select id="image-generation-model" value={imageModelId || imageModels[0]?.id || ""} disabled={imageGenerationBusy}
+                    <select id="image-generation-model" value={selectedImageModel?.id || ""} disabled={imageGenerationBusy}
                             onChange={(event) => setImageModelId(event.target.value)}>
                         {imageModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}</option>)}
                     </select>
@@ -1910,38 +2075,103 @@ function App() {
                     <label htmlFor="image-generation-prompt">Описание изображения</label>
                     <textarea id="image-generation-prompt" maxLength={32_000} value={imagePrompt} disabled={imageGenerationBusy}
                               onChange={(event) => setImagePrompt(event.target.value)} placeholder="Опишите изображение"/>
-                    <button type="button" disabled={imageGenerationBusy || !imagePrompt.trim() || uncertainImageSignature === JSON.stringify([imageModelId || imageModels[0]?.id || "", imagePrompt.trim()]) || !imageModels.some((model) => model.id === (imageModelId || imageModels[0]?.id) && model.request_rubles !== null)}
+                    <button type="button" disabled={imageGenerationBusy || imageSaving || !imagePrompt.trim() || uncertainImageSignatures.has(JSON.stringify([selectedImageModel?.id || "", imagePrompt.trim()])) || !imageModels.some((model) => model.id === (imageModelId || imageModels[0]?.id) && model.request_rubles !== null)}
                             onClick={() => void generateImage()}>{imageGenerationBusy ? "Запрос выполняется…" : "Проверить цену и сгенерировать"}</button>
-                    {uncertainImageSignature === JSON.stringify([imageModelId || imageModels[0]?.id || "", imagePrompt.trim()]) && <p role="alert">Результат предыдущего запроса неизвестен; повтор этого же запроса заблокирован.</p>}
+                    {uncertainImageSignatures.has(JSON.stringify([selectedImageModel?.id || "", imagePrompt.trim()])) && <p role="alert">Результат предыдущего запроса неизвестен; повтор этого же запроса заблокирован.</p>}
                     {generatedImage && <div className="generated-image-result">
                         <img src={generatedImage.data_url} alt={`Результат ${generatedImage.model_id}`}/>
                         <p>{generatedImage.model_id} · {generatedImage.price_rubles} ₽ за успешный запрос</p>
-                        <button type="button" className="secondary-button" onClick={() => void saveGeneratedImage()}>
-                            {imageSaved ? "Файл сохранён" : "Сохранить PNG…"}
+                        <button type="button" className="secondary-button" disabled={imageSaving} onClick={() => void saveGeneratedImage()}>
+                            {imageSaving ? "Сохранение…" : imageSaved ? "Файл сохранён" : "Сохранить PNG…"}
                         </button>
                     </div>}
-                </details>
+                </div></div>
+            </section>}
+            {tasksView && <section className="tasks-view" aria-label="Задачи">
+                <header className="chat-header"><button ref={tasksBack} type="button" className="secondary-button" onClick={() => { setSelectedArtifactId(null); setTasksView(false); requestAnimationFrame(() => promptField.current?.focus()); }}>К беседе</button><h1>Задачи</h1></header>
+                <div className="tasks-content">
+                {openedScheduledResult && <section className="scheduled-task-notice" role="region" aria-label="Результат агентной задачи" id="scheduled-task-result">
+                    <strong>Результат задачи: {openedScheduledResult.title}</strong>
+                    <p className="scheduled-result-content">{openedScheduledResult.content || "Ответ завершён без текста."}</p>
+                    <button type="button" className="secondary-button" onClick={() => setOpenedScheduledResult(null)}>Закрыть результат</button>
+                </section>}
+                {operationErrors("navigation")}
+                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" id={`scheduled-task-${task.id}`} key={task.id}>
+                    <strong>По расписанию наступила задача: {task.title}</strong>
+                    <p>Автоматический запуск не выполнялся. После подтверждения текст попадёт в черновик; платный запрос потребует обычной проверки контекста и отдельного подтверждения.</p>
+                    <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
+                    <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить расписание</button>
+                </section>)}
+                <div className="scheduled-task-panel">
+                    <h2>Результаты</h2>
+                    {!scheduledRuns.length && <p>Готовых результатов пока нет.</p>}
+                    {scheduledRuns.map((run) => <div className="scheduled-task-row" key={run.id}>
+                        <span>{run.title} · {new Date(run.due_at * 1000).toLocaleString()}</span>
+                        <button type="button" className="secondary-button" onClick={() => {
+                            const request = ++scheduledResultRequest.current;
+                            void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId: run.id}).then((result) => { if (request === scheduledResultRequest.current) setOpenedScheduledResult(result); }).catch((reason) => { if (request === scheduledResultRequest.current) report("scheduledRuns", reason); });
+                        }}>Открыть результат</button>
+                    </div>)}
+                </div>
+                <div className="scheduled-task-panel">
+                    <h2>Новое расписание</h2>
+                    <p>Беседа: {selectedConversation?.title ?? "Текущая беседа"}</p>
+                    {operationErrors("schedule")}
+                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Уведомление ведёт к ожидающей задаче или готовому результату. Закрытое приложение не выполняет задачи. Отправка всегда остаётся ручной.</p>
+                    {scheduleNotificationsEnabled ?
+                        <button type="button" className="secondary-button" onClick={() => { localStorage.removeItem("scheduleNotifications"); setScheduleNotificationsEnabled(false); }}>Выключить уведомления</button> :
+                        <button type="button" className="secondary-button" onClick={() => void enableScheduleNotifications()}>Включить уведомления</button>}
+                    <label>Название<input value={scheduleTitle} maxLength={120} onChange={(event) => setScheduleTitle(event.target.value)}/></label>
+                    <label>Текст задачи<textarea value={schedulePrompt} maxLength={2000} rows={2} onChange={(event) => setSchedulePrompt(event.target.value)}/></label>
+                    <label>Повторять каждые, минут<input type="number" min={1} max={10080} value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value)}/></label>
+                    <button type="button" className="secondary-button" disabled={!scheduleTitle.trim() || !schedulePrompt.trim() || !scheduleInterval}
+                            onClick={() => void createScheduledTask()}>Сохранить расписание</button>
+                    {scheduledTasks.map((task) => <div className="scheduled-task-row" key={task.id}>
+                        <span>{task.title} · {conversations.find((item) => item.id === task.conversation_id)?.title ?? "Беседа"} · каждые {task.interval_minutes} мин · {task.status === "active" ? `следующий срок ${new Date(task.next_run_at * 1000).toLocaleString()}` : task.status === "awaiting_confirmation" ? "ожидает подтверждения" : "остановлено"}</span>
+                        {task.status !== "stopped" && <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить</button>}
+                    </div>)}
                 </div>
                 </div>
-            </section>
-            {selectedArtifact && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
+            </section>}
+            {selectedArtifact && !tasksView && !imageView && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}
-                                                 onExport={(id) => void exportArtifact(id)} onError={(reason) => report("artifact", reason)}/>}
-            <dialog ref={paletteDialog} className="command-palette" aria-labelledby="command-palette-title"
-                    onCancel={(event) => { event.preventDefault(); closePalette(); }}>
-                <h2 id="command-palette-title">Команды</h2>
+                                                 onExport={(id) => void exportArtifact(id)} side={artifactSide} errorNotice={operationErrors("artifact")}/>}
+            <Dialog open={confirmationMessage !== null} onOpenChange={(open) => { if (!open) finishConfirmation(false); }}>
+                <DialogContent aria-describedby="confirmation-message" onCloseAutoFocus={(event) => {
+                    event.preventDefault();
+                    if (confirmationTrigger.current?.isConnected) confirmationTrigger.current.focus();
+                }}>
+                    <DialogTitle>Подтвердить действие</DialogTitle>
+                    <p id="confirmation-message">{confirmationMessage}</p>
+                    <button type="button" className="secondary-button" onClick={() => finishConfirmation(false)}>Отмена</button>
+                    <button type="button" onClick={() => finishConfirmation(true)}>Подтвердить</button>
+                </DialogContent>
+            </Dialog>
+            <Dialog open={createConversationConfirm} onOpenChange={setCreateConversationConfirm}>
+                <DialogContent aria-describedby={undefined} onCloseAutoFocus={(event) => { event.preventDefault(); promptField.current?.focus(); }}>
+                    <DialogTitle>Создать беседу?</DialogTitle>
+                    <p>Черновик, несохранённые записи плана и выбранные файлы будут убраны.</p>
+                    <button type="button" className="secondary-button" onClick={() => setCreateConversationConfirm(false)}>Отмена</button>
+                    <button type="button" onClick={() => { setCreateConversationConfirm(false); void createConversation(undefined, true); }}>Создать беседу</button>
+                </DialogContent>
+            </Dialog>
+            <Dialog open={paletteOpen} onOpenChange={setPaletteOpen}>
+              <DialogContent className="command-palette" aria-describedby={undefined}
+                    onOpenAutoFocus={(event) => { event.preventDefault(); paletteInput.current?.focus(); }}
+                    onCloseAutoFocus={(event) => { event.preventDefault(); (paletteTrigger.current?.isConnected ? paletteTrigger.current : promptField.current)?.focus(); }}>
+                <DialogTitle id="command-palette-title">Команды</DialogTitle>
                 <input ref={paletteInput} type="search" aria-label="Поиск команд" placeholder="Введите команду…"
                        value={paletteQuery} onChange={(event) => setPaletteQuery(event.target.value)}
                        onKeyDown={(event) => {
-                           const buttons = paletteDialog.current?.querySelectorAll<HTMLButtonElement>(".command-list button");
+                           const buttons = event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(".command-list button:not(:disabled)");
                            if (event.key === "ArrowDown" && buttons?.length) { event.preventDefault(); buttons[0].focus(); }
-                           else if (event.key === "Enter" && paletteCommands.length === 1) { event.preventDefault(); runPaletteCommand(paletteCommands[0].id); }
+                           else if (event.key === "Enter" && buttons?.length === 1) { event.preventDefault(); buttons[0].click(); }
                        }}/>
                 <div className="command-list">
                     {paletteCommands.map((command) => <button key={command.id} type="button" className="secondary-button"
-                        disabled={busy && ["new", "attach", "attach-image"].includes(command.id)}
+                        disabled={busy && ["new", "context", "attach", "attach-image"].includes(command.id)}
                         onKeyDown={(event) => {
-                            const buttons = Array.from(event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+                            const buttons = Array.from(event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? []);
                             const index = buttons.indexOf(event.currentTarget);
                             if (event.key === "ArrowDown") {
                                 event.preventDefault();
@@ -1952,11 +2182,12 @@ function App() {
                                 else buttons[index - 1]?.focus();
                             }
                         }}
-                        onClick={() => runPaletteCommand(command.id)}>{command.label}</button>)}
+                        onClick={() => { closePalette(); requestAnimationFrame(() => runCommand(command.id)); }}>{command.label}{command.shortcut && <span>{command.shortcut}</span>}</button>)}
                     {!paletteCommands.length && <p>Команды не найдены.</p>}
                 </div>
                 <p className="palette-hint">↑ ↓ выбрать · Enter открыть · Esc закрыть · ⌘K / Ctrl+K</p>
-            </dialog>
+              </DialogContent>
+            </Dialog>
             <Dialog open={replaceVoiceConfirm} onOpenChange={setReplaceVoiceConfirm}>
                 <DialogContent aria-describedby={undefined}>
                     <DialogTitle>Начать новую запись?</DialogTitle>
@@ -1987,7 +2218,8 @@ function App() {
                 <DialogContent className="settings-content" aria-describedby={undefined}
                                onCloseAutoFocus={(event) => {
                                    event.preventDefault();
-                                   (compactSettingsButton.current?.offsetParent ? compactSettingsButton.current : settingsButton.current)?.focus();
+                                   (settingsTrigger.current?.isConnected && settingsTrigger.current.offsetParent ? settingsTrigger.current : compactSettingsButton.current?.offsetParent ? compactSettingsButton.current : settingsButton.current)?.focus();
+                                   settingsTrigger.current = null;
                                }}>
                 <header className="settings-header"><DialogTitle className="text-base font-semibold">Настройки</DialogTitle>
                     <Button type="button" onClick={closeSettings}>Закрыть</Button></header>
@@ -2034,6 +2266,23 @@ function App() {
                             onClick={() => void restoreBackup()}>Восстановить</Button>
                 </section>
 
+                <details className="synthetic-task-panel">
+                    <summary>Тестовый режим: многошаговая демонстрация</summary>
+                    {operationErrors("agent", ["startSyntheticTask", "decideSyntheticStep", "syntheticTasks"])}
+                    <p>Синтетические шаги работают только в SQLite. Здесь нет сетевых запросов, файловых команд или внешних инструментов.</p>
+                    <button type="button" className="secondary-button" onClick={() => void startSyntheticTask()}>Создать демонстрацию</button>
+                    {syntheticTasks.map((task) => <article className="synthetic-task" key={task.id}>
+                        <h2>{task.title} · {task.status === "awaiting_approval" ? "ожидает решения" : task.status === "completed" ? "завершена" : "отклонена"}</h2>
+                        {task.steps.map((step) => <div className="synthetic-task-step" key={step.id}>
+                            <p>{step.ordinal + 1}. {step.action} · {step.decision === "pending" ? "ожидает разрешения" : step.decision === "approved" ? "разрешено" : "отклонено"}</p>
+                            {step.result && <p>{step.result}</p>}
+                            {step.decision === "pending" && <div className="actions">
+                                <button type="button" onClick={() => void decideSyntheticStep(task.id, step.id, "approve")}>Разрешить и выполнить</button>
+                                <button type="button" className="secondary-button" onClick={() => void decideSyntheticStep(task.id, step.id, "deny")}>Отклонить</button>
+                            </div>}
+                        </div>)}
+                    </article>)}
+                </details>
                 </DialogContent>
             </Dialog>
         </main>

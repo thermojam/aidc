@@ -6,9 +6,11 @@
 - Если `.scratch/codex-feature-map/issues/` есть в рабочей копии, проверь там блокирующие задачи; текущий статус сверяй с кодом и `checks.md`.
 - Сначала прочитай `docs/research/rea/README.md`, затем нужные разделы `spec.md`, `evidence.md` и `checks.md`. Исходное ТЗ находится в `/Users/nikitamensky/.codex/attachments/3da56d44-0a97-4fb0-b1c7-d42c6fb878fd/Вставленный текст.txt`. При противоречии для следующей стадии используй уточнения из `spec.md`.
 - Отделяй подтверждённые факты, статические находки REA, проектные решения и непроверенные предположения. Статический код конкурента не доказывает его поведение при запуске.
+- Для редизайна читай `docs/research/rea/design-ux-spec.md` и референсы в `docs/ref/`. Это предложенная спецификация, не подтверждение реализации. Перед изменениями согласуй затронутые решения с `DESIGN.md` и прежним `ui-refresh.md`; продуктовые ограничения и критерии P0 остаются в `spec.md`.
 
 ## Код и проверки
 
+- `src/MarkdownMessage.tsx` отвечает за Markdown, `src/ArtifactPanel.tsx` — за Artifacts, `src/viewer.ts` — за тестовый viewer. Tailwind и Shadcn сейчас не подключены; их использование в спецификации — план миграции.
 - `src-tauri/src/lib.rs`: SQLite, mock SSE, Tauri Channel, Keychain, ветки, Retry, вложения, каталог моделей и сборка контекста; `src-tauri/migrations/`: версии схемы; `src-tauri/build.rs` и `src-tauri/capabilities/main.json`: список команд и доступ только окна `main`; `src/main.tsx`: чат. `src-tauri/tauri.viewer-test.conf.json` добавляет окно `viewer` только для отрицательной проверки IPC.
 - Сборка и тесты: `npm ci`, `npm run typecheck`, `npm run build`, `cd src-tauri && cargo test`; запуск: `npm run tauri dev`. Нативный тест Keychain помечен `#[ignore]` и не входит в обычный `cargo test`. Тест viewer: `npm run tauri dev -- --config src-tauri/tauri.viewer-test.conf.json`. Линтер в `package.json` не настроен. Результаты запуска на macOS и оставшиеся пробелы — в `docs/research/rea/checks.md`; сценарий для реальной Windows — в `docs/research/rea/smoke-windows.md`.
 - Темы `Системная` / `Светлая` / `Тёмная` реализованы в `src/main.tsx` и `src/style.css`; выбор хранится в `localStorage` под ключом `appearance`. Поведение системной темы при смене темы ОС и полный перезапуск ещё не подтверждены.

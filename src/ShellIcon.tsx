@@ -1,6 +1,8 @@
-export default function ShellIcon({name}: {name: "chat" | "folder" | "settings" | "panel" | "more" | "close"}) {
+export default function ShellIcon({name}: {name: "chat" | "image" | "clock" | "folder" | "settings" | "panel" | "more" | "close"}) {
     const paths = {
         chat: "M4 4h16v12H9l-5 4V4Z",
+        image: "M4 4h16v16H4V4Zm0 12 5-5 4 4 2-2 5 5M16 8h.01",
+        clock: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 4v5l3 2",
         folder: "M3 6h7l2 2h9v12H3V6Z",
         settings: "M12 3v3m0 12v3M3 12h3m12 0h3M6 6l2 2m8 8 2 2M6 18l2-2m8-8 2-2M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0",
         panel: "M3 4h18v16H3V4Zm6 0v16",

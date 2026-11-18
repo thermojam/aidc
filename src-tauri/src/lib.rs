@@ -197,6 +197,9 @@ struct PreparedScheduledAgentTask {
 #[derive(Serialize)]
 struct ScheduledAgentRun {
     id: i64,
+    title: String,
+    due_at: i64,
+    notified_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -637,10 +640,12 @@ fn prepare_scheduled_agent_task_in_db(db: &mut Connection, task_id: i64, now: i6
 #[tauri::command]
 fn list_scheduled_agent_runs(state: State<'_, AppState>) -> Result<Vec<ScheduledAgentRun>, String> {
     let db = state.db.lock().map_err(|_| "База занята")?;
-    let mut query = db.prepare("SELECT r.id FROM scheduled_agent_runs r
-        JOIN messages m ON m.id=r.assistant_id WHERE r.notified_at IS NULL AND m.status='completed' ORDER BY r.id")
+    let mut query = db.prepare("SELECT r.id, t.title, r.due_at, r.notified_at FROM scheduled_agent_runs r
+        JOIN scheduled_agent_tasks t ON t.id=r.task_id
+        JOIN messages m ON m.id=r.assistant_id AND m.conversation_id=t.conversation_id
+        WHERE m.status='completed' ORDER BY r.id DESC")
         .map_err(|_| "Не удалось прочитать результаты задач")?;
-    let runs = query.query_map([], |row| Ok(ScheduledAgentRun { id: row.get(0)? }))
+    let runs = query.query_map([], |row| Ok(ScheduledAgentRun { id: row.get(0)?, title: row.get(1)?, due_at: row.get(2)?, notified_at: row.get(3)? }))
         .map_err(|_| "Не удалось прочитать результаты задач")?
         .collect::<rusqlite::Result<Vec<_>>>().map_err(|_| "Не удалось прочитать результаты задач")?;
     Ok(runs)
@@ -1275,16 +1280,16 @@ async fn generate_image(model_id: String, prompt: String, expected_price_rubles:
     let status = response.status();
     if !status.is_success() { return Err(format!("GENERATION_HTTP_{}", status.as_u16())); }
     let body = response.bytes().await.map_err(|_| "GENERATION_RESULT_UNKNOWN")?;
-    if body.len() > 35 * 1024 * 1024 { return Err("Ответ сервиса больше 35 МиБ".into()); }
+    if body.len() > 35 * 1024 * 1024 { return Err("GENERATION_RESULT_UNKNOWN".into()); }
     let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| "GENERATION_RESULT_UNKNOWN")?;
-    let encoded = value.pointer("/data/0/b64_json").and_then(|value| value.as_str()).ok_or("Сервис не вернул встроенный PNG")?;
-    let bytes = BASE64.decode(encoded).map_err(|_| "Сервис вернул некорректный PNG")?;
-    validate_generated_png(&bytes)?;
+    let encoded = value.pointer("/data/0/b64_json").and_then(|value| value.as_str()).ok_or("GENERATION_RESULT_UNKNOWN")?;
+    let bytes = BASE64.decode(encoded).map_err(|_| "GENERATION_RESULT_UNKNOWN")?;
+    validate_generated_png(&bytes).map_err(|_| "GENERATION_RESULT_UNKNOWN")?;
     Ok(GeneratedImage { model_id, price_rubles: price, data_url: format!("data:image/png;base64,{encoded}") })
 }
 
 #[tauri::command]
-fn save_generated_image(data_url: String, app: tauri::AppHandle) -> Result<bool, String> {
+async fn save_generated_image(data_url: String, app: tauri::AppHandle) -> Result<bool, String> {
     let encoded = data_url.strip_prefix("data:image/png;base64,").ok_or("Некорректное изображение")?;
     if encoded.len() > 35 * 1024 * 1024 { return Err("Изображение больше допустимого размера".into()); }
     let bytes = BASE64.decode(encoded).map_err(|_| "Некорректное изображение")?;

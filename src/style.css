@@ -97,7 +97,8 @@ button, select {
 .app-shell.navigation-open { grid-template-columns: 48px var(--navigation-width) minmax(0, 1fr); }
 .app-shell.with-artifact.artifact-side { grid-template-columns: 48px minmax(560px, 1fr) minmax(360px, 0.65fr); }
 .app-shell.navigation-open.with-artifact.artifact-side { grid-template-columns: 48px var(--navigation-width) minmax(560px, 1fr) minmax(360px, 0.65fr); }
-.with-artifact:not(.artifact-side) .chat-panel { display: none; }
+.with-artifact:not(.artifact-side) .chat-panel { grid-column: -2 / -1; grid-row: 1; visibility: hidden; }
+.with-artifact:not(.artifact-side) .artifact-panel { grid-column: -2 / -1; grid-row: 1; }
 .compact-only { display: none; }
 .with-artifact:not(.artifact-side) .compact-only { display: inline-block; }
 .with-artifact:not(.artifact-side) .wide-only { display: none; }
@@ -105,6 +106,15 @@ button, select {
 .dock-button { width: 36px; height: 36px; display: grid; place-items: center; padding: 0; color: var(--text); background: transparent; border: 0; border-radius: 6px; }
 .dock-current { background: var(--selected); border-left: 3px solid var(--accent); }
 .dock-settings { margin-top: auto; }
+.dock-button { position: relative; }
+.compact-task-indicator { display: none; }
+.task-indicator { position: absolute; top: 3px; right: 3px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.tasks-view-open .chat-panel { grid-column: -2 / -1; grid-row: 1; visibility: hidden; }
+.tasks-view { grid-column: -2 / -1; grid-row: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--canvas); }
+.tasks-view h1 { font-size: 16px; margin: 0; }
+.tasks-content { overflow: auto; padding: 20px; }
+.tasks-content > * { max-width: 760px; margin: 0 auto 16px; }
+.scheduled-task-row span { overflow-wrap: anywhere; }
 .project-sidebar { position: relative; display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--panel); border-right: 1px solid var(--border); }
 .navigation-heading { display: flex; flex: 0 0 48px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--border); }
 .navigation-heading h2 { margin: 0; font-size: 14px; }
@@ -208,7 +218,8 @@ h2 {
 }
 
 .message {
-    max-width: 720px;
+    max-width: 760px;
+    min-width: 0;
     margin: 0 0 20px;
     font-size: 13px;
 }
@@ -238,6 +249,15 @@ h2 {
     overflow-wrap: anywhere;
 }
 
+.history-latest { position: sticky; bottom: 8px; display: block; margin: 0 auto; }
+.markdown-table { max-width: 100%; overflow-x: auto; }
+.markdown-table table { border-collapse: collapse; }
+.markdown-table th, .markdown-table td { padding: 8px 12px; text-align: left; }
+.markdown-table th { font-weight: 600; }
+.markdown h2 { font-size: 20px; line-height: 28px; }
+.markdown h3 { font-size: 17px; line-height: 24px; }
+.markdown p + p { margin-top: 12px; }
+
 .markdown p, .markdown li {
     white-space: normal;
 }
@@ -250,6 +270,8 @@ h2 {
 .code-block {
     margin-top: 8px;
     border: 1px solid var(--border);
+    background: var(--field);
+    min-width: 0;
 }
 
 .code-block-heading, .artifact-heading, .artifact-actions {
@@ -633,10 +655,6 @@ input::placeholder, textarea::placeholder {
     border: 1px solid var(--border);
 }
 
-.command-palette::backdrop {
-    background: var(--overlay);
-}
-
 .command-palette h2, .command-palette p {
     margin: 0 0 12px;
 }
@@ -658,7 +676,16 @@ input::placeholder, textarea::placeholder {
 .command-list button {
     width: 100%;
     text-align: left;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
 }
+
+.slash-commands { display: grid; max-height: 256px; overflow-y: auto; border: 1px solid var(--control-border); background: var(--panel); }
+.slash-commands [role="option"] { padding: 6px 8px; cursor: pointer; }
+.slash-commands [aria-selected="true"] { background: var(--selected); }
+.slash-commands [aria-disabled="true"] { color: var(--muted); cursor: default; }
+.slash-commands p { margin: 6px 8px; color: var(--muted); }
 
 .palette-hint {
     margin: 12px 0 0 !important;
@@ -774,12 +801,7 @@ input::placeholder, textarea::placeholder {
 .image-generation-panel {
     display: grid;
     gap: 8px;
-    padding: 12px 18px;
-    border-top: 1px solid var(--border);
-}
-
-.image-generation-panel summary {
-    cursor: pointer;
+    padding: 0;
 }
 
 .image-generation-panel > p {
@@ -892,6 +914,8 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-
 @media (max-width: 639px) {
     .app-shell, .app-shell.with-artifact.artifact-side { grid-template-columns: minmax(0, 1fr); }
     .app-dock { display: none; }
+    .navigation-toggle { position: relative; }
+    .compact-task-indicator { display: block; position: absolute; top: 2px; right: 2px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
     .compact-settings { display: inline-block; margin-left: auto; }
     .conversation-project { max-width: 110px; }
 }
@@ -991,3 +1015,5 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-
 .model-picker-choice[aria-pressed="true"] { border-color: var(--accent); }
 .model-picker-trigger { max-width: 190px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-mode-chip { font-weight: 600; font-size: 12px; }
+
+.mention-commands [role="option"] { box-sizing: border-box; height: 32px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
