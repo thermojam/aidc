@@ -39,8 +39,8 @@ const operations: Record<string, Operation> = {
     keyStatus: {area: "connection", title: "Проверка подключения", global: true},
     startVoiceRecording: {area: "voice", title: "Запись голоса"},
     transcribeVoice: {area: "voice", title: "Распознавание голоса"},
-    generateImage: {area: "image", title: "Генерация изображения"},
-    saveGeneratedImage: {area: "image", title: "Сохранение изображения"},
+    generateImage: {area: "image", title: "Генерация изображения", global: true},
+    saveGeneratedImage: {area: "image", title: "Сохранение изображения", global: true},
     agentBoard: {area: "agent", title: "Загрузка плана"},
     agentSkill: {area: "agent", title: "Загрузка навыка"},
     saveAgentSkill: {area: "agent", title: "Сохранение навыка"},
@@ -97,8 +97,15 @@ export type OperationError = {
 export function safeDiagnostic(operation: string, reason: unknown, metadata?: {code: string | null; httpStatus: number | null; requestId: string | null}) {
     const text = typeof reason === "string" ? reason : "";
     const knownCodes = ["UPSTREAM_USAGE_UNCERTAIN", "RUBLE_LIMIT", "TOKEN_LIMIT", "UNAUTHORIZED", "INVALID_API_KEY", "HTTP_ERROR", "STREAM_INTERRUPTED", "NETWORK_ERROR", "PRICE_CHANGED", "IMAGE_PRICE_CHANGED", "AUDIO_PRICE_CHANGED", "SERVER_ERROR", "NETWORK_RESULT_UNKNOWN", "STREAM_IDLE_TIMEOUT", "INVALID_SSE", "RESPONSE_TOO_LARGE", "DATABASE_ERROR", "MODEL_SNAPSHOT_MISMATCH", "TOOL_LOOP_LIMIT", "INVALID_TOOL_CALL", "UNKNOWN_TOOL", "RUBLE_RATE_LIMIT", "TOKEN_RATE_LIMIT"];
+    const microphoneCodes: Record<string, string> = {
+        NotAllowedError: "MICROPHONE_PERMISSION_DENIED", SecurityError: "MICROPHONE_PERMISSION_DENIED",
+        NotFoundError: "MICROPHONE_NOT_FOUND", NotReadableError: "MICROPHONE_UNAVAILABLE",
+        NotSupportedError: "MICROPHONE_UNSUPPORTED", AbortError: "MICROPHONE_ABORTED"
+    };
     const candidate = metadata?.code ?? text;
-    const code = knownCodes.includes(candidate) ? candidate : reason instanceof TypeError ? "TYPE_ERROR" : "OPERATION_FAILED";
+    const errorName = reason && typeof reason === "object" && "name" in reason && typeof reason.name === "string" ? reason.name : "";
+    const microphoneCode = operation === "Запись голоса" && Object.hasOwn(microphoneCodes, errorName) ? microphoneCodes[errorName] : undefined;
+    const code = microphoneCode ?? (knownCodes.includes(candidate) ? candidate : reason instanceof TypeError ? "TYPE_ERROR" : "OPERATION_FAILED");
     const nativeHttp = /^(?:GENERATION_HTTP_|TRANSCRIPTION_HTTP_|HTTP )(\d{3})$/.exec(text);
     const httpStatus = metadata?.httpStatus ?? (nativeHttp ? Number(nativeHttp[1]) : text === "401" ? 401 : null);
     const requestId = metadata?.requestId && /^(?:request_|req_)[a-f0-9-]{8,64}$/i.test(metadata.requestId) ? metadata.requestId : null;
@@ -117,10 +124,17 @@ export function useOperationErrors(conversation: number) {
         const definition = operations[operation] ?? {area: "navigation", title: "Действие в списке бесед"};
         const diagnostic = safeDiagnostic(definition.title, reason, metadata);
         const area = diagnostic.connection ? "connection" : definition.area;
-        const safeReasons = ["Состав запроса изменился или не проверен. Проверьте контекст заново","Файл изменился после предпросмотра. Просмотрите его заново", "Материал не найден в проекте беседы", "Беседа не найдена или в архиве", "Файл больше 256 КБ", "Изображение больше 3 МиБ", "Файл должен быть в UTF-8 или UTF-16 с BOM", "Поддерживаются только выбранные текстовые форматы", "Некорректный UTF-16 файл", "Файл с возможными секретами нельзя прикрепить", "Файл не похож на текстовый", "Не удалось открыть файл", "Не удалось прочитать файл", "Не удалось проверить файл", "Выберите обычный файл", "Выберите корректное изображение PNG, JPEG или WebP", "Файл изображения повреждён", "Размер изображения превышает локальный предел 16 мегапикселей", "Файл не найден", "Выбранный файл не найден", "Символические ссылки не поддерживаются", "Не удалось декодировать изображение", "Изображение превышает локальный предел 16 мегапикселей", "Уведомления запрещены в настройках системы.", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b."];
+        const safeReasons = ["Цена каталога изменилась. Проверьте новую сумму, затем подтвердите запрос ещё раз.", "Не удалось сохранить изображение", "Состав запроса изменился или не проверен. Проверьте контекст заново","Файл изменился после предпросмотра. Просмотрите его заново", "Материал не найден в проекте беседы", "Беседа не найдена или в архиве", "Файл больше 256 КБ", "Изображение больше 3 МиБ", "Файл должен быть в UTF-8 или UTF-16 с BOM", "Поддерживаются только выбранные текстовые форматы", "Некорректный UTF-16 файл", "Файл с возможными секретами нельзя прикрепить", "Файл не похож на текстовый", "Не удалось открыть файл", "Не удалось прочитать файл", "Не удалось проверить файл", "Выберите обычный файл", "Выберите корректное изображение PNG, JPEG или WebP", "Файл изображения повреждён", "Размер изображения превышает локальный предел 16 мегапикселей", "Файл не найден", "Выбранный файл не найден", "Символические ссылки не поддерживаются", "Не удалось декодировать изображение", "Изображение превышает локальный предел 16 мегапикселей", "Уведомления запрещены в настройках системы.", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b."];
         const reasonText = typeof reason === "string" ? reason : reason instanceof Error ? reason.message : "";
         const safeReason = safeReasons.includes(reasonText) ? `${reasonText}. ` : "";
-        const message = diagnostic.connection ? "Подключите API-ключ или замените ключ, который сервер не принял." : `Не удалось выполнить: ${definition.title.toLowerCase()}. ${safeReason}${recovery[area]}`;
+        const microphoneMessages: Record<string, string> = {
+            MICROPHONE_PERMISSION_DENIED: "Доступ к микрофону запрещён. На macOS откройте Системные настройки → Конфиденциальность и безопасность → Микрофон и разрешите доступ приложению.",
+            MICROPHONE_NOT_FOUND: "Микрофон не найден. Проверьте устройство ввода в настройках системы.",
+            MICROPHONE_UNAVAILABLE: "Микрофон недоступен. Проверьте подключение и другие приложения, использующие микрофон.",
+            MICROPHONE_UNSUPPORTED: "Запись звука не поддерживается в этом окне.",
+            MICROPHONE_ABORTED: "Запись была прервана. Попробуйте снова."
+        };
+        const message = diagnostic.connection ? "Подключите API-ключ или замените ключ, который сервер не принял." : microphoneMessages[diagnostic.code] ?? `Не удалось выполнить: ${definition.title.toLowerCase()}. ${safeReason}${recovery[area]}`;
         const id = identity(operation);
         const error: OperationError = {...diagnostic, id, area, conversation: definition.global ? null : conversation, message};
         setErrors((current) => ({...current, [id]: error}));
