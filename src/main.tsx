@@ -203,7 +203,9 @@ function App() {
     const [uncertainImageSignatures, setUncertainImageSignatures] = useState<Set<string>>(new Set());
     const imageRequestPending = useRef(false);
     const [voiceOpen, setVoiceOpen] = useState(false);
-    const [voicePreparing, setVoicePreparing] = useState(false);
+    const [voicePreparation, setVoicePreparation] = useState<"microphone" | "audio" | null>(null);
+    const voicePreparing = voicePreparation !== null;
+    const permissionRequest = useRef(0);
     const voicePending = useRef(false);
     const [recordingSeconds, setRecordingSeconds] = useState(0);
     const cancelRecording = useRef(false);
@@ -213,6 +215,8 @@ function App() {
     const [transcriptionAvailable, setTranscriptionAvailable] = useState(false);
     const [transcribing, setTranscribing] = useState(false);
     const [uncertainTranscription, setUncertainTranscription] = useState("");
+    const snapshotGeneration = useRef(0);
+    const [choosingWindow, setChoosingWindow] = useState(false);
     const [captureNotice, setCaptureNotice] = useState("");
     const [capturedSnapshot, setCapturedSnapshot] = useState<CapturedSnapshot | null>(null);
     const [transcriptionModelId, setTranscriptionModelId] = useState("");
@@ -235,6 +239,7 @@ function App() {
     const [promptCaret, setPromptCaret] = useState(0);
     const checkAfterSlash = useRef(false);
     const navigation = useNavigationLayout();
+    const focusPromptOnSheetClose = useRef(false);
     const closeNavigationSheet = useRef(() => {});
     closeNavigationSheet.current = () => { if (navigation.modal) navigation.setOpen(false); };
     const [recentIds, setRecentIds] = useState<number[]>(() => {
@@ -566,13 +571,19 @@ function App() {
     }
 
     async function startVoiceRecording(replace = false) {
-        if (voicePending.current) return;
+        if (voicePending.current || transcribing) return;
         if (!replace && (recordedAudio || transcriptionText)) { setReplaceVoiceConfirm(true); return; }
         voicePending.current = true;
-        setVoicePreparing(true);
+        const request = ++permissionRequest.current;
+        clear("startVoiceRecording");
+        setVoicePreparation("microphone");
         try {
             if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new DOMException("", "NotSupportedError");
             const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+            if (request !== permissionRequest.current) {
+                stream.getTracks().forEach((track) => track.stop());
+                return;
+            }
             recordingStream.current = stream;
             audioChunks.current = [];
             audioSize.current = 0;
@@ -593,9 +604,9 @@ function App() {
                 stream.getTracks().forEach((track) => track.stop());
                 recordingStream.current = null;
                 setRecording(false);
-                setVoicePreparing(true);
-                if (cancelRecording.current) { audioChunks.current = []; voicePending.current = false; setVoicePreparing(false); return; }
-                if (audioSize.current > 25 * 1024 * 1024) { setRecordedAudio(null); voicePending.current = false; setVoicePreparing(false); return; }
+                setVoicePreparation("audio");
+                if (cancelRecording.current) { audioChunks.current = []; voicePending.current = false; setVoicePreparation(null); return; }
+                if (audioSize.current > 25 * 1024 * 1024) { setRecordedAudio(null); voicePending.current = false; setVoicePreparation(null); return; }
                 const seconds = Math.min(600, (Date.now() - startedAt.current) / 1000);
                 void new Blob(audioChunks.current, {type: nextRecorder.mimeType}).arrayBuffer().then((buffer) => {
                     const bytes = new Uint8Array(buffer);
@@ -603,18 +614,24 @@ function App() {
                     for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
                     setRecordedAudio({id: crypto.randomUUID(), base64: btoa(binary), mime: nextRecorder.mimeType.split(";")[0] || "audio/webm", seconds});
                 }).catch(() => report("startVoiceRecording", "Не удалось подготовить запись."))
-                    .finally(() => { voicePending.current = false; setVoicePreparing(false); });
+                    .finally(() => { voicePending.current = false; setVoicePreparation(null); });
             };
             startedAt.current = Date.now();
+            nextRecorder.start(1000);
             setRecordedAudio(null);
             setTranscriptionText("");
             setTranscriptionAvailable(false);
-            clear("startVoiceRecording");
-            nextRecorder.start(1000);
             setRecording(true);
-            setVoicePreparing(false);
+            setVoicePreparation(null);
             window.setTimeout(() => { if (recorder.current === nextRecorder && nextRecorder.state === "recording") nextRecorder.stop(); }, 600_000);
-        } catch (reason) { voicePending.current = false; setVoicePreparing(false); recordingStream.current?.getTracks().forEach((track) => track.stop()); recordingStream.current = null; report("startVoiceRecording", reason); }
+        } catch (reason) {
+            if (request !== permissionRequest.current) return;
+            voicePending.current = false;
+            setVoicePreparation(null);
+            recordingStream.current?.getTracks().forEach((track) => track.stop());
+            recordingStream.current = null;
+            report("startVoiceRecording", reason);
+        }
     }
 
     const voiceAtRisk = useRef(false);
@@ -648,6 +665,7 @@ function App() {
     }, [recording]);
 
     useEffect(() => () => {
+        permissionRequest.current++;
         if (recorder.current?.state === "recording") recorder.current.stop();
         recordingStream.current?.getTracks().forEach((track) => track.stop());
     }, []);
@@ -657,7 +675,7 @@ function App() {
     }
 
     async function transcribeVoice(confirmed = false) {
-        if (!recordedAudio) return;
+        if (!recordedAudio || voicePending.current || transcribing) return;
         const model = selectedTranscriptionModel;
         if (!model || model.audio_rubles_per_minute === null || !model.protocols.includes("audio_transcriptions")) return;
         const signature = recordedAudio.id;
@@ -854,7 +872,7 @@ function App() {
     async function switchConversation(id: number, discardConfirmed = false) {
         if (busy || dropBusy.current) return false;
         if (id === conversationId) { if (navigation.modal) navigation.setOpen(false); return true; }
-        if (!discardConfirmed && (prompt.trim() || pendingAttachments.length || planDraft.trim() || queueDraft.trim() || steeringDraft.trim()) && !await confirmAction("Перейти в другую беседу? Черновик, несохранённые записи плана и выбранные файлы будут убраны.")) return false;
+        if (!discardConfirmed && (prompt.trim() || pendingAttachments.length || capturedSnapshot || planDraft.trim() || queueDraft.trim() || steeringDraft.trim()) && !await confirmAction("Перейти в другую беседу? Черновик, несохранённые записи плана и выбранные файлы будут убраны.")) return false;
         const request = ++navigationRequest.current;
         try {
             for (const attachment of pendingAttachments) await invoke("remove_text_attachment", {id: attachment.id});
@@ -863,7 +881,7 @@ function App() {
             setDropResults([]);
             setPrompt("");
             setScheduledDraft(null);
-            setCaptureNotice("");
+            discardSnapshot();
             setBoardInputSource(null);
             boardRequest.current++;
             skillRequest.current++;
@@ -873,7 +891,10 @@ function App() {
             contextRequest.current++;
             setContextPreview(null);
             setSelectedArtifactId(null);
-            if (navigation.modal) navigation.setOpen(false);
+            if (navigation.modal && navigation.open) {
+                focusPromptOnSheetClose.current = true;
+                navigation.setOpen(false);
+            }
             historyRequest.current++;
             setHistory({messages: [], attachments: [], artifacts: [], active_leaf_id: null, contexts: [], attempts: []});
             activeConversation.current = id;
@@ -885,7 +906,7 @@ function App() {
 
     async function createConversation(draftForConfirmation = prompt, confirmed = false) {
         if (busy || dropBusy.current) return;
-        if (!confirmed && (draftForConfirmation.trim() || pendingAttachments.length || planDraft.trim() || queueDraft.trim() || steeringDraft.trim())) { setCreateConversationConfirm(true); return; }
+        if (!confirmed && (draftForConfirmation.trim() || pendingAttachments.length || capturedSnapshot || planDraft.trim() || queueDraft.trim() || steeringDraft.trim())) { setCreateConversationConfirm(true); return; }
         try {
             const id = await invoke<number>("create_conversation");
             if (projectFilter && projectFilter > 0) await invoke("move_conversation", {conversationId: id, projectId: projectFilter});
@@ -921,7 +942,7 @@ function App() {
 
     async function archiveConversation(item: Conversation) {
         if (busy) return;
-        if (item.id === conversationId && !item.archived && (prompt.trim() || pendingAttachments.length || planDraft.trim() || queueDraft.trim() || steeringDraft.trim())
+        if (item.id === conversationId && !item.archived && (prompt.trim() || pendingAttachments.length || capturedSnapshot || planDraft.trim() || queueDraft.trim() || steeringDraft.trim())
             && !await confirmAction("Архивировать беседу? Черновик, несохранённые записи плана и выбранные файлы будут убраны.")) return;
         try {
             await invoke("archive_conversation", {conversationId: item.id, archived: !item.archived});
@@ -1083,6 +1104,7 @@ function App() {
         if (!selectedBackup || busy || !await confirmAction(`Восстановить копию ${selectedBackup}? Текущая история будет сохранена отдельной копией. Выбранные файлы и несохранённые записи плана, очереди и уточнений будут убраны.`)) return;
         try {
             await invoke("restore_backup", {name: selectedBackup});
+            discardSnapshot();
             scheduledResultRequest.current++;
             setOpenedScheduledResult(null);
             setScheduledDraft(null);
@@ -1305,28 +1327,37 @@ function App() {
         finally { pickerBusy.current = false; }
     }
 
+    function discardSnapshot() {
+        snapshotGeneration.current++;
+        setCapturedSnapshot(null);
+        setCaptureNotice("");
+        clear("captureWindowSnapshot");
+    }
+
     async function captureWindowSnapshot() {
-        if (capturedSnapshot) return;
+        if (capturedSnapshot || choosingWindow) return;
+        const generation = snapshotGeneration.current;
+        setChoosingWindow(true);
+        clear("captureWindowSnapshot");
         setCaptureNotice("");
         try {
             const snapshot = await invoke<CapturedSnapshot | null>("capture_window_snapshot");
-            if (!snapshot || conversationId !== activeConversation.current) return;
-            setCapturedSnapshot(snapshot);
-            clear("captureWindowSnapshot");
+            if (generation !== snapshotGeneration.current || conversationId !== activeConversation.current) return;
+            if (snapshot) setCapturedSnapshot(snapshot);
+            else setCaptureNotice("Снимок не создан. Если вы не отменяли выбор, проверьте разрешение «Запись экрана» в настройках macOS.");
         } catch (reason) {
-            if (conversationId !== activeConversation.current) return;
-            if (reason === "Захват отменён или запрещён macOS. Проверьте разрешение «Запись экрана» в настройках конфиденциальности." || reason === "Не удалось прочитать снимок") {
-                setCaptureNotice("Снимок не создан. Если вы не отменяли выбор, проверьте разрешение «Запись экрана» в настройках macOS.");
-            } else report("captureWindowSnapshot", reason);
-        }
+            if (generation !== snapshotGeneration.current || conversationId !== activeConversation.current) return;
+            report("captureWindowSnapshot", reason);
+        } finally { setChoosingWindow(false); }
     }
 
     async function attachCapturedSnapshot() {
         if (dropBusy.current || pickerBusy.current || !capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5) return;
+        const generation = snapshotGeneration.current;
         pickerBusy.current = true;
         try {
             const attachment = await invoke<PendingAttachment>("add_captured_snapshot", {dataUrl: capturedSnapshot.preview});
-            if (conversationId !== activeConversation.current) {
+            if (generation !== snapshotGeneration.current || conversationId !== activeConversation.current) {
                 await invoke("remove_text_attachment", {id: attachment.id});
                 return;
             }
@@ -1601,7 +1632,14 @@ function App() {
             <Dialog open={navigation.modal && navigation.open} onOpenChange={navigation.setOpen}>
                 <DialogContent className="navigation-sheet top-0 left-12 translate-x-0 translate-y-0" aria-describedby={undefined}
                                onOpenAutoFocus={(event) => { event.preventDefault(); chatSearchField.current?.focus(); }}
-                               onCloseAutoFocus={(event) => { event.preventDefault(); if (tasksView) tasksBack.current?.focus(); else if (imageView) imageBack.current?.focus(); else navigation.restoreFocus(); }}>
+                               onCloseAutoFocus={(event) => {
+                                   event.preventDefault();
+                                   if (tasksView) tasksBack.current?.focus();
+                                   else if (imageView) imageBack.current?.focus();
+                                   else if (focusPromptOnSheetClose.current) promptField.current?.focus();
+                                   else navigation.restoreFocus();
+                                   focusPromptOnSheetClose.current = false;
+                               }}>
                     <div className="navigation-heading"><DialogTitle>Беседы</DialogTitle><button type="button" className="navigation-menu" aria-label="Закрыть навигацию" onClick={() => navigation.setOpen(false)}><ShellIcon name="close"/></button></div>
                     {navigation.modal && sidebar}
                     <button type="button" className="secondary-button" onClick={() => { navigation.setOpen(false); setTasksView(true); }}>Задачи{scheduledTasks.some((task) => task.status === "awaiting_confirmation") ? " · ожидают подтверждения" : ""}</button>
@@ -1840,6 +1878,7 @@ function App() {
                         })}
                         <button type="button" className="secondary-button" onClick={() => setComposerSettingsOpen(true)}>{pendingAttachments.length + selectedMaterialIds.length > 2 ? `Ещё ${pendingAttachments.length + selectedMaterialIds.length - 2}` : "Просмотреть / убрать"}</button>
                     </div>}
+                    {choosingWindow && <p role="status">Выберите окно для снимка или нажмите Escape.</p>}
                     {captureNotice && <p role="status">{captureNotice}</p>}
                     {!voiceOpen && (recording || voicePreparing || recordedAudio || transcriptionText || transcribing) && <button type="button" className="secondary-button" onClick={() => setVoiceOpen(true)}>Открыть голосовой ввод · {recording ? "идёт запись" : "есть несохранённые данные"}</button>}
                     {!selectedArtifact && operationErrors("artifact")}
@@ -1904,7 +1943,7 @@ function App() {
                         <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickAttachment(); }}>Прикрепить файл</button>
                         <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickImageAttachment(); }}>Прикрепить изображение</button>
                         <button type="button" className="secondary-button" role="menuitem" onClick={() => { setVoiceOpen(true); setComposerToolsOpen(false); }}>Голосовой ввод…</button>
-                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || !!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5 || !isMac} onClick={() => { setComposerToolsOpen(false); void captureWindowSnapshot(); }}>Снимок окна…</button>
+                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || choosingWindow || !!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5 || !isMac} onClick={() => { setComposerToolsOpen(false); void captureWindowSnapshot(); }}>Снимок окна…</button>
                         {!isMac && <small>Снимок окна доступен только на macOS.</small>}
                         {capturedSnapshot && <small>Сначала прикрепите или удалите текущий снимок.</small>}
                         <button type="button" className="secondary-button" role="menuitem" onClick={() => { setComposerToolsOpen(false); setComposerSettingsOpen(true); }}>Дополнительные настройки…</button>
@@ -1914,6 +1953,14 @@ function App() {
                         <div className="voice-controls">
                             {recording ? <button type="button" className="secondary-button" onClick={stopVoiceRecording}>Остановить запись</button> :
                                 <button type="button" className="secondary-button" disabled={busy || transcribing || voicePreparing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
+                            {voicePreparation === "microphone" && <>
+                                <span role="status">Ожидаем доступ к микрофону. Проверьте системный запрос разрешения.</span>
+                                <button type="button" className="secondary-button" onClick={() => {
+                                    permissionRequest.current++;
+                                    voicePending.current = false;
+                                    setVoicePreparation(null);
+                                }}>Отменить ожидание</button>
+                            </>}
                             {recording && <><span role="status">Идёт запись · {Math.floor(recordingSeconds / 60)}:{String(recordingSeconds % 60).padStart(2, "0")} / 10:00</span><button type="button" className="secondary-button" onClick={() => { cancelRecording.current = true; stopVoiceRecording(); }}>Отменить запись</button></>}
             {recordedAudio && <span>Запись: {recordedAudio.seconds.toFixed(1)} с · {(recordedAudio.base64.length * 0.75 / 1024).toFixed(0)} КБ</span>}
                         </div>
@@ -1923,7 +1970,7 @@ function App() {
                                 <select id="transcription-model" value={selectedTranscriptionModel?.id ?? ""} onChange={(event) => setTranscriptionModelId(event.target.value)}>
                                     {transcriptionModels.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.audio_rubles_per_minute} ₽/мин</option>)}
                                 </select>
-                                <button type="button" className="secondary-button" disabled={!recordedAudio || transcribing || !keySaved || !selectedTranscriptionModel || uncertainTranscription === recordedAudio?.id} onClick={() => void transcribeVoice()}>
+                                <button type="button" className="secondary-button" disabled={!recordedAudio || voicePreparing || recording || transcribing || !keySaved || !selectedTranscriptionModel || uncertainTranscription === recordedAudio?.id} onClick={() => void transcribeVoice()}>
                                     {transcribing ? "Распознавание…" : "Распознать"}
                                 </button>
                             </div>
