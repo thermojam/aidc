@@ -297,7 +297,11 @@ struct ProjectSummary {
     id: i64,
     title: String,
     archived: bool,
+    group_id: Option<i64>,
 }
+
+#[derive(Serialize)]
+struct ProjectGroup { id: i64, title: String }
 
 #[derive(Serialize)]
 struct ProjectMaterialSummary {
@@ -462,7 +466,9 @@ fn init_db(db: &Connection) -> rusqlite::Result<()> {
         db.execute_batch(include_str!("../migrations/0019_scheduled_agent_runs.sql"))?;
     }
     let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 18 { return Err(rusqlite::Error::InvalidQuery); }
+    if version == 18 { db.execute_batch(include_str!("../migrations/0020_project_groups.sql"))?; }
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 19 { return Err(rusqlite::Error::InvalidQuery); }
     Ok(())
 }
 
@@ -1400,9 +1406,57 @@ fn search_conversations_in_db(db: &Connection, query: &str, project_filter: Opti
 }
 
 fn list_projects_in_db(db: &Connection) -> rusqlite::Result<Vec<ProjectSummary>> {
-    let mut statement = db.prepare("SELECT id, title, archived FROM projects ORDER BY archived, id")?;
-    let rows = statement.query_map([], |row| Ok(ProjectSummary { id: row.get(0)?, title: row.get(1)?, archived: row.get(2)? }))?;
+    let mut statement = db.prepare("SELECT id, title, archived, group_id FROM projects ORDER BY archived, id")?;
+    let rows = statement.query_map([], |row| Ok(ProjectSummary { id: row.get(0)?, title: row.get(1)?, archived: row.get(2)?, group_id: row.get(3)? }))?;
     rows.collect()
+}
+
+fn list_project_groups_in_db(db: &Connection) -> rusqlite::Result<Vec<ProjectGroup>> {
+    let mut statement = db.prepare("SELECT id, title FROM project_groups ORDER BY id")?;
+    let rows = statement.query_map([], |row| Ok(ProjectGroup { id: row.get(0)?, title: row.get(1)? }))?;
+    rows.collect()
+}
+
+fn group_title(title: &str) -> Result<&str, String> {
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 80 { return Err("Название должно содержать от 1 до 80 символов".into()); }
+    Ok(title)
+}
+
+#[tauri::command]
+fn list_project_groups(state: State<'_, AppState>) -> Result<Vec<ProjectGroup>, String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    list_project_groups_in_db(&db).map_err(|_| "Не удалось прочитать группы".into())
+}
+
+#[tauri::command]
+fn create_project_group(title: String, state: State<'_, AppState>) -> Result<(), String> {
+    let title = group_title(&title)?;
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    db.execute("INSERT INTO project_groups(title) VALUES(?1)", [title]).map_err(|_| "Не удалось создать группу")?;
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_project_group(id: i64, title: String, state: State<'_, AppState>) -> Result<(), String> {
+    let title = group_title(&title)?;
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    if db.execute("UPDATE project_groups SET title=?1 WHERE id=?2", params![title, id]).map_err(|_| "Не удалось переименовать группу")? == 0 { return Err("Группа не найдена".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_project_group(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    if db.execute("DELETE FROM project_groups WHERE id=?1", [id]).map_err(|_| "Не удалось удалить группу")? == 0 { return Err("Группа не найдена".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+fn move_project_to_group(id: i64, group_id: Option<i64>, state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|_| "База занята")?;
+    if db.execute("UPDATE projects SET group_id=?1 WHERE id=?2", params![group_id, id]).map_err(|_| "Группа не найдена")? == 0 { return Err("Проект не найден".into()); }
+    Ok(())
 }
 
 fn list_project_materials_in_db(db: &Connection, project_id: i64) -> rusqlite::Result<Vec<ProjectMaterialSummary>> {
@@ -1935,7 +1989,7 @@ fn delete_key(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let content = |db: &Connection| -> rusqlite::Result<[i64; 20]> {
+    let content = |db: &Connection| -> rusqlite::Result<[i64; 22]> {
         Ok([
             db.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
@@ -1956,6 +2010,8 @@ fn backup_history_to(db: &Connection, path: &Path) -> rusqlite::Result<()> {
             db.query_row("SELECT count(*) FROM conversation_agent_skills", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM scheduled_agent_tasks", [], |row| row.get(0))?,
             db.query_row("SELECT count(*) FROM scheduled_agent_runs", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM project_groups", [], |row| row.get(0))?,
+            db.query_row("SELECT count(*) FROM projects WHERE group_id IS NOT NULL", [], |row| row.get(0))?,
             db.query_row("PRAGMA user_version", [], |row| row.get(0))?,
         ])
     };
@@ -2137,7 +2193,8 @@ fn restore_history_from(db: &mut Connection, path: &Path) -> rusqlite::Result<()
     if version >= 16 { let _: i64 = source.query_row("SELECT count(*) FROM conversation_agent_skills", [], |row| row.get(0))?; }
     if version >= 17 { let _: i64 = source.query_row("SELECT count(*) FROM scheduled_agent_tasks", [], |row| row.get(0))?; }
     if version >= 18 { let _: i64 = source.query_row("SELECT count(*) FROM scheduled_agent_runs", [], |row| row.get(0))?; }
-    if integrity != "ok" || foreign_keys != 0 || !(1..=18).contains(&version) || conversations < 1 || invalid_pins != 0
+    if version >= 19 { let _: i64 = source.query_row("SELECT count(*) FROM project_groups", [], |row| row.get(0))?; let _: i64 = source.query_row("SELECT count(*) FROM projects WHERE group_id IS NOT NULL", [], |row| row.get(0))?; }
+    if integrity != "ok" || foreign_keys != 0 || !(1..=19).contains(&version) || conversations < 1 || invalid_pins != 0
         || (version >= 2 && !attachments_valid(&source)?) || (version >= 7 && !artifacts_valid(&source)?)
         || (version >= 11 && !project_materials_valid(&source)?)
         || (version >= 12 && !project_folders_valid(&source)?)
@@ -2998,7 +3055,7 @@ pub fn run() {
                 };
             }
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, accept_dropped_files, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, list_project_groups, create_project_group, rename_project_group, delete_project_group, move_project_to_group, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, accept_dropped_files, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -3006,6 +3063,48 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_groups_survive_backup_and_deletion_preserves_projects_and_conversations() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-project-groups-{}.sqlite", std::process::id()));
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let project = create_project_in_db(&db).unwrap();
+        move_conversation_in_db(&db, 1, Some(project)).unwrap();
+        db.execute("INSERT INTO project_groups(title) VALUES('Работа')", []).unwrap();
+        let group = db.last_insert_rowid();
+        db.execute("UPDATE projects SET group_id=?1 WHERE id=?2", params![group, project]).unwrap();
+        assert!(db.execute("UPDATE projects SET group_id=99999 WHERE id=?1", [project]).is_err());
+        assert!(group_title("  ").is_err());
+        assert_eq!(group_title(" Работа ").unwrap(), "Работа");
+        backup_history_to(&db, &path).unwrap();
+        db.execute("DELETE FROM project_groups WHERE id=?1", [group]).unwrap();
+        assert_eq!(list_projects_in_db(&db).unwrap()[0].group_id, None);
+        assert_eq!(list_conversations_in_db(&db).unwrap()[0].project_id, Some(project));
+        restore_history_from(&mut db, &path).unwrap();
+        assert_eq!(list_project_groups_in_db(&db).unwrap()[0].title, "Работа");
+        assert_eq!(list_projects_in_db(&db).unwrap()[0].group_id, Some(group));
+        assert_eq!(list_conversations_in_db(&db).unwrap()[0].project_id, Some(project));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn restore_pre_group_backup_migrates_existing_projects() {
+        let path = std::env::temp_dir().join(format!("ai-desktop-pre-groups-{}.sqlite", std::process::id()));
+        let old = Connection::open(&path).unwrap();
+        init_db(&old).unwrap();
+        let project = create_project_in_db(&old).unwrap();
+        move_conversation_in_db(&old, 1, Some(project)).unwrap();
+        old.execute_batch("ALTER TABLE projects DROP COLUMN group_id; DROP TABLE project_groups; PRAGMA user_version=18;").unwrap();
+        drop(old);
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        restore_history_from(&mut db, &path).unwrap();
+        assert!(list_project_groups_in_db(&db).unwrap().is_empty());
+        assert_eq!(list_projects_in_db(&db).unwrap()[0].group_id, None);
+        assert_eq!(list_conversations_in_db(&db).unwrap()[0].project_id, Some(project));
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn context_test_state() -> AppState {
         let db = Connection::open_in_memory().unwrap();
@@ -4026,7 +4125,7 @@ mod tests {
         let mut current = Connection::open_in_memory().unwrap();
         init_db(&current).unwrap();
         restore_history_from(&mut current, &path).unwrap();
-        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 18);
+        assert_eq!(current.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 19);
         assert_eq!(current.query_row("SELECT content FROM messages WHERE id=2", [], |row| row.get::<_, String>(0)).unwrap(), "old answer");
         assert_eq!(current.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         std::fs::remove_file(path).unwrap();
@@ -4164,7 +4263,7 @@ mod tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(saved, ("partial".into(), "interrupted".into(), 3, 1));
-        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 18);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 19);
         drop(db);
         std::fs::remove_file(path).unwrap();
     }
