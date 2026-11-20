@@ -251,7 +251,7 @@ h2 {
 
 .history-latest { position: sticky; bottom: 8px; display: block; margin: 0 auto; }
 .markdown-table { max-width: 100%; overflow-x: auto; }
-.markdown-table table { border-collapse: collapse; }
+.markdown-table table { border-collapse: collapse; width: max-content; min-width: 100%; overflow-wrap: normal; }
 .markdown-table th, .markdown-table td { padding: 8px 12px; text-align: left; }
 .markdown-table th { font-weight: 600; }
 .markdown h2 { font-size: 20px; line-height: 28px; }
