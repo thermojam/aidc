@@ -4,16 +4,18 @@ import {Button} from "./components/ui/button";
 import ShellIcon from "./ShellIcon";
 
 export type Conversation = {id: number; title: string; archived: boolean; pinned: boolean; project_id: number | null};
-export type Project = {id: number; title: string; archived: boolean};
-type Target = {kind: "conversation"; item: Conversation} | {kind: "project"; item: Project};
+export type Project = {id: number; title: string; archived: boolean; group_id: number | null};
+export type ProjectGroup = {id: number; title: string};
+type Target = {kind: "conversation"; item: Conversation} | {kind: "project"; item: Project} | {kind: "group"; item: ProjectGroup};
 
 type Props = {
-    conversations: Conversation[]; projects: Project[]; selectedId: number; projectFilter: number | null;
+    conversations: Conversation[]; projects: Project[]; groups: ProjectGroup[]; selectedId: number; projectFilter: number | null;
     busy: boolean; query: string; matches: number[] | null; recentIds: number[];
     searchRef: RefObject<HTMLInputElement | null>; children: ReactNode;
     onQuery: (query: string) => void; onFilter: (id: number | null) => void;
     onSelect: (id: number) => void; onNew: () => void; onNewProject: () => void;
-    onRename: (target: {kind: "project" | "conversation"; id: number; title: string}) => void;
+    onNewGroup: () => void; onDeleteGroup: (group: ProjectGroup) => void; onMoveProject: (id: number, groupId: number | null) => void;
+    onRename: (target: {kind: "project" | "conversation" | "group"; id: number; title: string}) => void;
     onArchive: (item: Conversation) => void; onPin: (item: Conversation) => void;
     onArchiveProject: (item: Project) => void; onMove: (id: number, projectId: number | null) => void;
 };
@@ -21,6 +23,10 @@ type Props = {
 export default function ProjectSidebar(props: Props) {
     const [collapsed, setCollapsed] = useState<number[]>(() => {
         try { const saved = JSON.parse(localStorage.getItem("navigation.collapsed") ?? "[]"); return Array.isArray(saved) ? saved.filter(Number.isInteger) : []; }
+        catch { return []; }
+    });
+    const [collapsedGroups, setCollapsedGroups] = useState<number[]>(() => {
+        try { const saved = JSON.parse(localStorage.getItem("navigation.collapsedGroups") ?? "[]"); return Array.isArray(saved) ? saved.filter(Number.isInteger) : []; }
         catch { return []; }
     });
     const [target, setTarget] = useState<Target | null>(null);
@@ -41,6 +47,10 @@ export default function ProjectSidebar(props: Props) {
         const next = collapsed.includes(id) ? collapsed.filter((value) => value !== id) : [...collapsed, id];
         setCollapsed(next); localStorage.setItem("navigation.collapsed", JSON.stringify(next));
     }
+    function toggleGroup(id: number) {
+        const next = collapsedGroups.includes(id) ? collapsedGroups.filter((value) => value !== id) : [...collapsedGroups, id];
+        setCollapsedGroups(next); localStorage.setItem("navigation.collapsedGroups", JSON.stringify(next));
+    }
     function row(item: Conversation) {
         return <div className="navigation-row" key={item.id} onContextMenu={(event) => contextMenu(event, {kind: "conversation", item})}>
             <button type="button" className="navigation-title" title={item.title} aria-current={item.id === props.selectedId ? "page" : undefined}
@@ -49,6 +59,17 @@ export default function ProjectSidebar(props: Props) {
             </button>
             <button type="button" className="navigation-menu" aria-label={`Действия беседы ${item.title}`} onClick={(event) => showMenu({kind: "conversation", item}, event.currentTarget)}><ShellIcon name="more"/></button>
         </div>;
+    }
+    function projectRows(items: Project[]) {
+        return <>{items.filter((project) => props.projectFilter === null || props.projectFilter === project.id).map((project) => <section key={project.id}>
+                <div className="navigation-row" onContextMenu={(event) => contextMenu(event, {kind: "project", item: project})}>
+                    <button type="button" className="navigation-title" aria-expanded={!collapsed.includes(project.id)} title={project.title} onClick={() => toggleProject(project.id)}><ShellIcon name="folder"/><span>{project.title}</span><span aria-hidden="true">{collapsed.includes(project.id) ? "›" : "⌄"}</span></button>
+                    <button type="button" className="navigation-menu" aria-label={`Действия проекта ${project.title}`} onClick={(event) => showMenu({kind: "project", item: project}, event.currentTarget)}><ShellIcon name="more"/></button>
+                </div>
+                {(!collapsed.includes(project.id) || !!props.query.trim()) && <div className="project-conversations">{active.filter((item) => item.project_id === project.id).map(row)}
+                    {!active.some((item) => item.project_id === project.id) && <p className="sidebar-empty">{props.query.trim() ? "Ничего не найдено" : "Пока нет бесед"}</p>}
+                </div>}
+            </section>)}</>;
     }
     return <>
         <div className="navigation-tools">
@@ -62,16 +83,15 @@ export default function ProjectSidebar(props: Props) {
         <nav className="navigation-scroll" aria-label="Проекты и беседы">
             {props.children}
             {!!recent.length && !props.query.trim() && props.projectFilter === null && <section aria-label="Недавние беседы"><h2>Недавние</h2>{recent.map(row)}</section>}
-            <div className="navigation-section-heading"><h2>Проекты</h2><button type="button" className="secondary-button" onClick={props.onNewProject}>Создать</button></div>
-            {activeProjects.filter((project) => props.projectFilter === null || props.projectFilter === project.id).map((project) => <section key={project.id}>
-                <div className="navigation-row" onContextMenu={(event) => contextMenu(event, {kind: "project", item: project})}>
-                    <button type="button" className="navigation-title" aria-expanded={!collapsed.includes(project.id)} title={project.title} onClick={() => toggleProject(project.id)}><ShellIcon name="folder"/><span>{project.title}</span><span aria-hidden="true">{collapsed.includes(project.id) ? "›" : "⌄"}</span></button>
-                    <button type="button" className="navigation-menu" aria-label={`Действия проекта ${project.title}`} onClick={(event) => showMenu({kind: "project", item: project}, event.currentTarget)}><ShellIcon name="more"/></button>
+            <div className="navigation-section-heading"><h2>Проекты</h2><button type="button" className="secondary-button" onClick={props.onNewGroup}>Новая группа</button><button type="button" className="secondary-button" onClick={props.onNewProject}>Создать</button></div>
+            {props.groups.map((group) => <section key={group.id} aria-label={`Группа ${group.title}`}>
+                <div className="navigation-row" onContextMenu={(event) => contextMenu(event, {kind: "group", item: group})}>
+                    <button type="button" className="navigation-title" aria-expanded={!collapsedGroups.includes(group.id) || !!props.query.trim()} title={group.title} onClick={() => toggleGroup(group.id)}><span>{group.title}</span><span aria-hidden="true">{collapsedGroups.includes(group.id) && !props.query.trim() ? "›" : "⌄"}</span></button>
+                    <button type="button" className="navigation-menu" aria-label={`Действия группы ${group.title}`} onClick={(event) => showMenu({kind: "group", item: group}, event.currentTarget)}><ShellIcon name="more"/></button>
                 </div>
-                {(!collapsed.includes(project.id) || !!props.query.trim()) && <div className="project-conversations">{active.filter((item) => item.project_id === project.id).map(row)}
-                    {!active.some((item) => item.project_id === project.id) && <p className="sidebar-empty">{props.query.trim() ? "Ничего не найдено" : "Пока нет бесед"}</p>}
-                </div>}
+                {(!collapsedGroups.includes(group.id) || !!props.query.trim()) && <div className="project-conversations">{projectRows(activeProjects.filter((item) => item.group_id === group.id))}</div>}
             </section>)}
+            {projectRows(activeProjects.filter((item) => item.group_id === null))}
             {(props.projectFilter === null || props.projectFilter === 0) && <section aria-label="Беседы без проекта"><h2>Без проекта</h2>{active.filter((item) => item.project_id === null).map(row)}</section>}
             {!filtered.length && (props.projectFilter === 0 || !activeProjects.length) && <p className="sidebar-empty">{props.query.trim() ? "Ничего не найдено" : "Пока нет бесед"}</p>}
             {!!archived.length && <details open={!!props.query.trim()}><summary>Архив бесед</summary>{archived.map(row)}</details>}
@@ -92,7 +112,12 @@ export default function ProjectSidebar(props: Props) {
                             <option value={0}>Без проекта</option>{activeProjects.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
                         </select></label>
                         <Button type="button" disabled={props.busy} onClick={() => { props.onArchive(target.item); setTarget(null); }}>{target.item.archived ? "Восстановить" : "Архивировать"}</Button>
-                    </> : <Button type="button" disabled={props.busy} onClick={() => { props.onArchiveProject(target.item); setTarget(null); }}>{target.item.archived ? "Восстановить" : "Архивировать"}</Button>}
+                    </> : target.kind === "project" ? <>
+                        <label>Группа проекта<select aria-label="Переместить проект" value={target.item.group_id ?? 0} onChange={(event) => { props.onMoveProject(target.item.id, Number(event.target.value) || null); setTarget(null); }}>
+                            <option value={0}>Без группы</option>{props.groups.map((group) => <option key={group.id} value={group.id}>{group.title}</option>)}
+                        </select></label>
+                        <Button type="button" disabled={props.busy} onClick={() => { props.onArchiveProject(target.item); setTarget(null); }}>{target.item.archived ? "Восстановить" : "Архивировать"}</Button>
+                    </> : <Button type="button" onClick={() => { props.onDeleteGroup(target.item); setTarget(null); }}>Удалить группу</Button>}
                 </>}
                 <Button type="button" onClick={() => setTarget(null)}>Закрыть</Button>
             </DialogContent>

@@ -12,7 +12,7 @@ import {Dialog, DialogContent, DialogTitle} from "./components/ui/dialog";
 import {NativeSelect} from "./components/ui/native-select";
 import {OperationNotice, OperationToaster, useOperationErrors, type ErrorArea, AnswerFailure, notify} from "./OperationErrors";
 import RenderBoundary from "./RenderBoundary";
-import ProjectSidebar, {type Conversation, type Project} from "./ProjectSidebar";
+import ProjectSidebar, {type Conversation, type Project, type ProjectGroup} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
 import ModelPicker from "./ModelPicker";
 import {useNavigationLayout} from "./useNavigationLayout";
@@ -99,6 +99,7 @@ const categoryLabel: Record<string, string> = {
 function App() {
     const [conversations, setConversations] = useState<Conversation[]>([]);
     const [projects, setProjects] = useState<Project[]>([]);
+    const [projectGroups, setProjectGroups] = useState<ProjectGroup[]>([]);
     const [projectFilter, setProjectFilter] = useState<number | null>(null);
     const [materialsOpen, setMaterialsOpen] = useState(false);
     const [materialPreview, setMaterialPreview] = useState<PendingAttachment | null>(null);
@@ -111,7 +112,8 @@ function App() {
     const [projectFolderView, setProjectFolderView] = useState<ProjectFolderView | null>(null);
     const [folderPreview, setFolderPreview] = useState<PendingAttachment | null>(null);
     const [selectedMaterialIds, setSelectedMaterialIds] = useState<number[]>([]);
-    const [renameTarget, setRenameTarget] = useState<{kind: "project" | "conversation"; id: number; title: string} | null>(null);
+    const renamePending = useRef(false);
+    const [renameTarget, setRenameTarget] = useState<{kind: "project" | "conversation" | "group"; id: number; title: string} | null>(null);
     const [conversationSearch, setConversationSearch] = useState("");
     const [searchMatches, setSearchMatches] = useState<number[] | null>(null);
     const [conversationId, setConversationId] = useState(1);
@@ -715,8 +717,9 @@ function App() {
     }
 
     async function refreshProjects() {
-        const items = await invoke<Project[]>("list_projects");
+        const [items, groups] = await Promise.all([invoke<Project[]>("list_projects"), invoke<ProjectGroup[]>("list_project_groups")]);
         setProjects(items);
+        setProjectGroups(groups);
         return items;
     }
 
@@ -917,18 +920,29 @@ function App() {
     }
 
     async function saveRename() {
-        if (!renameTarget) return;
+        if (!renameTarget || renamePending.current) return;
+        renamePending.current = true;
+        let operation = renameTarget.kind === "group" && renameTarget.id === 0 ? "createGroup" : "saveRename";
         try {
             if (renameTarget.kind === "conversation") {
                 await invoke("rename_conversation", {conversationId: renameTarget.id, title: renameTarget.title});
                 await refreshConversations();
+            } else if (renameTarget.kind === "group") {
+                if (renameTarget.id === 0) {
+                    await invoke("create_project_group", {title: renameTarget.title});
+                    setRenameTarget(null);
+                    clear(operation);
+                    operation = "projects";
+                } else await invoke("rename_project_group", {id: renameTarget.id, title: renameTarget.title});
+                await refreshProjects();
             } else {
                 await invoke("rename_project", {id: renameTarget.id, title: renameTarget.title});
                 await refreshProjects();
             }
             setRenameTarget(null);
-            clear("saveRename");
-        } catch (reason) { report("saveRename", reason); }
+            clear(operation);
+        } catch (reason) { report(operation, reason); }
+        finally { renamePending.current = false; }
     }
 
     async function updateResponseStyle(style: ContextPreview["response_style"]) {
@@ -974,6 +988,23 @@ function App() {
             setProjectFilter(id);
             clear("createProject");
         } catch (reason) { report("createProject", reason); }
+    }
+
+    async function deleteProjectGroup(group: ProjectGroup) {
+        if (!await confirmAction(`Удалить группу «${group.title}»? Проекты и беседы сохранятся, проекты останутся без группы.`)) return;
+        try {
+            await invoke("delete_project_group", {id: group.id});
+            await refreshProjects();
+            clear("projectGroups");
+        } catch (reason) { report("projectGroups", reason); }
+    }
+
+    async function moveProjectToGroup(id: number, groupId: number | null) {
+        try {
+            await invoke("move_project_to_group", {id, groupId});
+            await refreshProjects();
+            clear("projectGroups");
+        } catch (reason) { report("projectGroups", reason); }
     }
 
     async function archiveProject(item: Project) {
@@ -1115,7 +1146,7 @@ function App() {
             notifiedRuns.current.clear();
             await Promise.all([refreshScheduledTasks(), refreshScheduledRuns()]);
             const items = await refreshConversations();
-            setProjects(await invoke<Project[]>("list_projects"));
+            await refreshProjects();
             setProjectFilter(null);
             const nextId = items.some((item) => item.id === conversationId && !item.archived)
                 ? conversationId : items.find((item) => !item.archived)?.id ?? items[0]?.id ?? 1;
@@ -1598,10 +1629,11 @@ function App() {
             {error.id.endsWith(":history") && <Button type="button" onClick={() => void reload().catch((reason) => report("history", reason))}>Загрузить историю заново</Button>}
         </OperationNotice>);
     }
-    const sidebar = <ProjectSidebar conversations={conversations} projects={projects} selectedId={conversationId}
+    const sidebar = <ProjectSidebar conversations={conversations} projects={projects} groups={projectGroups} selectedId={conversationId}
         projectFilter={projectFilter} busy={busy} query={conversationSearch} matches={searchMatches} recentIds={recentIds}
         searchRef={chatSearchField} onQuery={setConversationSearch} onFilter={(id) => { setProjectFilter(id); setSearchMatches(null); }}
         onSelect={(id) => void switchConversation(id).then((switched) => { if (switched) setTasksView(false); })} onNew={() => void createConversation()} onNewProject={() => void createProject()}
+        onNewGroup={() => setRenameTarget({kind: "group", id: 0, title: ""})} onDeleteGroup={(group) => void deleteProjectGroup(group)} onMoveProject={(id, groupId) => void moveProjectToGroup(id, groupId)}
         onRename={setRenameTarget} onArchive={(item) => void archiveConversation(item)} onPin={(item) => void togglePin(item)}
         onArchiveProject={(item) => void archiveProject(item)} onMove={(id, projectId) => void moveConversation(projectId, id)}>
         {operationErrors("navigation")}
@@ -1649,7 +1681,7 @@ function App() {
             </Dialog>
             <Dialog open={renameTarget !== null} onOpenChange={(open) => { if (!open) setRenameTarget(null); }}>
                 <DialogContent className="navigation-actions" aria-describedby={undefined} onCloseAutoFocus={(event) => { event.preventDefault(); (chatSearchField.current ?? navigation.trigger.current)?.focus(); }}>
-                    <DialogTitle>Переименовать {renameTarget?.kind === "project" ? "проект" : "беседу"}</DialogTitle>
+                    <DialogTitle>{renameTarget?.kind === "group" && renameTarget.id === 0 ? "Создать группу" : `Переименовать ${renameTarget?.kind === "project" ? "проект" : renameTarget?.kind === "group" ? "группу" : "беседу"}`}</DialogTitle>
                     {renameTarget && <form className="rename-form" onSubmit={(event) => { event.preventDefault(); void saveRename(); }}>
                         <label htmlFor="rename-title">Название</label><input id="rename-title" maxLength={80} value={renameTarget.title} onChange={(event) => setRenameTarget({...renameTarget, title: event.target.value})}/>
                         <Button type="submit" disabled={!renameTarget.title.trim()}>Сохранить</Button><Button type="button" onClick={() => setRenameTarget(null)}>Отмена</Button>

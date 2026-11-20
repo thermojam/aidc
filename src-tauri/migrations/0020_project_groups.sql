@@ -1,0 +1,8 @@
+BEGIN;
+CREATE TABLE project_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL
+);
+ALTER TABLE projects ADD COLUMN group_id INTEGER REFERENCES project_groups(id) ON DELETE SET NULL;
+PRAGMA user_version = 19;
+COMMIT;

@@ -1,4 +1,4 @@
-import {isValidElement, memo, useState} from "react";
+import {isValidElement, memo, useLayoutEffect, useMemo, useRef, useState} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import hljs from "highlight.js/lib/core";
@@ -41,8 +41,9 @@ function CodeBlock({code, language, complete, onArtifact}: {code: string; langua
 }
 
 function MarkdownMessage({content, messageId, onArtifact}: Props) {
-    return <div className="markdown">
-        <ReactMarkdown skipHtml remarkPlugins={[remarkGfm]} components={{
+    const artifactAction = useRef(onArtifact);
+    useLayoutEffect(() => { artifactAction.current = onArtifact; }, [onArtifact]);
+    const components = useMemo<NonNullable<React.ComponentProps<typeof ReactMarkdown>["components"]>>(() => ({
             a({children, href}) { return <span>{children}{href ? ` (${href})` : ""}</span>; },
             img({alt}) { return <span>[Изображение не загружено{alt ? `: ${alt}` : ""}]</span>; },
             table({children}) { return <div className="markdown-table" role="region" aria-label="Таблица" tabIndex={0}><table>{children}</table></div>; },
@@ -58,9 +59,11 @@ function MarkdownMessage({content, messageId, onArtifact}: Props) {
                 const fence = /(?:^|[\s>])(`{3,}|~{3,})[^`~]*$/.exec(lines[0]);
                 const closing = fence && lines.slice(1).some((line) => new RegExp(`^[\\s>]*${fence[1][0]}{${fence[1].length},}\\s*$`).test(line));
                 return <CodeBlock code={code} language={language} complete={Boolean(closing)}
-                    onArtifact={() => onArtifact(messageId, kind, language || "code", code)}/>;
+                    onArtifact={() => artifactAction.current(messageId, kind, language || "code", code)}/>;
             }
-        }}>{content}</ReactMarkdown>
+        }), [content, messageId]);
+    return <div className="markdown">
+        <ReactMarkdown skipHtml remarkPlugins={[remarkGfm]} components={components}>{content}</ReactMarkdown>
     </div>;
 }
 
