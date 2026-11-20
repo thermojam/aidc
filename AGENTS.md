@@ -10,10 +10,10 @@
 
 ## Код и проверки
 
-- `src/MarkdownMessage.tsx` отвечает за Markdown, `src/ArtifactPanel.tsx` — за Artifacts, `src/viewer.ts` — за тестовый viewer. Tailwind и Shadcn сейчас не подключены; их использование в спецификации — план миграции.
+- `src/MarkdownMessage.tsx` отвечает за Markdown, `src/ArtifactPanel.tsx` — за Artifacts, `src/viewer.ts` — за тестовый viewer. Tailwind подключён через Vite. Общие элементы интерфейса находятся в `src/components/ui/`. Задачи редизайна — в `.scratch/design-ux/issues/`.
 - `src-tauri/src/lib.rs`: SQLite, mock SSE, Tauri Channel, Keychain, ветки, Retry, вложения, каталог моделей и сборка контекста; `src-tauri/migrations/`: версии схемы; `src-tauri/build.rs` и `src-tauri/capabilities/main.json`: список команд и доступ только окна `main`; `src/main.tsx`: чат. `src-tauri/tauri.viewer-test.conf.json` добавляет окно `viewer` только для отрицательной проверки IPC.
-- Сборка и тесты: `npm ci`, `npm run typecheck`, `npm run build`, `cd src-tauri && cargo test`; запуск: `npm run tauri dev`. Нативный тест Keychain помечен `#[ignore]` и не входит в обычный `cargo test`. Тест viewer: `npm run tauri dev -- --config src-tauri/tauri.viewer-test.conf.json`. Линтер в `package.json` не настроен. Результаты запуска на macOS и оставшиеся пробелы — в `docs/research/rea/checks.md`; сценарий для реальной Windows — в `docs/research/rea/smoke-windows.md`.
-- Темы `Системная` / `Светлая` / `Тёмная` реализованы в `src/main.tsx` и `src/style.css`; выбор хранится в `localStorage` под ключом `appearance`. Поведение системной темы при смене темы ОС и полный перезапуск ещё не подтверждены.
+- Сборка и тесты: `npm ci`, `npm run typecheck`, `npm run build`, `cd src-tauri && cargo test`; запуск: `npm run tauri dev`. Обычный `cargo test` пропускает нативный Keychain и платный SimpleClaw POST. Для платного теста требуется отдельное разрешение на расходы. Тест viewer: `npm run tauri dev -- --config src-tauri/tauri.viewer-test.conf.json`. Линтер в `package.json` не настроен. Результаты запуска на macOS и оставшиеся пробелы — в `docs/research/rea/checks.md`; сценарий для реальной Windows — в `docs/research/rea/smoke-windows.md`.
+- Темы `Системная` / `Светлая` / `Тёмная` реализованы в `src/main.tsx` и `src/style.css`; выбор хранится в `localStorage` под ключом `appearance`. Результаты проверки смены оформления ОС и сохранения темы после перезапуска см. в разделе «Редизайн 02: компоненты и темы» в `docs/research/rea/checks.md`.
 
 ## Ближайшая задача
 

@@ -953,8 +953,8 @@ fn prepare_image_attachment_bytes(name: String, content: Vec<u8>, id: i64, exten
     Ok(PendingAttachment { id, name, mime: mime.into(), content, preview })
 }
 
-#[tauri::command]
-fn capture_window_snapshot() -> Result<CapturedSnapshot, String> {
+#[tauri::command(async)]
+fn capture_window_snapshot() -> Result<Option<CapturedSnapshot>, String> {
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
@@ -967,11 +967,15 @@ fn capture_window_snapshot() -> Result<CapturedSnapshot, String> {
         let result = (|| {
             match capture {
                 Ok(output) if output.status.success() => {
-                    let bytes = std::fs::read(&file).map_err(|_| "Не удалось прочитать снимок")?;
+                    let bytes = match std::fs::read(&file) {
+                        Ok(bytes) => bytes,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                        Err(_) => return Err("Не удалось прочитать снимок".into()),
+                    };
                     let draft = prepare_image_attachment_bytes("window-snapshot.png".into(), bytes, 0, "png")?;
-                    Ok(CapturedSnapshot { mime: draft.mime, size: draft.content.len(), sha256: format!("{:x}", Sha256::digest(&draft.content)), preview: draft.preview })
+                    Ok(Some(CapturedSnapshot { mime: draft.mime, size: draft.content.len(), sha256: format!("{:x}", Sha256::digest(&draft.content)), preview: draft.preview }))
                 }
-                Ok(_) => Err("Захват отменён или запрещён macOS. Проверьте разрешение «Запись экрана» в настройках конфиденциальности.".into()),
+                Ok(_) => Ok(None),
                 Err(_) => Err("Не удалось открыть системный выбор окна macOS".into()),
             }
         })();
