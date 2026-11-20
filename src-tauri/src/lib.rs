@@ -3081,6 +3081,27 @@ mod tests {
     }
 
     #[test]
+    fn context_rejects_missing_or_other_project_material() {
+        let state = context_test_state();
+        let (material, other_material) = {
+            let db = state.db.lock().unwrap();
+            let project = create_project_in_db(&db).unwrap();
+            let other_project = create_project_in_db(&db).unwrap();
+            move_conversation_in_db(&db, 1, Some(project)).unwrap();
+            let draft = PendingAttachment { id: 1, name: "note.txt".into(), mime: "text/plain".into(), content: b"synthetic".to_vec(), preview: "synthetic".into() };
+            (save_project_material_in_db(&db, project, &draft).unwrap().id,
+             save_project_material_in_db(&db, other_project, &draft).unwrap().id)
+        };
+        for id in [999999, other_material] {
+            assert_eq!(check_context(&state, 1, "question", &[], &[id], "local-mock", false).err().as_deref(), Some("Материал не найден в проекте беседы"));
+        }
+        let preview = check_context(&state, 1, "question", &[], &[material], "local-mock", false).unwrap();
+        state.db.lock().unwrap().execute("DELETE FROM project_materials WHERE id=?1", [material]).unwrap();
+        assert_eq!(start_mock(&state, Channel::new(|_| Ok(())), 1, Some("question"), None, &[], &[material], "local-mock", preview.confirmation_id.as_deref()).unwrap_err(), RECHECK_CONTEXT);
+        assert_eq!(state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
     fn context_confirmation_rechecks_model_agent_skill_folder_and_material_version() {
         for change in ["model", "agent", "skill", "folder", "version", "material_content", "project_archive"] {
             let state = context_test_state();
