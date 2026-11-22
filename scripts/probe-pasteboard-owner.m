@@ -2,12 +2,15 @@
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc > 1) {
-      NSPasteboard *p = [NSPasteboard pasteboardWithName:[NSString stringWithUTF8String:argv[1]]];
+      NSString *name = [NSString stringWithUTF8String:argv[1]];
+      if (![name hasPrefix:@"com.aidc.synthetic."]) return 3;
+      NSPasteboard *p = [NSPasteboard pasteboardWithName:name];
       if (!p) { fprintf(stderr, "named pasteboard unavailable\n"); return 3; }
       [p declareTypes:@[NSPasteboardTypeString] owner:nil];
       return [p setString:@"synthetic child" forType:NSPasteboardTypeString] ? 0 : 2;
     }
-    NSPasteboard *p = [NSPasteboard pasteboardWithUniqueName];
+    NSString *name = [@"com.aidc.synthetic." stringByAppendingString:NSUUID.UUID.UUIDString];
+    NSPasteboard *p = [NSPasteboard pasteboardWithName:name];
     if (!p || !p.name) { fprintf(stderr, "named pasteboard unavailable\n"); return 3; }
     [p declareTypes:@[NSPasteboardTypeString] owner:nil];
     BOOL before = [p setString:@"synthetic initial" forType:NSPasteboardTypeString];
