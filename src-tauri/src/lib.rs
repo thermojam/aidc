@@ -123,6 +123,8 @@ struct ContextMessage {
 
 #[derive(Deserialize, Serialize)]
 struct ContextPreview {
+    #[serde(default = "default_model_source")]
+    model_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     confirmation_id: Option<String>,
     model_id: String,
@@ -1095,6 +1097,8 @@ fn with_agent_tools(mut payload: serde_json::Value, enabled: bool, project_searc
     Ok(payload)
 }
 
+fn default_model_source() -> String { "simpleclaw".into() }
+
 fn chat_payload(db: &Connection, context: &ContextPreview, tail: Option<(&str, &[&PendingAttachment])>) -> Result<serde_json::Value, String> {
     let mut image_count = 0;
     let mut messages = Vec::new();
@@ -1104,6 +1108,7 @@ fn chat_payload(db: &Connection, context: &ContextPreview, tail: Option<(&str, &
             for id in &message.attachment_ids {
                 let (mime, content) = context_attachment(db, if message.source_message_id.is_none() { tail } else { None }, *id)?;
                 if !mime.starts_with("image/") { continue; }
+                if context.model_source == "ollama" { return Err("Для Ollama изображения пока не поддерживаются".into()); }
                 if !is_supported_image_mime(&mime) { return Err("Формат изображения не поддерживается".into()); }
                 image_count += 1;
                 if image_count > 8 { return Err("В одном запросе можно использовать не больше восьми изображений".into()); }
@@ -1115,7 +1120,8 @@ fn chat_payload(db: &Connection, context: &ContextPreview, tail: Option<(&str, &
         let content = if parts.len() == 1 { serde_json::Value::String(message.content.clone()) } else { serde_json::Value::Array(parts) };
         messages.push(serde_json::json!({"role": message.role, "content": content}));
     }
-    let payload = serde_json::json!({"model": context.model_id, "messages": messages, "max_tokens": 1024, "stream": true});
+    let mut payload = serde_json::json!({"model": context.model_id, "messages": messages, "max_tokens": 1024, "stream": true});
+    if context.model_source == "ollama" && context.model_id.to_ascii_lowercase().starts_with("qwen3.5:") { payload["reasoning_effort"] = serde_json::json!("none"); }
     let request_bytes = serde_json::to_vec(&payload).map_err(|_| "Не удалось собрать запрос")?.len();
     if request_bytes > 5 * 1024 * 1024 { return Err("Запрос превышает предел 5 МиБ".into()); }
     Ok(payload)
@@ -1170,6 +1176,37 @@ fn save_catalog_if_latest(db: &Connection, latest: &AtomicU64, request: u64, cat
 fn list_models(state: State<'_, AppState>) -> Result<Option<ModelCatalog>, String> {
     let db = state.db.lock().map_err(|_| "База занята")?;
     cached_catalog(&db).map_err(|_| "Не удалось прочитать каталог".into())
+}
+
+#[tauri::command]
+async fn list_ollama_models() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "macos")]
+    { fetch_ollama_catalog("http://127.0.0.1:11434/api/tags").await }
+    #[cfg(not(target_os = "macos"))]
+    { Err("Ollama пока доступна только на macOS".into()) }
+}
+
+async fn fetch_ollama_catalog(url: &str) -> Result<Vec<String>, String> {
+    let error = "Ollama недоступна. Запустите Ollama и повторите попытку.";
+    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8)).build().map_err(|_| error)?;
+    let mut response = client.get(url).send().await.map_err(|_| error)?;
+    if !response.status().is_success() || response.content_length().is_some_and(|size| size > 2 * 1024 * 1024) { return Err(error.into()); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| error)? {
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 { return Err(error.into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| error)?;
+    let models = body.get("models").and_then(|value| value.as_array()).ok_or(error)?;
+    let mut names = Vec::new();
+    for model in models {
+        let Some(name) = model.get("name").and_then(|value| value.as_str()) else { continue; };
+        let remote = ["remote_model", "remote_host"].iter().any(|field| model.get(*field).is_some_and(|value| !value.is_null() && value.as_str() != Some("")));
+        let cloud = name.rsplit_once(':').is_some_and(|(_, tag)| tag.eq_ignore_ascii_case("cloud") || tag.to_ascii_lowercase().ends_with("-cloud"));
+        if !remote && !cloud && !name.is_empty() && name.len() <= 200 && !names.iter().any(|item| item == name) { names.push(name.to_owned()); }
+    }
+    Ok(names)
 }
 
 #[tauri::command]
@@ -2281,6 +2318,10 @@ fn create_attempt_for_conversation(db: &mut Connection, conversation_id: i64, pr
 }
 
 fn create_attempt_for_conversation_with_agent_skill(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>) -> rusqlite::Result<i64> {
+    create_attempt_for_source(db, conversation_id, prompt, attachments, model_id, agent_mode, scheduled_run_id, "simpleclaw")
+}
+
+fn create_attempt_for_source(db: &mut Connection, conversation_id: i64, prompt: &str, attachments: &[&PendingAttachment], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>, source: &str) -> rusqlite::Result<i64> {
     let tx = db.transaction()?;
     let parent_id: Option<i64> = tx.query_row(
         "SELECT c.active_leaf_id FROM conversations c WHERE c.id=?1 AND c.archived=0 AND
@@ -2300,7 +2341,7 @@ fn create_attempt_for_conversation_with_agent_skill(db: &mut Connection, convers
                 format!("{:x}", Sha256::digest(&draft.content)), draft.content],
         )?;
     }
-    let mut context = context_for(&tx, conversation_id, Some(user_message_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut context = context_for_source(&tx, conversation_id, Some(user_message_id), None, model_id, source).map_err(|_| rusqlite::Error::InvalidQuery)?;
     if agent_mode {
         let skill = get_agent_skill_in_db(&tx, conversation_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
         apply_agent_skill(&mut context, skill).map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -2350,6 +2391,10 @@ fn create_retry_for_model(db: &mut Connection, assistant_id: i64, model_id: &str
 }
 
 fn create_retry_for_conversation(db: &mut Connection, conversation_id: i64, assistant_id: i64, model_id: &str) -> rusqlite::Result<(i64, String)> {
+    create_retry_for_source(db, conversation_id, assistant_id, model_id, "simpleclaw")
+}
+
+fn create_retry_for_source(db: &mut Connection, conversation_id: i64, assistant_id: i64, model_id: &str, source: &str) -> rusqlite::Result<(i64, String)> {
     let tx = db.transaction()?;
     let (user_id, prompt): (i64, String) = tx.query_row(
         "SELECT u.id, u.content FROM messages a
@@ -2357,10 +2402,11 @@ fn create_retry_for_conversation(db: &mut Connection, conversation_id: i64, assi
          JOIN messages u ON u.id=a.parent_id AND u.id=old.user_message_id
          JOIN conversations c ON c.id=a.conversation_id
          WHERE a.id=?1 AND a.conversation_id=?2 AND u.conversation_id=?2 AND c.archived=0
-           AND u.role='user' AND old.status!='streaming'",
-        params![assistant_id, conversation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+           AND u.role='user' AND old.status!='streaming' AND coalesce(json_extract(old.context_json, '$.model_source'), 'simpleclaw')=?3
+           AND coalesce(old.model_id, 'local-mock')=?4",
+        params![assistant_id, conversation_id, source, model_id], |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let context = context_for(&tx, conversation_id, Some(user_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let context = context_for_source(&tx, conversation_id, Some(user_id), None, model_id, source).map_err(|_| rusqlite::Error::InvalidQuery)?;
     tx.execute(
         "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', ?1, ?2)",
         params![conversation_id, user_id],
@@ -2379,10 +2425,16 @@ fn create_retry_for_conversation(db: &mut Connection, conversation_id: i64, assi
     Ok((attempt_id, prompt))
 }
 
+#[cfg(test)]
 fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail: Option<(&str, &[&PendingAttachment])>, model_id: &str) -> Result<ContextPreview, String> {
+    context_for_source(db, conversation_id, leaf_id, tail, model_id, "simpleclaw")
+}
+
+fn context_for_source(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail: Option<(&str, &[&PendingAttachment])>, model_id: &str, source: &str) -> Result<ContextPreview, String> {
+    if !["simpleclaw", "ollama"].contains(&source) || model_id.is_empty() || model_id.len() > 200 { return Err("Неизвестный источник или модель".into()); }
     let response_style = response_style(db)?;
     let catalog = cached_catalog(db).map_err(|_| "Не удалось прочитать каталог")?;
-    let model = if model_id == "local-mock" { None } else {
+    let model = if source == "ollama" || model_id == "local-mock" { None } else {
         Some(catalog.as_ref().and_then(|catalog| catalog.models.iter().find(|model| model.id == model_id))
             .ok_or("Модель отсутствует в сохранённом каталоге")?)
     };
@@ -2455,6 +2507,7 @@ fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail
     }
     messages.insert(0, system);
     let mut preview = ContextPreview {
+        model_source: source.to_owned(),
         confirmation_id: None,
         model_id: model_id.to_owned(),
         response_style,
@@ -2505,6 +2558,11 @@ struct PreparedContext {
 }
 
 fn prepare_context(db: &Connection, drafts: &[PendingAttachment], conversation_id: i64, prompt: &str, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool) -> Result<PreparedContext, String> {
+    prepare_context_for_source(db, drafts, conversation_id, prompt, attachment_ids, project_material_ids, model_id, agent_mode, "simpleclaw")
+}
+
+fn prepare_context_for_source(db: &Connection, drafts: &[PendingAttachment], conversation_id: i64, prompt: &str, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool, source: &str) -> Result<PreparedContext, String> {
+    if source == "ollama" && agent_mode { return Err("Агентный режим для Ollama недоступен".into()); }
     if agent_mode && model_id != VERIFIED_TOOL_MODEL_ID { return Err("Агентный режим проверен только для gpt-oss-20b".into()); }
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.chars().count() > 2000 { return Err("Введите от 1 до 2000 символов".into()); }
@@ -2516,7 +2574,7 @@ fn prepare_context(db: &Connection, drafts: &[PendingAttachment], conversation_i
     let mut selected = drafts.iter().filter(|draft| attachment_ids.contains(&draft.id)).cloned().collect::<Vec<_>>();
     selected.extend(selected_project_materials(db, conversation_id, project_material_ids)?);
     let selected_refs = selected.iter().collect::<Vec<_>>();
-    let mut preview = context_for(db, conversation_id, leaf_id, Some((prompt, &selected_refs)), model_id)?;
+    let mut preview = context_for_source(db, conversation_id, leaf_id, Some((prompt, &selected_refs)), model_id, source)?;
     if agent_mode {
         apply_agent_skill(&mut preview, get_agent_skill_in_db(db, conversation_id)?)?;
     }
@@ -2543,12 +2601,17 @@ fn prepare_context(db: &Connection, drafts: &[PendingAttachment], conversation_i
     Ok(PreparedContext { preview, selected, request: CheckedRequest { payload, project_scope: project_id.zip(folder) }, fingerprint })
 }
 
+#[cfg(test)]
 fn check_context(state: &AppState, conversation_id: i64, prompt: &str, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool) -> Result<ContextPreview, String> {
+    check_context_for_source(state, conversation_id, prompt, attachment_ids, project_material_ids, model_id, agent_mode, "simpleclaw")
+}
+
+fn check_context_for_source(state: &AppState, conversation_id: i64, prompt: &str, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool, source: &str) -> Result<ContextPreview, String> {
     let drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
     let db = state.db.lock().map_err(|_| "База занята")?;
     let mut checked = state.checked_context.lock().map_err(|_| "Проверка контекста занята")?;
     *checked = None;
-    let mut prepared = prepare_context(&db, &drafts, conversation_id, prompt, attachment_ids, project_material_ids, model_id, agent_mode)?;
+    let mut prepared = prepare_context_for_source(&db, &drafts, conversation_id, prompt, attachment_ids, project_material_ids, model_id, agent_mode, source)?;
     let id = CONTEXT_CHECK_SEQUENCE.fetch_add(1, Ordering::SeqCst).to_string();
     *checked = Some((id.clone(), prepared.fingerprint));
     prepared.preview.confirmation_id = Some(id);
@@ -2563,8 +2626,8 @@ fn consume_context_check(state: &AppState, confirmation_id: Option<&str>, prepar
 }
 
 #[tauri::command]
-fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, state: State<'_, AppState>) -> Result<ContextPreview, String> {
-    check_context(&state, conversation_id, &prompt, &attachment_ids, &project_material_ids, &model_id, agent_mode)
+fn preview_context(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, agent_mode: bool, model_source: Option<String>, state: State<'_, AppState>) -> Result<ContextPreview, String> {
+    check_context_for_source(&state, conversation_id, &prompt, &attachment_ids, &project_material_ids, &model_id, agent_mode, model_source.as_deref().unwrap_or("simpleclaw"))
 }
 
 #[cfg(test)]
@@ -2719,6 +2782,7 @@ fn start_mock_generation(conversation_id: i64, prompt: String, attachment_ids: V
 
 #[tauri::command]
 fn retry_mock_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+    if model_id != "local-mock" { return Err("Для тестового повтора нужна тестовая модель".into()); }
     start_mock(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, None)
 }
 
@@ -2836,6 +2900,20 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
         let context: ContextPreview = serde_json::from_str(&context_json).map_err(|_| "DATABASE_ERROR")?;
         if context.model_id != model_id { return Err("MODEL_SNAPSHOT_MISMATCH".into()); }
         if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
+        if context.model_source == "ollama" {
+            let mut tags = reqwest::Url::parse(url).map_err(|_| "OLLAMA_UNAVAILABLE")?;
+            tags.set_path("/api/tags");
+            tags.set_query(None);
+            let mut request = Box::pin(fetch_ollama_catalog(tags.as_str()));
+            let models = loop {
+                if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
+                match tokio::time::timeout(Duration::from_millis(250), &mut request).await {
+                    Ok(result) => break result.map_err(|_| "OLLAMA_UNAVAILABLE")?,
+                    Err(_) => continue,
+                }
+            };
+            if !models.iter().any(|name| name == &model_id) { status = "failed"; return Err("OLLAMA_MODEL_UNAVAILABLE".into()); }
+        }
         let project_search_enabled = if let Some(payload) = &checked_payload {
             payload.payload.get("tools").and_then(serde_json::Value::as_array).is_some_and(|tools| tools.iter().any(|tool| tool.pointer("/function/name").and_then(serde_json::Value::as_str) == Some("search_project")))
         } else {
@@ -2849,16 +2927,25 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
             let connection = db.lock().map_err(|_| "DATABASE_ERROR")?;
             with_agent_tools(chat_payload(&connection, &context, None)?, agent_mode, project_search_enabled)?
         };
-        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(8))
-            .read_timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none())
-            .build().map_err(|_| "HTTP_CLIENT_ERROR")?;
+        let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(8))
+            .read_timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none());
+        if context.model_source == "ollama" { builder = builder.no_proxy(); }
+        let client = builder.build().map_err(|_| "HTTP_CLIENT_ERROR")?;
         let mut payload = payload;
         let mut total_usage = None;
         let mut seq = 0;
         for turn in 0..=1 {
             if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
-            let mut response = client.post(url).bearer_auth(&key).json(&payload)
-                .send().await.map_err(|_| "NETWORK_RESULT_UNKNOWN")?;
+            let mut request = client.post(url).json(&payload);
+            if context.model_source != "ollama" { request = request.bearer_auth(&key); }
+            let mut pending = Box::pin(request.send());
+            let mut response = loop {
+                if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
+                match tokio::time::timeout(Duration::from_millis(250), &mut pending).await {
+                    Ok(result) => break result.map_err(|_| if context.model_source == "ollama" { "OLLAMA_UNAVAILABLE" } else { "NETWORK_RESULT_UNKNOWN" })?,
+                    Err(_) => continue,
+                }
+            };
             http_status = Some(response.status().as_u16());
             if let Ok(db) = db.lock() {
                 let _ = db.execute("UPDATE attempts SET http_status=?1 WHERE id=?2", params![http_status, attempt_id]);
@@ -2868,7 +2955,16 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
             if !response.status().is_success() {
                 let status_code = response.status().as_u16();
                 let mut body = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(|_| "HTTP_ERROR")? {
+                let mut last_data = std::time::Instant::now();
+                loop {
+                    if cancel.load(Ordering::SeqCst) { status = "stopped"; return Ok(()); }
+                    let chunk = match tokio::time::timeout(Duration::from_millis(250), response.chunk()).await {
+                        Ok(chunk) => chunk.map_err(|_| "HTTP_ERROR")?,
+                        Err(_) if last_data.elapsed() < Duration::from_secs(30) => continue,
+                        Err(_) => return Err("HTTP_ERROR".into()),
+                    };
+                    let Some(chunk) = chunk else { break; };
+                    last_data = std::time::Instant::now();
                     if body.len() + chunk.len() > 64 * 1024 { break; }
                     body.extend_from_slice(&chunk);
                 }
@@ -2955,10 +3051,42 @@ async fn run_http_stream(db: Db, active: Arc<Mutex<Option<(i64, Arc<AtomicBool>)
     if cancel.load(Ordering::SeqCst) && status != "completed" { status = "stopped"; }
     record_stream_metadata(&db, attempt_id, None, request_id.as_deref(), None, error_code.as_deref());
     if let Ok(db) = db.lock() { let _ = finish(&db, attempt_id, status); }
-    let _ = on_event.send(StreamEvent::End { attempt_id, status: status.into(), error_code, request_id, http_status });
     if let Ok(mut current) = active.lock() {
         if current.as_ref().is_some_and(|(id, _)| *id == attempt_id) { *current = None; }
     }
+    let _ = on_event.send(StreamEvent::End { attempt_id, status: status.into(), error_code, request_id, http_status });
+}
+
+#[tauri::command]
+fn start_ollama_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i64>, project_material_ids: Vec<i64>, model_id: String, confirmation_id: Option<String>, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+    if !cfg!(target_os = "macos") { return Err("Ollama пока доступна только на macOS".into()); }
+    start_ollama(&state, on_event, conversation_id, &prompt, &attachment_ids, &project_material_ids, &model_id, confirmation_id.as_deref(), "http://127.0.0.1:11434/v1/chat/completions")
+}
+
+fn start_ollama(state: &AppState, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: &str, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, confirmation_id: Option<&str>, url: &str) -> Result<i64, String> {
+    let mut active = state.active.lock().map_err(|_| "Запрос занят")?;
+    if active.is_some() { return Err("Дождитесь завершения текущего ответа".into()); }
+    let (attempt_id, request) = {
+        let mut drafts = state.drafts.lock().map_err(|_| "Список файлов занят")?;
+        let mut db = state.db.lock().map_err(|_| "База занята")?;
+        let prepared = prepare_context_for_source(&db, &drafts, conversation_id, prompt, attachment_ids, project_material_ids, model_id, false, "ollama")?;
+        consume_context_check(state, confirmation_id, &prepared)?;
+        let selected = prepared.selected.iter().collect::<Vec<_>>();
+        let attempt_id = create_attempt_for_source(&mut db, conversation_id, prompt.trim(), &selected, model_id, false, None, "ollama")
+            .map_err(|_| "Не удалось сохранить локальный запрос")?;
+        drafts.retain(|draft| !attachment_ids.contains(&draft.id));
+        (attempt_id, prepared.request)
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    *active = Some((attempt_id, cancel.clone()));
+    let url = url.to_owned();
+    let model_id = model_id.to_owned();
+    let db = state.db.clone();
+    let active = state.active.clone();
+    tauri::async_runtime::spawn(async move {
+        run_http_stream(db, active, cancel, attempt_id, model_id, String::new(), &url, false, Some(request), on_event).await;
+    });
+    Ok(attempt_id)
 }
 
 #[tauri::command]
@@ -2971,7 +3099,39 @@ fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i6
 
 #[tauri::command]
 fn retry_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, false, None, None)
+    let _ = model_id;
+    retry_from_original(&state, on_event, conversation_id, assistant_id, "http://127.0.0.1:11434/v1/chat/completions")
+}
+
+fn retry_from_original(state: &AppState, on_event: Channel<StreamEvent>, conversation_id: i64, assistant_id: i64, ollama_url: &str) -> Result<i64, String> {
+    let (source, model): (String, String) = state.db.lock().map_err(|_| "База занята")?.query_row(
+        "SELECT coalesce(json_extract(context_json, '$.model_source'), 'simpleclaw'), coalesce(model_id, 'local-mock') FROM attempts WHERE assistant_id=?1 AND conversation_id=?2",
+        params![assistant_id, conversation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| "Ответ для повтора не найден")?;
+    if source == "simpleclaw" {
+        return if model == "local-mock" {
+            start_mock(state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model, None)
+        } else {
+            start_remote(state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model, false, None, None)
+        };
+    }
+    if source != "ollama" || !cfg!(target_os = "macos") { return Err("Источник повтора недоступен".into()); }
+    let mut active = state.active.lock().map_err(|_| "Запрос занят")?;
+    if active.is_some() { return Err("Дождитесь завершения текущего ответа".into()); }
+    let attempt_id = {
+        let mut db = state.db.lock().map_err(|_| "База занята")?;
+        create_retry_for_source(&mut db, conversation_id, assistant_id, &model, "ollama")
+            .map_err(|_| "Не удалось собрать контекст локального повтора")?.0
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    *active = Some((attempt_id, cancel.clone()));
+    let url = ollama_url.to_owned();
+    let db = state.db.clone();
+    let active = state.active.clone();
+    tauri::async_runtime::spawn(async move {
+        run_http_stream(db, active, cancel, attempt_id, model, String::new(), &url, false, None, on_event).await;
+    });
+    Ok(attempt_id)
 }
 
 fn start_remote(state: &AppState, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>, confirmation_id: Option<&str>) -> Result<i64, String> {
@@ -2989,6 +3149,10 @@ fn start_remote(state: &AppState, on_event: Channel<StreamEvent>, conversation_i
             consume_context_check(state, confirmation_id, &prepared)?;
             Some(prepared)
         } else { None };
+        if let Some(id) = retry_id {
+            let source: Option<String> = db.query_row("SELECT json_extract(context_json, '$.model_source') FROM attempts WHERE assistant_id=?1 AND conversation_id=?2", params![id, conversation_id], |row| row.get(0)).map_err(|_| "Ответ для повтора не найден")?;
+            if source.as_deref() == Some("ollama") { return Err("Повтор ответа Ollama пока недоступен".into()); }
+        }
         let key = {
             let _guard = state.key_lock.lock().map_err(|_| "Хранилище занято")?;
             key_entry(&state.key_service)?.get_password().map_err(|_| "Сначала сохраните ключ SimpleClaw")?
@@ -3055,7 +3219,7 @@ pub fn run() {
                 };
             }
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, list_project_groups, create_project_group, rename_project_group, delete_project_group, move_project_to_group, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, accept_dropped_files, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, list_project_groups, create_project_group, rename_project_group, delete_project_group, move_project_to_group, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_ollama_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, accept_dropped_files, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_ollama_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -3726,6 +3890,273 @@ mod tests {
             "seq": result.6, "answer_bytes": result.7}));
     }
 
+    fn ollama_response(body: &str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api/tags", listener.local_addr().unwrap());
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let size = socket.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /api/tags "));
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn ollama_context_keeps_source_and_rejects_cross_source_confirmation() {
+        let state = context_test_state();
+        let preview = check_context_for_source(&state, 1, "hello", &[], &[], "same:latest", false, "ollama").unwrap();
+        assert_eq!(preview.model_source, "ollama");
+        let db = state.db.lock().unwrap();
+        let catalog = ModelCatalog { fetched_at: 1, models: vec![CatalogModel { id: "same:latest".into(), name: "same".into(), input_rubles_per_million: None, output_rubles_per_million: None, protocols: vec![], request_rubles: None, audio_rubles_per_minute: None }] };
+        save_catalog_if_latest(&db, &AtomicU64::new(1), 1, &catalog).unwrap();
+        let drafts = state.drafts.lock().unwrap();
+        let remote = prepare_context_for_source(&db, &drafts, 1, "hello", &[], &[], "same:latest", false, "simpleclaw").unwrap();
+        assert!(consume_context_check(&state, preview.confirmation_id.as_deref(), &remote).is_err());
+    }
+
+    #[test]
+    fn ollama_rejects_agent_mode_and_images_before_send() {
+        let state = context_test_state();
+        assert!(check_context_for_source(&state, 1, "hello", &[], &[], "gpt-oss-20b", true, "ollama").is_err());
+        state.drafts.lock().unwrap().push(PendingAttachment { id: 1, name: "image.png".into(), mime: "image/png".into(), content: vec![1, 2, 3], preview: String::new() });
+        assert!(check_context_for_source(&state, 1, "hello", &[1], &[], "gpt-6-luna", false, "ollama").is_err());
+        assert_eq!(state.db.lock().unwrap().query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    fn serve_ollama_tags(listener: &std::net::TcpListener, models: &str) {
+        use std::io::Write;
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let size = socket.read(&mut request).unwrap();
+        assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /api/tags "));
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", models.len(), models).unwrap();
+    }
+
+    #[test]
+    fn ollama_sends_without_key_streams_and_keeps_context_and_source() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("aidc-ollama-restart-{}.sqlite", std::process::id()));
+        let connection = Connection::open(&path).unwrap();
+        init_db(&connection).unwrap();
+        let mut state = context_test_state();
+        state.db = Arc::new(Mutex::new(connection));
+        let catalog = ModelCatalog { fetched_at: 1, models: vec![CatalogModel { id: "qwen3.5:9b-q4_K_M".into(), name: "cloud model with same name".into(), input_rubles_per_million: Some(5.0), output_rubles_per_million: None, protocols: vec![], request_rubles: None, audio_rubles_per_minute: None }] };
+        save_catalog_if_latest(&state.db.lock().unwrap(), &AtomicU64::new(1), 1, &catalog).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for turn in 0..3 {
+                serve_ollama_tags(&listener, r#"{"models":[{"name":"qwen3.5:9b-q4_K_M"}]}"#);
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body_start;
+                let content_length;
+                loop {
+                    let size = socket.read(&mut buf).unwrap();
+                    assert!(size > 0);
+                    bytes.extend_from_slice(&buf[..size]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        body_start = index + 4;
+                        let headers = String::from_utf8_lossy(&bytes[..index]).to_lowercase();
+                        assert!(headers.starts_with("post /v1/chat/completions"));
+                        assert!(!headers.contains("authorization:"));
+                        content_length = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse::<usize>().unwrap();
+                        break;
+                    }
+                }
+                while bytes.len() < body_start + content_length { let n = socket.read(&mut buf).unwrap(); assert!(n > 0); bytes.extend_from_slice(&buf[..n]); }
+                let payload: serde_json::Value = serde_json::from_slice(&bytes[body_start..body_start + content_length]).unwrap();
+                assert_eq!(payload["model"], "qwen3.5:9b-q4_K_M");
+                assert_eq!(payload["reasoning_effort"], "none");
+                assert_eq!(payload["stream"], true);
+                if turn == 1 {
+                    let messages = payload["messages"].as_array().unwrap();
+                    assert!(messages.iter().any(|m| m["role"] == "user" && m["content"] == "first"));
+                    assert!(messages.iter().any(|m| m["role"] == "assistant" && m["content"] == "Hello world"));
+                }
+                if turn == 2 {
+                    let messages = payload["messages"].as_array().unwrap();
+                    assert!(messages.iter().any(|m| m["role"] == "user" && m["content"] == "first"));
+                    assert!(!messages.iter().any(|m| m["role"] == "assistant"));
+                }
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        for prompt in ["first", "second"] {
+            let preview = check_context_for_source(&state, 1, prompt, &[], &[], "qwen3.5:9b-q4_K_M", false, "ollama").unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| { if let tauri::ipc::InvokeResponseBody::Json(json) = body { tx.send(json).unwrap(); } Ok(()) });
+            let id = start_ollama(&state, channel, 1, prompt, &[], &[], "qwen3.5:9b-q4_K_M", preview.confirmation_id.as_deref(), &url).unwrap();
+            let events: Vec<String> = std::iter::from_fn(|| { let value = rx.recv_timeout(Duration::from_secs(5)).unwrap(); let done = value.contains("\"end\""); Some((value, done)) }).take_while(|(_, done)| !done).map(|(value, _)| value).collect();
+            assert_eq!(events.len(), 2);
+            let db = state.db.lock().unwrap();
+            let (answer, status, context): (String, String, String) = db.query_row("SELECT m.content,a.status,a.context_json FROM attempts a JOIN messages m ON m.id=a.assistant_id WHERE a.id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            assert_eq!((answer.as_str(), status.as_str()), ("Hello world", "completed"));
+            assert_eq!(serde_json::from_str::<ContextPreview>(&context).unwrap().model_source, "ollama");
+        }
+        let db = state.db.lock().unwrap();
+        let assistant: i64 = db.query_row("SELECT assistant_id FROM attempts ORDER BY id LIMIT 1", [], |row| row.get(0)).unwrap();
+        drop(db);
+        assert!(start_remote(&state, Channel::new(|_| Ok(())), 1, None, Some(assistant), &[], &[], "same:latest", false, None, None).unwrap_err().contains("Ollama"));
+        assert!(start_mock(&state, Channel::new(|_| Ok(())), 1, None, Some(assistant), &[], &[], "local-mock", None).is_err());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| { if let tauri::ipc::InvokeResponseBody::Json(json) = body { tx.send(json).unwrap(); } Ok(()) });
+        let retry = retry_from_original(&state, channel, 1, assistant, &url).unwrap();
+        loop { if rx.recv_timeout(Duration::from_secs(5)).unwrap().contains("\"end\"") { break; } }
+        server.join().unwrap();
+        let mut db = state.db.lock().unwrap();
+        let (new_assistant, model, source, parent, answer): (i64, String, String, i64, String) = db.query_row("SELECT a.assistant_id,a.model_id,json_extract(a.context_json,'$.model_source'),m.parent_id,m.content FROM attempts a JOIN messages m ON m.id=a.assistant_id WHERE a.id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
+        let old_parent: i64 = db.query_row("SELECT parent_id FROM messages WHERE id=?1", [assistant], |row| row.get(0)).unwrap();
+        assert_eq!((model.as_str(), source.as_str(), parent, answer.as_str()), ("qwen3.5:9b-q4_K_M", "ollama", old_parent, "Hello world"));
+        select_branch_for_conversation(&mut db, 1, assistant).unwrap();
+        assert_eq!(db.query_row("SELECT active_leaf_id FROM conversations WHERE id=1", [], |row| row.get::<_, i64>(0)).unwrap(), assistant);
+        select_branch_for_conversation(&mut db, 1, new_assistant).unwrap();
+        drop(db);
+        drop(state);
+        let reopened = Connection::open(&path).unwrap();
+        init_db(&reopened).unwrap();
+        let (answer, source): (String, String) = reopened.query_row("SELECT m.content,json_extract(a.context_json, '$.model_source') FROM attempts a JOIN messages m ON m.id=a.assistant_id WHERE a.assistant_id=?1", [assistant], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((answer.as_str(), source.as_str()), ("Hello world", "ollama"));
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ollama_interruption_and_cancellation_keep_partial_answer() {
+        use std::io::Write;
+        for cancel in [false, true] {
+            let state = context_test_state();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                serve_ollama_tags(&listener, r#"{"models":[{"name":"same:latest"}]}"#);
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 8192];
+                let _ = socket.read(&mut request).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n").unwrap();
+                if cancel { std::thread::sleep(Duration::from_millis(500)); }
+            });
+            let preview = check_context_for_source(&state, 1, "hello", &[], &[], "same:latest", false, "ollama").unwrap();
+            let active = state.active.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
+                if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                    if cancel && json.contains("\"delta\"") { if let Some((_, flag)) = active.lock().unwrap().as_ref() { flag.store(true, Ordering::SeqCst); } }
+                    if json.contains("\"end\"") { tx.send(()).unwrap(); }
+                }
+                Ok(())
+            });
+            let id = start_ollama(&state, channel, 1, "hello", &[], &[], "same:latest", preview.confirmation_id.as_deref(), &url).unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            server.join().unwrap();
+            let db = state.db.lock().unwrap();
+            let (answer, status): (String, String) = db.query_row("SELECT m.content,a.status FROM attempts a JOIN messages m ON m.id=a.assistant_id WHERE a.id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(answer, "partial");
+            assert_eq!(status, if cancel { "stopped" } else { "interrupted" });
+        }
+    }
+
+    #[test]
+    fn ollama_rejects_cloud_model_without_post_and_reports_unavailable_server() {
+        for unavailable in [false, true] {
+            let state = context_test_state();
+            let (url, server) = if unavailable { ("http://127.0.0.1:0/v1/chat/completions".to_owned(), None) } else {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || serve_ollama_tags(&listener, r#"{"models":[{"name":"same:latest","remote_host":"https://example.org"}]}"#));
+                (url, Some(server))
+            };
+            let preview = check_context_for_source(&state, 1, "hello", &[], &[], "same:latest", false, "ollama").unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| { if let tauri::ipc::InvokeResponseBody::Json(json) = body { if json.contains("\"end\"") { tx.send(()).unwrap(); } } Ok(()) });
+            let id = start_ollama(&state, channel, 1, "hello", &[], &[], "same:latest", preview.confirmation_id.as_deref(), &url).unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Some(server) = server { server.join().unwrap(); }
+            let db = state.db.lock().unwrap();
+            let code: String = db.query_row("SELECT error_code FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+            assert_eq!(code, if unavailable { "OLLAMA_UNAVAILABLE" } else { "OLLAMA_MODEL_UNAVAILABLE" });
+        }
+    }
+
+    #[test]
+    fn ollama_retry_keeps_local_errors_when_server_or_model_is_missing() {
+        for unavailable in [false, true] {
+            let state = context_test_state();
+            let assistant = {
+                let mut db = state.db.lock().unwrap();
+                let id = create_attempt_for_source(&mut db, 1, "hello", &[], "same:latest", false, None, "ollama").unwrap();
+                finish(&db, id, "completed").unwrap();
+                db.query_row("SELECT assistant_id FROM attempts WHERE id=?1", [id], |row| row.get::<_, i64>(0)).unwrap()
+            };
+            let (url, server) = if unavailable { ("http://127.0.0.1:0/v1/chat/completions".to_owned(), None) } else {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || serve_ollama_tags(&listener, r#"{"models":[]}"#));
+                (url, Some(server))
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| { if let tauri::ipc::InvokeResponseBody::Json(json) = body { if json.contains("\"end\"") { tx.send(()).unwrap(); } } Ok(()) });
+            let retry = retry_from_original(&state, channel, 1, assistant, &url).unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Some(server) = server { server.join().unwrap(); }
+            let db = state.db.lock().unwrap();
+            let (code, source): (String, String) = db.query_row("SELECT error_code,json_extract(context_json,'$.model_source') FROM attempts WHERE id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(code, if unavailable { "OLLAMA_UNAVAILABLE" } else { "OLLAMA_MODEL_UNAVAILABLE" });
+            assert_eq!(source, "ollama");
+            assert_eq!(db.query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn ollama_can_cancel_before_response_headers() {
+        for error_body in [false, true] {
+        let state = context_test_state();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            serve_ollama_tags(&listener, r#"{"models":[{"name":"same:latest"}]}"#);
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            if error_body { socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\n\r\n").unwrap(); }
+            request_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let preview = check_context_for_source(&state, 1, "hello", &[], &[], "same:latest", false, "ollama").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| { if let tauri::ipc::InvokeResponseBody::Json(json) = body { if json.contains("\"end\"") { tx.send(()).unwrap(); } } Ok(()) });
+        let id = start_ollama(&state, channel, 1, "hello", &[], &[], "same:latest", preview.confirmation_id.as_deref(), &url).unwrap();
+        request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        state.active.lock().unwrap().as_ref().unwrap().1.store(true, Ordering::SeqCst);
+        rx.recv_timeout(Duration::from_millis(750)).unwrap();
+        let status: String = state.db.lock().unwrap().query_row("SELECT status FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        assert_eq!(status, "stopped");
+        server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn ollama_catalog_filters_cloud_models_and_handles_empty_and_unavailable() {
+        let body = r#"{"models":[{"name":"qwen3.5:9b-q4_K_M"},{"name":"same:latest"},{"name":"cloud:latest","remote_model":"x"},{"name":"remote:latest","remote_host":"https://example.org"},{"name":"model:cloud"}]}"#;
+        let (url, server) = ollama_response(body);
+        let names = tauri::async_runtime::block_on(fetch_ollama_catalog(&url)).unwrap();
+        server.join().unwrap();
+        assert_eq!(names, vec!["qwen3.5:9b-q4_K_M", "same:latest"]);
+        let (url, server) = ollama_response(r#"{"models":[]}"#);
+        assert!(tauri::async_runtime::block_on(fetch_ollama_catalog(&url)).unwrap().is_empty());
+        server.join().unwrap();
+        assert!(tauri::async_runtime::block_on(fetch_ollama_catalog("http://127.0.0.1:0/api/tags")).is_err());
+    }
+
     #[test]
     fn catalog_network_failure_keeps_cached_snapshot_and_user_category() {
         let connection = Connection::open_in_memory().unwrap();
@@ -4237,6 +4668,9 @@ mod tests {
         assert_eq!(parent, 4);
         let foreign_key_errors: i64 = db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0)).unwrap();
         assert_eq!(foreign_key_errors, 0);
+        let (retry, _) = create_retry_for_conversation(&mut db, 1, 4, "local-mock").unwrap();
+        let (model, source): (String, String) = db.query_row("SELECT model_id,json_extract(context_json,'$.model_source') FROM attempts WHERE id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((model.as_str(), source.as_str()), ("local-mock", "simpleclaw"));
     }
 
     #[test]
@@ -4298,6 +4732,22 @@ mod tests {
         assert_eq!(branch_parent, 2);
         let old_answer: String = db.query_row("SELECT content FROM messages WHERE id=3", [], |row| row.get(0)).unwrap();
         assert_eq!(old_answer, "new answer");
+    }
+
+    #[test]
+    fn retry_of_simpleclaw_attempt_keeps_its_model_without_network() {
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let catalog = ModelCatalog { fetched_at: 1, models: vec![CatalogModel { id: "same:latest".into(), name: "same".into(), input_rubles_per_million: Some(5.0), output_rubles_per_million: None, protocols: vec![], request_rubles: None, audio_rubles_per_minute: None }] };
+        save_catalog_if_latest(&db, &AtomicU64::new(1), 1, &catalog).unwrap();
+        let first = create_attempt_for_source(&mut db, 1, "question", &[], "same:latest", false, None, "simpleclaw").unwrap();
+        finish(&db, first, "completed").unwrap();
+        let assistant: i64 = db.query_row("SELECT assistant_id FROM attempts WHERE id=?1", [first], |row| row.get(0)).unwrap();
+        assert!(create_retry_for_source(&mut db, 1, assistant, "same:latest", "ollama").is_err());
+        assert!(create_retry_for_source(&mut db, 1, assistant, "other", "simpleclaw").is_err());
+        let (retry, _) = create_retry_for_conversation(&mut db, 1, assistant, "same:latest").unwrap();
+        let (model, source): (String, String) = db.query_row("SELECT model_id,json_extract(context_json,'$.model_source') FROM attempts WHERE id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((model.as_str(), source.as_str()), ("same:latest", "simpleclaw"));
     }
 
     #[test]

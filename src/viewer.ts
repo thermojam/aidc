@@ -36,6 +36,7 @@ Promise.allSettled([
         onEvent: new Channel()
     }),
     invoke("retry_mock_generation", {conversationId: 1, assistantId: 2, modelId: "local-mock", onEvent: new Channel()}),
+    invoke("start_ollama_generation", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "synthetic-model", confirmationId: "viewer-must-fail", onEvent: new Channel()}),
     invoke("start_generation", {conversationId: 1, prompt: "viewer must fail", attachmentIds: [], projectMaterialIds: [], modelId: "synthetic-model", agentMode: false, confirmationId: "viewer-must-fail", onEvent: new Channel()}),
     invoke("retry_generation", {conversationId: 1, assistantId: 2, modelId: "synthetic-model", onEvent: new Channel()}),
     invoke("select_branch", {conversationId: 1, messageId: 2}),
@@ -53,6 +54,7 @@ Promise.allSettled([
     invoke("add_captured_snapshot", {dataUrl: "invalid"}),
     invoke("remove_text_attachment", {id: 1}),
     invoke("list_models"),
+    invoke("list_ollama_models"),
     invoke("list_model_categories"),
     invoke("set_model_category", {modelId: "synthetic-model", category: "speed"}),
     invoke("refresh_models"),

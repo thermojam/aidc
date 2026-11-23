@@ -15,6 +15,7 @@ import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project, type ProjectGroup} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
 import ModelPicker from "./ModelPicker";
+import {generationCommand, retryTarget} from "./modelSource";
 import {useNavigationLayout} from "./useNavigationLayout";
 import "./style.css";
 
@@ -28,6 +29,7 @@ type AgentSkill = { material_id: number; name: string; version: number; size: nu
 type ContextPreview = {
     confirmation_id: string;
     model_id: string;
+    model_source: "simpleclaw" | "ollama";
     response_style: "concise" | "balanced" | "detailed";
     catalog_fetched_at: number | null;
     input_rubles_per_million: number | null;
@@ -167,6 +169,12 @@ function App() {
     const [categories, setCategories] = useState<ModelCategory[]>([]);
 
     const [modelId, setModelId] = useState("local-mock");
+    const [modelSource, setModelSource] = useState<"simpleclaw" | "ollama">("simpleclaw");
+    const currentModelSource = useRef(modelSource);
+    currentModelSource.current = modelSource;
+    const [ollamaModels, setOllamaModels] = useState<string[]>([]);
+    const [ollamaStatus, setOllamaStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+    const ollamaRequest = useRef(0);
     const [agentMode, setAgentMode] = useState(false);
     const [agentSkill, setAgentSkill] = useState<AgentSkill | null>(null);
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
@@ -436,9 +444,10 @@ function App() {
         try {
             if (task.conversation_id !== conversationId && !await switchConversation(task.conversation_id, true)) return;
             const prepared = await invoke<PreparedScheduledAgentTask>("prepare_scheduled_agent_task", {taskId: task.id});
-            if (task.conversation_id !== activeConversation.current || modelId !== currentModel.current) return;
+            if (task.conversation_id !== activeConversation.current || modelId !== currentModel.current || modelSource !== currentModelSource.current) return;
             setPrompt(prepared.prompt);
             setScheduledDraft(prepared);
+            setModelSource("simpleclaw");
             setModelId("gpt-oss-20b");
             setAgentMode(true);
             setContextPreview(null);
@@ -706,13 +715,22 @@ function App() {
         } finally { setTranscribing(false); }
     }
 
+    async function refreshOllamaCatalog() {
+        const request = ++ollamaRequest.current;
+        setOllamaStatus("loading");
+        try {
+            const models = await invoke<string[]>("list_ollama_models");
+            if (request === ollamaRequest.current) { setOllamaModels(models); setOllamaStatus("ready"); }
+        } catch { if (request === ollamaRequest.current) { setOllamaModels([]); setOllamaStatus("error"); } }
+    }
+
     async function refreshModelCatalog() {
         const request = ++catalogRequest.current;
         try {
             const result = await invoke<ModelCatalog>("refresh_models");
             if (request !== catalogRequest.current) return;
             setCatalog(result);
-            setContextPreview(null);
+            if (currentModelSource.current === "simpleclaw") setContextPreview(null);
             clear("catalog");
         } catch (reason) { if (request === catalogRequest.current) report("catalog", reason); }
     }
@@ -1164,6 +1182,7 @@ function App() {
             await reload(nextId);
             setCatalog(await invoke<ModelCatalog | null>("list_models"));
             setCategories(await invoke<ModelCategory[]>("list_model_categories"));
+            setModelSource("simpleclaw");
             setModelId("local-mock");
             setPendingAttachments([]);
             setSelectedArtifactId(null);
@@ -1192,8 +1211,8 @@ function App() {
         } catch (reason) { report("deleteKey", reason); }
     }
 
-    async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string): Promise<boolean> {
-        if (busy) return false;
+    async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string, retrySource?: "simpleclaw" | "ollama"): Promise<boolean> {
+        if (busy || (retrySource === undefined && (currentModelSource.current === "ollama") !== (command === "start_ollama_generation"))) return false;
         const request = ++generationRequest.current;
         setBusy(true);
         clear("runGeneration");
@@ -1227,7 +1246,7 @@ function App() {
                 setDraft((current) => current + tail);
                 setBusy(false);
                 if (message.data.status === "failed" || message.data.status === "interrupted") {
-                    notify("Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
+                    notify(command === "start_ollama_generation" || retrySource === "ollama" ? "Ответ Ollama не завершён. Полученный текст сохранён; проверьте сервер и модель." : "Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
                 }
                 void reload().then(() => {
                     if (request === generationRequest.current && conversationId === activeConversation.current) setDraft("");
@@ -1252,7 +1271,7 @@ function App() {
     }
 
     function contextSignature() {
-        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
+        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelSource, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
     }
 
     async function submitPrompt() {
@@ -1262,7 +1281,7 @@ function App() {
             await checkContext();
             return;
         }
-        if ((modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported)) return;
+        if ((modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported)) return;
         await send();
     }
 
@@ -1292,10 +1311,11 @@ function App() {
             report("send", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
             return;
         }
+        if (currentModelSource.current !== modelSource || currentModel.current !== modelId || signature !== liveContextSignature.current) return;
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
         const inputSource = boardInputSource?.text === value ? boardInputSource : null;
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {confirmationId: contextPreview.confirmation_id, prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
+        if (await runGeneration(generationCommand(modelSource, modelId, false)!, {confirmationId: contextPreview.confirmation_id, prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
             setScheduledDraft(null);
             clear("send");
             if (inputSource) {
@@ -1417,8 +1437,11 @@ function App() {
     }
 
     async function retry(assistantId: number) {
-        if (modelId !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
-        await runGeneration(modelId === "local-mock" ? "retry_mock_generation" : "retry_generation", {assistantId, modelId});
+        const attempt = history.attempts.find((item) => item.assistant_id === assistantId);
+        if (!attempt) return;
+        const target = retryTarget(attempt, history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source);
+        if (target.source === "simpleclaw" && target.model !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
+        await runGeneration(target.command, {assistantId, modelId: target.model}, undefined, target.source);
     }
 
     async function selectBranch(messageId: number) {
@@ -1461,7 +1484,7 @@ function App() {
         try {
             const ids = pendingAttachments.map((attachment) => attachment.id);
             const materialIds = selectedMaterialIds;
-            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId, agentMode});
+            const preview = await invoke<ContextPreview>("preview_context", {conversationId, prompt, attachmentIds: ids, projectMaterialIds: materialIds, modelId, agentMode, modelSource});
             if (request !== contextRequest.current || signature !== liveContextSignature.current) return;
             setContextPreview(preview);
             setPreviewSignature(signature);
@@ -1611,7 +1634,7 @@ function App() {
     const selectedTranscriptionModel = transcriptionModels.find((model) => model.id === transcriptionModelId) ?? transcriptionModels[0];
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
     const hasImage = pendingAttachments.some((attachment) => attachment.mime.startsWith("image/"));
-    const imageModelSupported = modelId === "gpt-6-luna";
+    const imageModelSupported = modelSource === "simpleclaw" && modelId === "gpt-6-luna";
     const selectedCategory = categories.find((item) => item.model_id === modelId);
     function follows(message: Message, ancestorId: number): boolean {
         for (let parentId = message.parent_id; parentId !== null;) {
@@ -1782,13 +1805,16 @@ function App() {
                                 <small>{statusLabel[message.status] ?? message.status}</small>}
                             {message.role === "assistant" && <small>
                                 Модель: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id ?? "локальный тест"}
+                                {history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source === "ollama" ? " · Локально · Ollama" : ""}
                                 {message.status === "completed" ? " · Завершено" : ` · ${statusLabel[message.status] ?? message.status}`}
-                                {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id !== "local-mock" &&
+                                {history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source !== "ollama" && history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id !== "local-mock" &&
                                     history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id &&
                                     (history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage ? " · Сумма не подтверждена" : " · Usage и сумма неизвестны")}
                             </small>}
                             {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed") && (() => {
                                 const attempt = history.attempts.find((item) => item.assistant_id === message.id);
+                                const local = history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source === "ollama";
+                                if (local) return <p role="alert">{attempt?.error_code === "OLLAMA_UNAVAILABLE" ? "Ollama недоступна. Запустите Ollama и проверьте модель. Частичный текст сохранён." : message.status === "interrupted" ? "Ответ Ollama прерван. Частичный текст сохранён." : "Ошибка Ollama. Проверьте, что сервер запущен и модель установлена. Частичный текст сохранён."}</p>;
                                 return <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
                                     code={attempt?.error_code ?? null} httpStatus={attempt?.http_status ?? null} requestId={attempt?.server_request_id ?? null}
                                     onConnection={() => setSettingsOpen(true)}/>;
@@ -2078,7 +2104,7 @@ function App() {
                             <label htmlFor="request-mode">Режим следующего запроса</label>
                             <select id="request-mode" value={agentMode ? "agent" : "chat"} disabled={busy} onChange={(event) => { setAgentMode(event.target.value === "agent"); setContextPreview(null); }}>
                                 <option value="chat">Чат</option>
-                                <option value="agent" disabled={modelId !== "gpt-oss-20b"}>Агент · только gpt-oss-20b</option>
+                                <option value="agent" disabled={modelSource === "ollama" || modelId !== "gpt-oss-20b"}>Агент · только gpt-oss-20b</option>
                             </select>
                             <small>Агент: калькулятор и поиск при явно подключённой папке; команды недоступны. До двух платных запросов с подтверждением.</small>
                     {selectedMaterialIds.map((id) => { const item = projectMaterials.find((material) => material.id === id); return <div key={id}>
@@ -2088,7 +2114,7 @@ function App() {
                     {selectedMaterialIds.length > 0 && <button type="button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>}
                     </section>}
                     {contextPreview && <details open className="context-preview">
-                        <summary>Состав запроса · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
+                        <summary>Состав запроса · {contextPreview.model_source === "ollama" ? "Локально · Ollama" : "SimpleClaw / тест"} · {contextPreview.model_id} · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
                             обменов: {contextPreview.omitted_exchanges}</summary>
                         <p>{contextPreview.warning}</p>
                         {contextPreview.agent_skill && <p>В этом снимке включён навык «{contextPreview.agent_skill.name}», версия {contextPreview.agent_skill.version}, SHA-256 {contextPreview.agent_skill.sha256}. Текст инструкции показан ниже в составе сообщений.</p>}
@@ -2098,15 +2124,16 @@ function App() {
                     <div className="composer-footer">
                         <div className="composer-tools">
                             <button ref={composerMenuButton} type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-haspopup="menu" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
-                            <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} disabled={busy}
+                            <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} source={modelSource} ollamaModels={ollamaModels} ollamaStatus={ollamaStatus} onRefreshOllama={() => void refreshOllamaCatalog()} disabled={busy}
                                          fetchedAt={catalog?.fetched_at ?? null} catalogFailed={errors.some((error) => error.area === "catalog")}
-                                         onChange={(id) => { setModelId(id); if (id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
+                                         onChange={(id, source) => { setModelSource(source); setModelId(id); if (source === "ollama" || id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
                             {agentMode && <span className="agent-mode-chip">Агент · калькулятор{conversationProjectId !== null ? " и поиск при подключённой папке" : ""}</span>}
-                            {operationErrors("catalog")}
+                            {modelSource === "simpleclaw" && operationErrors("catalog")}
                             <details className="model-details">
                                 <summary>О модели</summary>
-                                <p>{catalog ? `Каталог: ${new Date(catalog.fetched_at * 1000).toLocaleString()}` : "Каталог ещё не загружен"}</p>
-                                {modelId !== "local-mock" && <>
+                                {modelSource === "simpleclaw" && <p>{catalog ? `Каталог: ${new Date(catalog.fetched_at * 1000).toLocaleString()}` : "Каталог ещё не загружен"}</p>}
+                                {modelSource === "ollama" && <p>Источник: Локально · Ollama. Сообщения обрабатываются на этом компьютере.</p>}
+                                {modelSource === "simpleclaw" && modelId !== "local-mock" && <>
                                     <p>Цена: {selectedModel?.input_rubles_per_million ?? "неизвестна"} ₽/млн входных; {selectedModel?.output_rubles_per_million ?? "неизвестна"} ₽/млн выходных. Источник и дата каталога: <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">Provider API, GET /v1/models</a>, {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестны"}.</p>
                                     <p>Окно контекста и токенизатор: неизвестны — каталог их не сообщает. Возможность работы с текстом отдельно для этой модели не подтверждена.</p>
                                     <p>Изображения: пример с gpt-6-luna опубликован в <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">документации Provider API</a>, проверено 9 ноября 2026. Для остальных моделей поддержка неизвестна.</p>
@@ -2124,15 +2151,15 @@ function App() {
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || dropLoading || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
+                                    disabled={busy || dropLoading || !prompt.trim() || (modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
                             </button>}
                         </div>
                     </div>
                     {operationErrors("send")}
                     {!settingsOpen && operationErrors("connection")}
-                    <p className="send-warning">{modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
-                    {hasImage && !imageModelSupported && <p role="alert">Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение.</p>}
-                    {modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
+                    <p className="send-warning">{modelSource === "ollama" ? "Локально · Ollama. Текст отправится на этот компьютер; изображения и агентный режим не поддерживаются." : modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
+                    {hasImage && !imageModelSupported && <p role="alert">{modelSource === "ollama" ? "Изображения в Ollama пока не поддерживаются. Удалите изображение из запроса." : "Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение."}</p>}
+                    {modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
 
                 </form>
                 </div>
