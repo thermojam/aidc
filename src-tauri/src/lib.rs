@@ -2391,6 +2391,10 @@ fn create_retry_for_model(db: &mut Connection, assistant_id: i64, model_id: &str
 }
 
 fn create_retry_for_conversation(db: &mut Connection, conversation_id: i64, assistant_id: i64, model_id: &str) -> rusqlite::Result<(i64, String)> {
+    create_retry_for_source(db, conversation_id, assistant_id, model_id, "simpleclaw")
+}
+
+fn create_retry_for_source(db: &mut Connection, conversation_id: i64, assistant_id: i64, model_id: &str, source: &str) -> rusqlite::Result<(i64, String)> {
     let tx = db.transaction()?;
     let (user_id, prompt): (i64, String) = tx.query_row(
         "SELECT u.id, u.content FROM messages a
@@ -2398,10 +2402,11 @@ fn create_retry_for_conversation(db: &mut Connection, conversation_id: i64, assi
          JOIN messages u ON u.id=a.parent_id AND u.id=old.user_message_id
          JOIN conversations c ON c.id=a.conversation_id
          WHERE a.id=?1 AND a.conversation_id=?2 AND u.conversation_id=?2 AND c.archived=0
-           AND u.role='user' AND old.status!='streaming' AND coalesce(json_extract(old.context_json, '$.model_source'), 'simpleclaw') != 'ollama'",
-        params![assistant_id, conversation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+           AND u.role='user' AND old.status!='streaming' AND coalesce(json_extract(old.context_json, '$.model_source'), 'simpleclaw')=?3
+           AND coalesce(old.model_id, 'local-mock')=?4",
+        params![assistant_id, conversation_id, source, model_id], |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let context = context_for(&tx, conversation_id, Some(user_id), None, model_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let context = context_for_source(&tx, conversation_id, Some(user_id), None, model_id, source).map_err(|_| rusqlite::Error::InvalidQuery)?;
     tx.execute(
         "INSERT INTO messages(role, content, status, conversation_id, parent_id) VALUES('assistant', '', 'streaming', ?1, ?2)",
         params![conversation_id, user_id],
@@ -2420,6 +2425,7 @@ fn create_retry_for_conversation(db: &mut Connection, conversation_id: i64, assi
     Ok((attempt_id, prompt))
 }
 
+#[cfg(test)]
 fn context_for(db: &Connection, conversation_id: i64, leaf_id: Option<i64>, tail: Option<(&str, &[&PendingAttachment])>, model_id: &str) -> Result<ContextPreview, String> {
     context_for_source(db, conversation_id, leaf_id, tail, model_id, "simpleclaw")
 }
@@ -2776,6 +2782,7 @@ fn start_mock_generation(conversation_id: i64, prompt: String, attachment_ids: V
 
 #[tauri::command]
 fn retry_mock_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
+    if model_id != "local-mock" { return Err("Для тестового повтора нужна тестовая модель".into()); }
     start_mock(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, None)
 }
 
@@ -3092,7 +3099,39 @@ fn start_generation(conversation_id: i64, prompt: String, attachment_ids: Vec<i6
 
 #[tauri::command]
 fn retry_generation(conversation_id: i64, assistant_id: i64, model_id: String, on_event: Channel<StreamEvent>, state: State<'_, AppState>) -> Result<i64, String> {
-    start_remote(&state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model_id, false, None, None)
+    let _ = model_id;
+    retry_from_original(&state, on_event, conversation_id, assistant_id, "http://127.0.0.1:11434/v1/chat/completions")
+}
+
+fn retry_from_original(state: &AppState, on_event: Channel<StreamEvent>, conversation_id: i64, assistant_id: i64, ollama_url: &str) -> Result<i64, String> {
+    let (source, model): (String, String) = state.db.lock().map_err(|_| "База занята")?.query_row(
+        "SELECT coalesce(json_extract(context_json, '$.model_source'), 'simpleclaw'), coalesce(model_id, 'local-mock') FROM attempts WHERE assistant_id=?1 AND conversation_id=?2",
+        params![assistant_id, conversation_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| "Ответ для повтора не найден")?;
+    if source == "simpleclaw" {
+        return if model == "local-mock" {
+            start_mock(state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model, None)
+        } else {
+            start_remote(state, on_event, conversation_id, None, Some(assistant_id), &[], &[], &model, false, None, None)
+        };
+    }
+    if source != "ollama" || !cfg!(target_os = "macos") { return Err("Источник повтора недоступен".into()); }
+    let mut active = state.active.lock().map_err(|_| "Запрос занят")?;
+    if active.is_some() { return Err("Дождитесь завершения текущего ответа".into()); }
+    let attempt_id = {
+        let mut db = state.db.lock().map_err(|_| "База занята")?;
+        create_retry_for_source(&mut db, conversation_id, assistant_id, &model, "ollama")
+            .map_err(|_| "Не удалось собрать контекст локального повтора")?.0
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    *active = Some((attempt_id, cancel.clone()));
+    let url = ollama_url.to_owned();
+    let db = state.db.clone();
+    let active = state.active.clone();
+    tauri::async_runtime::spawn(async move {
+        run_http_stream(db, active, cancel, attempt_id, model, String::new(), &url, false, None, on_event).await;
+    });
+    Ok(attempt_id)
 }
 
 fn start_remote(state: &AppState, on_event: Channel<StreamEvent>, conversation_id: i64, prompt: Option<&str>, retry_id: Option<i64>, attachment_ids: &[i64], project_material_ids: &[i64], model_id: &str, agent_mode: bool, scheduled_run_id: Option<i64>, confirmation_id: Option<&str>) -> Result<i64, String> {
@@ -3905,10 +3944,12 @@ mod tests {
         init_db(&connection).unwrap();
         let mut state = context_test_state();
         state.db = Arc::new(Mutex::new(connection));
+        let catalog = ModelCatalog { fetched_at: 1, models: vec![CatalogModel { id: "qwen3.5:9b-q4_K_M".into(), name: "cloud model with same name".into(), input_rubles_per_million: Some(5.0), output_rubles_per_million: None, protocols: vec![], request_rubles: None, audio_rubles_per_minute: None }] };
+        save_catalog_if_latest(&state.db.lock().unwrap(), &AtomicU64::new(1), 1, &catalog).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            for turn in 0..2 {
+            for turn in 0..3 {
                 serve_ollama_tags(&listener, r#"{"models":[{"name":"qwen3.5:9b-q4_K_M"}]}"#);
                 let (mut socket, _) = listener.accept().unwrap();
                 socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -3939,6 +3980,11 @@ mod tests {
                     assert!(messages.iter().any(|m| m["role"] == "user" && m["content"] == "first"));
                     assert!(messages.iter().any(|m| m["role"] == "assistant" && m["content"] == "Hello world"));
                 }
+                if turn == 2 {
+                    let messages = payload["messages"].as_array().unwrap();
+                    assert!(messages.iter().any(|m| m["role"] == "user" && m["content"] == "first"));
+                    assert!(!messages.iter().any(|m| m["role"] == "assistant"));
+                }
                 let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
@@ -3955,12 +4001,24 @@ mod tests {
             assert_eq!((answer.as_str(), status.as_str()), ("Hello world", "completed"));
             assert_eq!(serde_json::from_str::<ContextPreview>(&context).unwrap().model_source, "ollama");
         }
-        server.join().unwrap();
         let db = state.db.lock().unwrap();
         let assistant: i64 = db.query_row("SELECT assistant_id FROM attempts ORDER BY id LIMIT 1", [], |row| row.get(0)).unwrap();
         drop(db);
         assert!(start_remote(&state, Channel::new(|_| Ok(())), 1, None, Some(assistant), &[], &[], "same:latest", false, None, None).unwrap_err().contains("Ollama"));
         assert!(start_mock(&state, Channel::new(|_| Ok(())), 1, None, Some(assistant), &[], &[], "local-mock", None).is_err());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| { if let tauri::ipc::InvokeResponseBody::Json(json) = body { tx.send(json).unwrap(); } Ok(()) });
+        let retry = retry_from_original(&state, channel, 1, assistant, &url).unwrap();
+        loop { if rx.recv_timeout(Duration::from_secs(5)).unwrap().contains("\"end\"") { break; } }
+        server.join().unwrap();
+        let mut db = state.db.lock().unwrap();
+        let (new_assistant, model, source, parent, answer): (i64, String, String, i64, String) = db.query_row("SELECT a.assistant_id,a.model_id,json_extract(a.context_json,'$.model_source'),m.parent_id,m.content FROM attempts a JOIN messages m ON m.id=a.assistant_id WHERE a.id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
+        let old_parent: i64 = db.query_row("SELECT parent_id FROM messages WHERE id=?1", [assistant], |row| row.get(0)).unwrap();
+        assert_eq!((model.as_str(), source.as_str(), parent, answer.as_str()), ("qwen3.5:9b-q4_K_M", "ollama", old_parent, "Hello world"));
+        select_branch_for_conversation(&mut db, 1, assistant).unwrap();
+        assert_eq!(db.query_row("SELECT active_leaf_id FROM conversations WHERE id=1", [], |row| row.get::<_, i64>(0)).unwrap(), assistant);
+        select_branch_for_conversation(&mut db, 1, new_assistant).unwrap();
+        drop(db);
         drop(state);
         let reopened = Connection::open(&path).unwrap();
         init_db(&reopened).unwrap();
@@ -4024,6 +4082,35 @@ mod tests {
             let db = state.db.lock().unwrap();
             let code: String = db.query_row("SELECT error_code FROM attempts WHERE id=?1", [id], |row| row.get(0)).unwrap();
             assert_eq!(code, if unavailable { "OLLAMA_UNAVAILABLE" } else { "OLLAMA_MODEL_UNAVAILABLE" });
+        }
+    }
+
+    #[test]
+    fn ollama_retry_keeps_local_errors_when_server_or_model_is_missing() {
+        for unavailable in [false, true] {
+            let state = context_test_state();
+            let assistant = {
+                let mut db = state.db.lock().unwrap();
+                let id = create_attempt_for_source(&mut db, 1, "hello", &[], "same:latest", false, None, "ollama").unwrap();
+                finish(&db, id, "completed").unwrap();
+                db.query_row("SELECT assistant_id FROM attempts WHERE id=?1", [id], |row| row.get::<_, i64>(0)).unwrap()
+            };
+            let (url, server) = if unavailable { ("http://127.0.0.1:0/v1/chat/completions".to_owned(), None) } else {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || serve_ollama_tags(&listener, r#"{"models":[]}"#));
+                (url, Some(server))
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| { if let tauri::ipc::InvokeResponseBody::Json(json) = body { if json.contains("\"end\"") { tx.send(()).unwrap(); } } Ok(()) });
+            let retry = retry_from_original(&state, channel, 1, assistant, &url).unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Some(server) = server { server.join().unwrap(); }
+            let db = state.db.lock().unwrap();
+            let (code, source): (String, String) = db.query_row("SELECT error_code,json_extract(context_json,'$.model_source') FROM attempts WHERE id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+            assert_eq!(code, if unavailable { "OLLAMA_UNAVAILABLE" } else { "OLLAMA_MODEL_UNAVAILABLE" });
+            assert_eq!(source, "ollama");
+            assert_eq!(db.query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
         }
     }
 
@@ -4581,6 +4668,9 @@ mod tests {
         assert_eq!(parent, 4);
         let foreign_key_errors: i64 = db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0)).unwrap();
         assert_eq!(foreign_key_errors, 0);
+        let (retry, _) = create_retry_for_conversation(&mut db, 1, 4, "local-mock").unwrap();
+        let (model, source): (String, String) = db.query_row("SELECT model_id,json_extract(context_json,'$.model_source') FROM attempts WHERE id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((model.as_str(), source.as_str()), ("local-mock", "simpleclaw"));
     }
 
     #[test]

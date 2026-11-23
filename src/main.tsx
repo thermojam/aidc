@@ -1211,8 +1211,8 @@ function App() {
         } catch (reason) { report("deleteKey", reason); }
     }
 
-    async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string): Promise<boolean> {
-        if (busy || (currentModelSource.current === "ollama") !== (command === "start_ollama_generation")) return false;
+    async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string, retrySource?: "simpleclaw" | "ollama"): Promise<boolean> {
+        if (busy || (retrySource === undefined && (currentModelSource.current === "ollama") !== (command === "start_ollama_generation"))) return false;
         const request = ++generationRequest.current;
         setBusy(true);
         clear("runGeneration");
@@ -1246,7 +1246,7 @@ function App() {
                 setDraft((current) => current + tail);
                 setBusy(false);
                 if (message.data.status === "failed" || message.data.status === "interrupted") {
-                    notify(command === "start_ollama_generation" ? "Ответ Ollama не завершён. Полученный текст сохранён; проверьте сервер и модель." : "Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
+                    notify(command === "start_ollama_generation" || retrySource === "ollama" ? "Ответ Ollama не завершён. Полученный текст сохранён; проверьте сервер и модель." : "Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
                 }
                 void reload().then(() => {
                     if (request === generationRequest.current && conversationId === activeConversation.current) setDraft("");
@@ -1437,9 +1437,12 @@ function App() {
     }
 
     async function retry(assistantId: number) {
-        if (modelSource === "ollama" || history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source === "ollama") return;
-        if (modelId !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
-        await runGeneration(generationCommand(modelSource, modelId, true)!, {assistantId, modelId});
+        const attempt = history.attempts.find((item) => item.assistant_id === assistantId);
+        if (!attempt) return;
+        const source = history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source ?? "simpleclaw";
+        const originalModel = attempt.model_id ?? "local-mock";
+        if (source === "simpleclaw" && originalModel !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
+        await runGeneration(generationCommand(source, originalModel, true)!, {assistantId, modelId: originalModel}, undefined, source);
     }
 
     async function selectBranch(messageId: number) {
@@ -1864,7 +1867,7 @@ function App() {
                                             Ответ {index + 1}{candidate.id === message.id ? " · выбран" : ""}
                                         </button>
                                     ))}
-                                    <button type="button" className="secondary-button" disabled={busy || modelSource === "ollama" || history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source === "ollama"}
+                                    <button type="button" className="secondary-button" disabled={busy}
                                             onClick={() => void retry(message.id)}>Повторить · новый ответ
                                     </button>
                                 </div>
