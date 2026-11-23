@@ -53,6 +53,7 @@ Promise.allSettled([
     invoke("add_captured_snapshot", {dataUrl: "invalid"}),
     invoke("remove_text_attachment", {id: 1}),
     invoke("list_models"),
+    invoke("list_ollama_models"),
     invoke("list_model_categories"),
     invoke("set_model_category", {modelId: "synthetic-model", category: "speed"}),
     invoke("refresh_models"),

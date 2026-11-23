@@ -45,6 +45,7 @@ fn main() {
                 "add_captured_snapshot",
                 "remove_text_attachment",
                 "list_models",
+                "list_ollama_models",
                 "list_model_categories",
                 "set_model_category",
                 "refresh_models",

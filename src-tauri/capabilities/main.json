@@ -51,6 +51,7 @@
     "allow-add-captured-snapshot",
     "allow-remove-text-attachment",
     "allow-list-models",
+    "allow-list-ollama-models",
     "allow-list-model-categories",
     "allow-set-model-category",
     "allow-refresh-models",

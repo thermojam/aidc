@@ -1173,6 +1173,37 @@ fn list_models(state: State<'_, AppState>) -> Result<Option<ModelCatalog>, Strin
 }
 
 #[tauri::command]
+async fn list_ollama_models() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "macos")]
+    { fetch_ollama_catalog("http://127.0.0.1:11434/api/tags").await }
+    #[cfg(not(target_os = "macos"))]
+    { Err("Ollama пока доступна только на macOS".into()) }
+}
+
+async fn fetch_ollama_catalog(url: &str) -> Result<Vec<String>, String> {
+    let error = "Ollama недоступна. Запустите Ollama и повторите попытку.";
+    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8)).build().map_err(|_| error)?;
+    let mut response = client.get(url).send().await.map_err(|_| error)?;
+    if !response.status().is_success() || response.content_length().is_some_and(|size| size > 2 * 1024 * 1024) { return Err(error.into()); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| error)? {
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 { return Err(error.into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| error)?;
+    let models = body.get("models").and_then(|value| value.as_array()).ok_or(error)?;
+    let mut names = Vec::new();
+    for model in models {
+        let Some(name) = model.get("name").and_then(|value| value.as_str()) else { continue; };
+        let remote = ["remote_model", "remote_host"].iter().any(|field| model.get(*field).is_some_and(|value| !value.is_null() && value.as_str() != Some("")));
+        let cloud = name.rsplit_once(':').is_some_and(|(_, tag)| tag.eq_ignore_ascii_case("cloud") || tag.to_ascii_lowercase().ends_with("-cloud"));
+        if !remote && !cloud && !name.is_empty() && name.len() <= 200 && !names.iter().any(|item| item == name) { names.push(name.to_owned()); }
+    }
+    Ok(names)
+}
+
+#[tauri::command]
 fn list_model_categories(state: State<'_, AppState>) -> Result<Vec<ModelCategory>, String> {
     let db = state.db.lock().map_err(|_| "База занята")?;
     let mut query = db.prepare("SELECT model_id, category, source, updated_at FROM model_categories ORDER BY model_id")
@@ -3055,7 +3086,7 @@ pub fn run() {
                 };
             }
         })
-        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, list_project_groups, create_project_group, rename_project_group, delete_project_group, move_project_to_group, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, accept_dropped_files, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
+        .invoke_handler(tauri::generate_handler![list_history, list_conversations, search_conversations, set_conversation_pinned, list_projects, list_project_groups, create_project_group, rename_project_group, delete_project_group, move_project_to_group, create_project, rename_project, archive_project, move_conversation, list_project_materials, preview_project_material, save_project_material, choose_project_folder, list_project_folder, preview_project_file, save_project_folder_material, create_conversation, rename_conversation, archive_conversation, start_mock_generation, retry_mock_generation, start_generation, retry_generation, select_branch, stop_generation, save_key, delete_key, key_status, create_backup, list_backups, restore_backup, pick_text_attachment, pick_image_attachment, accept_dropped_files, capture_window_snapshot, add_captured_snapshot, remove_text_attachment, list_models, list_ollama_models, list_model_categories, set_model_category, refresh_models, preview_context, get_response_style, set_response_style, start_synthetic_task, list_synthetic_tasks, approve_synthetic_step, deny_synthetic_step, list_scheduled_agent_tasks, create_scheduled_agent_task, stop_scheduled_agent_task, prepare_scheduled_agent_task, list_scheduled_agent_runs, mark_scheduled_agent_run_notified, get_scheduled_agent_result, get_agent_board, add_agent_plan_step, complete_agent_plan_step, add_agent_queue_item, add_agent_steering_note, mark_agent_input_submitted, get_agent_skill, set_agent_skill, generate_image, save_generated_image, transcribe_audio, create_artifact, export_artifact])
         .run(tauri::generate_context!())
         .expect("Tauri app failed");
 }
@@ -3724,6 +3755,34 @@ mod tests {
             "server_response_id": result.3, "server_request_id": result.4,
             "usage": result.5.as_ref().and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok()),
             "seq": result.6, "answer_bytes": result.7}));
+    }
+
+    fn ollama_response(body: &str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api/tags", listener.local_addr().unwrap());
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let size = socket.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /api/tags "));
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn ollama_catalog_filters_cloud_models_and_handles_empty_and_unavailable() {
+        let body = r#"{"models":[{"name":"qwen3.5:9b-q4_K_M"},{"name":"same:latest"},{"name":"cloud:latest","remote_model":"x"},{"name":"remote:latest","remote_host":"https://example.org"},{"name":"model:cloud"}]}"#;
+        let (url, server) = ollama_response(body);
+        let names = tauri::async_runtime::block_on(fetch_ollama_catalog(&url)).unwrap();
+        server.join().unwrap();
+        assert_eq!(names, vec!["qwen3.5:9b-q4_K_M", "same:latest"]);
+        let (url, server) = ollama_response(r#"{"models":[]}"#);
+        assert!(tauri::async_runtime::block_on(fetch_ollama_catalog(&url)).unwrap().is_empty());
+        server.join().unwrap();
+        assert!(tauri::async_runtime::block_on(fetch_ollama_catalog("http://127.0.0.1:0/api/tags")).is_err());
     }
 
     #[test]

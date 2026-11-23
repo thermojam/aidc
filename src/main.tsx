@@ -15,6 +15,7 @@ import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project, type ProjectGroup} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
 import ModelPicker from "./ModelPicker";
+import {generationCommand} from "./modelSource";
 import {useNavigationLayout} from "./useNavigationLayout";
 import "./style.css";
 
@@ -167,6 +168,12 @@ function App() {
     const [categories, setCategories] = useState<ModelCategory[]>([]);
 
     const [modelId, setModelId] = useState("local-mock");
+    const [modelSource, setModelSource] = useState<"simpleclaw" | "ollama">("simpleclaw");
+    const currentModelSource = useRef(modelSource);
+    currentModelSource.current = modelSource;
+    const [ollamaModels, setOllamaModels] = useState<string[]>([]);
+    const [ollamaStatus, setOllamaStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+    const ollamaRequest = useRef(0);
     const [agentMode, setAgentMode] = useState(false);
     const [agentSkill, setAgentSkill] = useState<AgentSkill | null>(null);
     const [responseStyle, setResponseStyle] = useState<ContextPreview["response_style"]>("balanced");
@@ -436,9 +443,10 @@ function App() {
         try {
             if (task.conversation_id !== conversationId && !await switchConversation(task.conversation_id, true)) return;
             const prepared = await invoke<PreparedScheduledAgentTask>("prepare_scheduled_agent_task", {taskId: task.id});
-            if (task.conversation_id !== activeConversation.current || modelId !== currentModel.current) return;
+            if (task.conversation_id !== activeConversation.current || modelId !== currentModel.current || modelSource !== currentModelSource.current) return;
             setPrompt(prepared.prompt);
             setScheduledDraft(prepared);
+            setModelSource("simpleclaw");
             setModelId("gpt-oss-20b");
             setAgentMode(true);
             setContextPreview(null);
@@ -706,13 +714,22 @@ function App() {
         } finally { setTranscribing(false); }
     }
 
+    async function refreshOllamaCatalog() {
+        const request = ++ollamaRequest.current;
+        setOllamaStatus("loading");
+        try {
+            const models = await invoke<string[]>("list_ollama_models");
+            if (request === ollamaRequest.current) { setOllamaModels(models); setOllamaStatus("ready"); }
+        } catch { if (request === ollamaRequest.current) { setOllamaModels([]); setOllamaStatus("error"); } }
+    }
+
     async function refreshModelCatalog() {
         const request = ++catalogRequest.current;
         try {
             const result = await invoke<ModelCatalog>("refresh_models");
             if (request !== catalogRequest.current) return;
             setCatalog(result);
-            setContextPreview(null);
+            if (currentModelSource.current === "simpleclaw") setContextPreview(null);
             clear("catalog");
         } catch (reason) { if (request === catalogRequest.current) report("catalog", reason); }
     }
@@ -1164,6 +1181,7 @@ function App() {
             await reload(nextId);
             setCatalog(await invoke<ModelCatalog | null>("list_models"));
             setCategories(await invoke<ModelCategory[]>("list_model_categories"));
+            setModelSource("simpleclaw");
             setModelId("local-mock");
             setPendingAttachments([]);
             setSelectedArtifactId(null);
@@ -1193,7 +1211,7 @@ function App() {
     }
 
     async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string): Promise<boolean> {
-        if (busy) return false;
+        if (busy || currentModelSource.current === "ollama") return false;
         const request = ++generationRequest.current;
         setBusy(true);
         clear("runGeneration");
@@ -1252,11 +1270,11 @@ function App() {
     }
 
     function contextSignature() {
-        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
+        return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelSource, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
     }
 
     async function submitPrompt() {
-        if (busy || dropBusy.current || !prompt.trim()) return;
+        if (busy || dropBusy.current || !prompt.trim() || modelSource === "ollama") return;
         if (!contextPreview?.confirmation_id || previewSignature !== contextSignature()) {
             notify("Проверьте состав запроса. Для отправки нажмите Enter ещё раз или «Отправить».", "composer-check", 6000);
             await checkContext();
@@ -1285,17 +1303,18 @@ function App() {
     async function send() {
         const value = prompt.trim();
         const signature = contextSignature();
-        if (!value || busy || !contextPreview?.confirmation_id || previewSignature !== signature) return;
+        if (!value || busy || modelSource === "ollama" || !contextPreview?.confirmation_id || previewSignature !== signature) return;
         const tools = contextPreview.project_search_enabled ? "калькулятор и поиск по выбранной папке проекта" : "только калькулятор";
         if (agentMode && !await confirmAction(`Агентный режим отправит до двух платных запросов модели. Сейчас проверен только gpt-oss-20b. Доступны: ${tools}; команды недоступны.`)) return;
         if (scheduledDraft && value === scheduledDraft.prompt && (!agentMode || modelId !== "gpt-oss-20b")) {
             report("send", "Для результата задачи по расписанию выберите агентный режим и модель gpt-oss-20b.");
             return;
         }
+        if (currentModelSource.current !== modelSource || currentModel.current !== modelId || signature !== liveContextSignature.current) return;
         setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
         const inputSource = boardInputSource?.text === value ? boardInputSource : null;
-        if (await runGeneration(modelId === "local-mock" ? "start_mock_generation" : "start_generation", {confirmationId: contextPreview.confirmation_id, prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
+        if (await runGeneration(generationCommand(modelSource, modelId, false)!, {confirmationId: contextPreview.confirmation_id, prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
             setScheduledDraft(null);
             clear("send");
             if (inputSource) {
@@ -1417,8 +1436,9 @@ function App() {
     }
 
     async function retry(assistantId: number) {
+        if (modelSource === "ollama") return;
         if (modelId !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
-        await runGeneration(modelId === "local-mock" ? "retry_mock_generation" : "retry_generation", {assistantId, modelId});
+        await runGeneration(generationCommand(modelSource, modelId, true)!, {assistantId, modelId});
     }
 
     async function selectBranch(messageId: number) {
@@ -1454,7 +1474,7 @@ function App() {
     liveContextSignature.current = contextSignature();
 
     async function checkContext() {
-        if (dropBusy.current) return;
+        if (dropBusy.current || modelSource === "ollama") return;
         const request = ++contextRequest.current;
         const signature = contextSignature();
         setContextPreview(null);
@@ -1840,7 +1860,7 @@ function App() {
                                             Ответ {index + 1}{candidate.id === message.id ? " · выбран" : ""}
                                         </button>
                                     ))}
-                                    <button type="button" className="secondary-button" disabled={busy}
+                                    <button type="button" className="secondary-button" disabled={busy || modelSource === "ollama"}
                                             onClick={() => void retry(message.id)}>Повторить · новый ответ
                                     </button>
                                 </div>
@@ -2098,15 +2118,16 @@ function App() {
                     <div className="composer-footer">
                         <div className="composer-tools">
                             <button ref={composerMenuButton} type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-haspopup="menu" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
-                            <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} disabled={busy}
+                            <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} source={modelSource} ollamaModels={ollamaModels} ollamaStatus={ollamaStatus} onRefreshOllama={() => void refreshOllamaCatalog()} disabled={busy}
                                          fetchedAt={catalog?.fetched_at ?? null} catalogFailed={errors.some((error) => error.area === "catalog")}
-                                         onChange={(id) => { setModelId(id); if (id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
+                                         onChange={(id, source) => { setModelSource(source); setModelId(id); if (source === "ollama" || id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
                             {agentMode && <span className="agent-mode-chip">Агент · калькулятор{conversationProjectId !== null ? " и поиск при подключённой папке" : ""}</span>}
-                            {operationErrors("catalog")}
+                            {modelSource === "simpleclaw" && operationErrors("catalog")}
                             <details className="model-details">
                                 <summary>О модели</summary>
-                                <p>{catalog ? `Каталог: ${new Date(catalog.fetched_at * 1000).toLocaleString()}` : "Каталог ещё не загружен"}</p>
-                                {modelId !== "local-mock" && <>
+                                {modelSource === "simpleclaw" && <p>{catalog ? `Каталог: ${new Date(catalog.fetched_at * 1000).toLocaleString()}` : "Каталог ещё не загружен"}</p>}
+                                {modelSource === "ollama" && <p>Источник: Локально · Ollama. Отправка будет доступна в следующем обновлении.</p>}
+                                {modelSource === "simpleclaw" && modelId !== "local-mock" && <>
                                     <p>Цена: {selectedModel?.input_rubles_per_million ?? "неизвестна"} ₽/млн входных; {selectedModel?.output_rubles_per_million ?? "неизвестна"} ₽/млн выходных. Источник и дата каталога: <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">Provider API, GET /v1/models</a>, {catalog ? new Date(catalog.fetched_at * 1000).toLocaleString() : "неизвестны"}.</p>
                                     <p>Окно контекста и токенизатор: неизвестны — каталог их не сообщает. Возможность работы с текстом отдельно для этой модели не подтверждена.</p>
                                     <p>Изображения: пример с gpt-6-luna опубликован в <a href="https://simple-claw.ru/docs/provider-api" target="_blank" rel="noreferrer">документации Provider API</a>, проверено 9 ноября 2026. Для остальных моделей поддержка неизвестна.</p>
@@ -2120,19 +2141,19 @@ function App() {
                             </details>
                         </div>
                         <div className="actions">
-                            <button type="button" className="secondary-button" disabled={busy || dropLoading || !prompt.trim()}
+                            <button type="button" className="secondary-button" disabled={busy || dropLoading || !prompt.trim() || modelSource === "ollama"}
                                     onClick={() => void checkContext()}>Проверить контекст
                             </button>
                             {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || dropLoading || !prompt.trim() || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
+                                    disabled={busy || dropLoading || !prompt.trim() || modelSource === "ollama" || (modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
                             </button>}
                         </div>
                     </div>
                     {operationErrors("send")}
                     {!settingsOpen && operationErrors("connection")}
-                    <p className="send-warning">{modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
+                    <p className="send-warning">{modelSource === "ollama" ? "Отправка в Ollama пока недоступна." : modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
                     {hasImage && !imageModelSupported && <p role="alert">Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение.</p>}
-                    {modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
+                    {modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
 
                 </form>
                 </div>

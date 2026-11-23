@@ -5,9 +5,10 @@ type Model = {id: string; name: string; protocols: string[]; input_rubles_per_mi
 type Category = {model_id: string; category: string};
 const labels: Record<string, string> = {thinking: "Мышление", speed: "Скорость", economy: "Экономия", other: "Остальные"};
 
-export default function ModelPicker({models, categories, value, disabled, fetchedAt, catalogFailed, onChange}: {
+export default function ModelPicker({models, categories, value, source, ollamaModels, ollamaStatus, disabled, fetchedAt, catalogFailed, onRefreshOllama, onChange}: {
     models: Model[]; categories: Category[]; value: string; disabled: boolean;
-    fetchedAt: number | null; catalogFailed: boolean; onChange: (id: string) => void;
+    source: "simpleclaw" | "ollama"; ollamaModels: string[]; ollamaStatus: "idle" | "loading" | "ready" | "error";
+    fetchedAt: number | null; catalogFailed: boolean; onRefreshOllama: () => void; onChange: (id: string, source: "simpleclaw" | "ollama") => void;
 }) {
     const id = useId();
     const nativePopover = typeof HTMLElement.prototype.showPopover === "function";
@@ -16,6 +17,7 @@ export default function ModelPicker({models, categories, value, disabled, fetche
     const panel = useRef<HTMLDivElement>(null);
     const search = useRef<HTMLInputElement>(null);
     const [query, setQuery] = useState("");
+    const [viewSource, setViewSource] = useState<"simpleclaw" | "ollama">(source);
     const [category, setCategory] = useState("");
     const [storageError, setStorageError] = useState("");
     const [favorites, setFavorites] = useState<string[]>(() => {
@@ -50,8 +52,15 @@ export default function ModelPicker({models, categories, value, disabled, fetche
         if (event.key === "Enter" && event.target instanceof HTMLInputElement) event.preventDefault();
     }}>
             <div className="model-picker-heading"><strong>Выбор модели</strong><button type="button" onClick={close}>Закрыть</button></div>
+            <div><button type="button" aria-pressed={viewSource === "simpleclaw"} onClick={() => setViewSource("simpleclaw")}>SimpleClaw и тест</button> {/Mac/.test(navigator.platform) && <button type="button" aria-pressed={viewSource === "ollama"} onClick={() => { setViewSource("ollama"); onRefreshOllama(); }}>Локально · Ollama</button>}</div>
             <label htmlFor={`${id}-search`}>Поиск по имени или ID</label>
             <input ref={search} id={`${id}-search`} value={query} onChange={(event) => setQuery(event.target.value)}/>
+            {viewSource === "ollama" ? <div className="model-picker-results" aria-label="Локальные модели">
+                {ollamaStatus === "loading" && <p role="status">Загрузка моделей Ollama…</p>}
+                {ollamaStatus === "error" && <p role="alert">Ollama недоступна. Запустите Ollama. <button type="button" onClick={onRefreshOllama}>Повторить</button></p>}
+                {ollamaStatus === "ready" && !ollamaModels.length && <p role="status">В Ollama нет установленных локальных моделей.</p>}
+                {ollamaStatus === "ready" && ollamaModels.filter((name) => name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())).map((name) => <button key={name} type="button" className="secondary-button model-picker-choice" disabled={disabled} aria-pressed={source === "ollama" && value === name} onClick={() => { onChange(name, "ollama"); close(); }}><strong>{name}</strong><span>Локально · Ollama</span></button>)}
+            </div> : <>
             <label htmlFor={`${id}-category`}>Ваша категория</label>
             <select id={`${id}-category`} value={category} onChange={(event) => setCategory(event.target.value)}>
                 <option value="">Все категории</option>
@@ -63,8 +72,8 @@ export default function ModelPicker({models, categories, value, disabled, fetche
             <div className="model-picker-results" aria-label="Модели">
                 {!choices.length && <p role="status">Модели не найдены. Измените поиск или категорию.</p>}
                 {choices.map((model) => <div key={model.id} className="model-picker-row">
-                    <button type="button" className="secondary-button model-picker-choice" disabled={disabled} aria-pressed={value === model.id}
-                            onClick={() => { onChange(model.id); close(); }}>
+                    <button type="button" className="secondary-button model-picker-choice" disabled={disabled} aria-pressed={source === "simpleclaw" && value === model.id}
+                            onClick={() => { onChange(model.id, "simpleclaw"); close(); }}>
                         <strong>{model.name}</strong><span>{model.id}</span>
                         <span>{model.id === "local-mock" ? "Без сети" : "API: SimpleClaw · провайдер модели неизвестен"}</span>
                         <span>{model.id === "local-mock" ? "Локальная демонстрация" : `Доступна для выбора · свойства не подтверждены · ${labels[categories.find((item) => item.model_id === model.id)?.category ?? "other"]}`}</span>
@@ -73,15 +82,15 @@ export default function ModelPicker({models, categories, value, disabled, fetche
                     <button type="button" className="secondary-button" aria-pressed={favorites.includes(model.id)} aria-label={`Избранное: ${model.name}`}
                             onClick={() => toggleFavorite(model.id)}>{favorites.includes(model.id) ? "★" : "☆"}</button>
                 </div>)}
-            </div>
+            </div></>}
 
     </div>;
 
     return <>
-        <button ref={trigger} type="button" className="secondary-button model-picker-trigger" disabled={disabled} popoverTarget={nativePopover ? id : undefined} onClick={() => { if (!nativePopover) setOpen(true); }}
-                title={value === "local-mock" ? "Локальный тест · без сети" : `${selected?.name ?? value} · ${value}`}
-                aria-label={`Модель: ${value === "local-mock" ? "Локальный тест · без сети" : selected?.name ?? value}`}>
-            {value === "local-mock" ? "Локальный тест · без сети" : selected?.name ?? value}
+        <button ref={trigger} type="button" className="secondary-button model-picker-trigger" disabled={disabled} popoverTarget={nativePopover ? id : undefined} onClick={() => { if (source === "ollama") onRefreshOllama(); if (!nativePopover) setOpen(true); }}
+                title={source === "ollama" ? `${value} · Локально · Ollama` : value === "local-mock" ? "Локальный тест · без сети" : `${selected?.name ?? value} · ${value}`}
+                aria-label={`Модель: ${source === "ollama" ? `${value} · Локально · Ollama` : value === "local-mock" ? "Локальный тест · без сети" : selected?.name ?? value}`}>
+            {source === "ollama" ? `${value} · Ollama` : value === "local-mock" ? "Локальный тест · без сети" : selected?.name ?? value}
         </button>
         {nativePopover ? <div ref={panel} id={id} popover="auto" className="model-picker" role={open ? "dialog" : undefined} aria-label="Выбор модели"
              onToggle={() => { const visible = panel.current?.matches(":popover-open") ?? false; setOpen(visible); if (visible) search.current?.focus(); }}>{content}</div> :
