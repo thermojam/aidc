@@ -15,7 +15,7 @@ import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project, type ProjectGroup} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
 import ModelPicker from "./ModelPicker";
-import {generationCommand} from "./modelSource";
+import {generationCommand, retryTarget} from "./modelSource";
 import {useNavigationLayout} from "./useNavigationLayout";
 import "./style.css";
 
@@ -1439,10 +1439,9 @@ function App() {
     async function retry(assistantId: number) {
         const attempt = history.attempts.find((item) => item.assistant_id === assistantId);
         if (!attempt) return;
-        const source = history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source ?? "simpleclaw";
-        const originalModel = attempt.model_id ?? "local-mock";
-        if (source === "simpleclaw" && originalModel !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
-        await runGeneration(generationCommand(source, originalModel, true)!, {assistantId, modelId: originalModel}, undefined, source);
+        const target = retryTarget(attempt, history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source);
+        if (target.source === "simpleclaw" && target.model !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
+        await runGeneration(target.command, {assistantId, modelId: target.model}, undefined, target.source);
     }
 
     async function selectBranch(messageId: number) {

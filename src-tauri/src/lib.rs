@@ -4735,6 +4735,22 @@ mod tests {
     }
 
     #[test]
+    fn retry_of_simpleclaw_attempt_keeps_its_model_without_network() {
+        let mut db = Connection::open_in_memory().unwrap();
+        init_db(&db).unwrap();
+        let catalog = ModelCatalog { fetched_at: 1, models: vec![CatalogModel { id: "same:latest".into(), name: "same".into(), input_rubles_per_million: Some(5.0), output_rubles_per_million: None, protocols: vec![], request_rubles: None, audio_rubles_per_minute: None }] };
+        save_catalog_if_latest(&db, &AtomicU64::new(1), 1, &catalog).unwrap();
+        let first = create_attempt_for_source(&mut db, 1, "question", &[], "same:latest", false, None, "simpleclaw").unwrap();
+        finish(&db, first, "completed").unwrap();
+        let assistant: i64 = db.query_row("SELECT assistant_id FROM attempts WHERE id=?1", [first], |row| row.get(0)).unwrap();
+        assert!(create_retry_for_source(&mut db, 1, assistant, "same:latest", "ollama").is_err());
+        assert!(create_retry_for_source(&mut db, 1, assistant, "other", "simpleclaw").is_err());
+        let (retry, _) = create_retry_for_conversation(&mut db, 1, assistant, "same:latest").unwrap();
+        let (model, source): (String, String) = db.query_row("SELECT model_id,json_extract(context_json,'$.model_source') FROM attempts WHERE id=?1", [retry], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((model.as_str(), source.as_str()), ("same:latest", "simpleclaw"));
+    }
+
+    #[test]
     fn conversations_keep_messages_files_artifacts_and_branches_separate_after_restore() {
         let source_path = std::env::temp_dir().join(format!("ai-desktop-conversations-live-{}.sqlite", std::process::id()));
         let path = std::env::temp_dir().join(format!("ai-desktop-conversations-{}.sqlite", std::process::id()));
