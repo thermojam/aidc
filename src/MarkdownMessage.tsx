@@ -20,9 +20,9 @@ hljs.registerLanguage("json", json);
 hljs.registerLanguage("python", python);
 hljs.registerLanguage("rust", rust);
 
-type Props = {content: string; messageId: number; onArtifact: (messageId: number, kind: "code" | "html" | "svg", title: string, content: string) => void};
+type Props = {content: string; messageId: number; onArtifact: (messageId: number, kind: "code" | "html" | "svg", title: string, content: string, trigger: HTMLButtonElement) => void};
 
-function CodeBlock({code, language, complete, onArtifact}: {code: string; language: string; complete: boolean; onArtifact: () => void}) {
+function CodeBlock({code, language, complete, onArtifact}: {code: string; language: string; complete: boolean; onArtifact: (trigger: HTMLButtonElement) => void}) {
     const [copyStatus, setCopyStatus] = useState("");
     const highlighted = complete && language && hljs.getLanguage(language)
         ? hljs.highlight(code, {language, ignoreIllegals: true}).value : null;
@@ -33,7 +33,7 @@ function CodeBlock({code, language, complete, onArtifact}: {code: string; langua
     return <div className="code-block">
         <div className="code-block-heading"><span>{language || "Код"}</span>
             <div><button type="button" className="secondary-button" onClick={() => void copy()}>Копировать</button>
-                <button type="button" className="secondary-button" onClick={onArtifact}>Открыть как Artifact</button></div>
+                <button type="button" className="secondary-button" onClick={(event) => onArtifact(event.currentTarget)}>Открыть как Artifact</button></div>
         </div>
         {copyStatus && <p role="status">{copyStatus}</p>}
         <pre><code className="hljs" {...(highlighted ? {dangerouslySetInnerHTML: {__html: highlighted}} : {children: code})}/></pre>
@@ -59,7 +59,7 @@ function MarkdownMessage({content, messageId, onArtifact}: Props) {
                 const fence = /(?:^|[\s>])(`{3,}|~{3,})[^`~]*$/.exec(lines[0]);
                 const closing = fence && lines.slice(1).some((line) => new RegExp(`^[\\s>]*${fence[1][0]}{${fence[1].length},}\\s*$`).test(line));
                 return <CodeBlock code={code} language={language} complete={Boolean(closing)}
-                    onArtifact={() => artifactAction.current(messageId, kind, language || "code", code)}/>;
+                    onArtifact={(trigger) => artifactAction.current(messageId, kind, language || "code", code, trigger)}/>;
             }
         }), [content, messageId]);
     return <div className="markdown">
