@@ -23,7 +23,7 @@ export default function ArtifactPanel({artifact, versions, onSelect, onClose, on
     const [copyStatus, setCopyStatus] = useState("");
     useEffect(() => { closeButton.current?.focus(); }, []);
     useEffect(() => {
-        if (!side && document.activeElement?.closest(".chat-panel")) closeButton.current?.focus();
+        if (!side && document.hasFocus() && (document.activeElement === document.body || document.activeElement?.closest(".chat-panel"))) closeButton.current?.focus();
     }, [side]);
     useEffect(() => { setCopyStatus(""); }, [artifact.id]);
     const [mode, setMode] = useState<"code" | "preview">("code");
