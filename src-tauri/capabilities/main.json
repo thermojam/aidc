@@ -35,6 +35,7 @@
     "allow-start-mock-generation",
     "allow-retry-mock-generation",
     "allow-start-generation",
+    "allow-start-ollama-generation",
     "allow-retry-generation",
     "allow-select-branch",
     "allow-stop-generation",

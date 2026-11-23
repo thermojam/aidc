@@ -29,6 +29,7 @@ fn main() {
                 "start_mock_generation",
                 "retry_mock_generation",
                 "start_generation",
+                "start_ollama_generation",
                 "retry_generation",
                 "select_branch",
                 "stop_generation",
