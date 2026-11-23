@@ -270,6 +270,7 @@ function App() {
     const currentModel = useRef(modelId);
     currentModel.current = modelId;
     const navigationRequest = useRef(0);
+    const conversationGeneration = useRef(0);
     const generationRequest = useRef(0);
     const catalogRequest = useRef(0);
     const historyRequest = useRef(0);
@@ -900,6 +901,7 @@ function App() {
             }
             historyRequest.current++;
             setHistory({messages: [], attachments: [], artifacts: [], active_leaf_id: null, contexts: [], attempts: []});
+            conversationGeneration.current++;
             activeConversation.current = id;
             setConversationId(id);
             setDraft("");
@@ -1135,6 +1137,7 @@ function App() {
         if (!selectedBackup || busy || !await confirmAction(`Восстановить копию ${selectedBackup}? Текущая история будет сохранена отдельной копией. Выбранные файлы и несохранённые записи плана, очереди и уточнений будут убраны.`)) return;
         try {
             await invoke("restore_backup", {name: selectedBackup});
+            conversationGeneration.current++;
             discardSnapshot();
             scheduledResultRequest.current++;
             setOpenedScheduledResult(null);
@@ -1311,10 +1314,11 @@ function App() {
     async function pickAttachment() {
         if (dropBusy.current || pickerBusy.current) return;
         pickerBusy.current = true;
+        const generation = conversationGeneration.current;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_text_attachment");
             if (!attachment) return;
-            if (conversationId !== activeConversation.current) {
+            if (generation !== conversationGeneration.current || conversationId !== activeConversation.current) {
                 await invoke("remove_text_attachment", {id: attachment.id});
                 return;
             }
@@ -1331,6 +1335,7 @@ function App() {
     async function pickImageAttachment() {
         if (dropBusy.current || pickerBusy.current) return;
         pickerBusy.current = true;
+        const generation = conversationGeneration.current;
         try {
             const attachment = await invoke<PendingAttachment | null>("pick_image_attachment");
             if (!attachment) return;
@@ -1346,7 +1351,7 @@ function App() {
                     await invoke("remove_text_attachment", {id: attachment.id});
                     throw new Error("Изображение превышает локальный предел 16 мегапикселей");
                 }
-                if (conversationId !== activeConversation.current) {
+                if (generation !== conversationGeneration.current || conversationId !== activeConversation.current) {
                     await invoke("remove_text_attachment", {id: attachment.id});
                     return;
                 }
@@ -1475,8 +1480,8 @@ function App() {
         else promptField.current?.focus();
     }, [prompt]);
 
-    async function openArtifact(messageId: number, kind: "code" | "html" | "svg", title: string, content: string) {
-        artifactTrigger.current = document.activeElement as HTMLElement;
+    async function openArtifact(messageId: number, kind: "code" | "html" | "svg", title: string, content: string, trigger: HTMLButtonElement) {
+        artifactTrigger.current = trigger;
         try {
             const id = await invoke<number>("create_artifact", {messageId, kind, title, content});
             await reload();
@@ -1766,7 +1771,7 @@ function App() {
                         <article className={`message message-${message.role}`} key={message.id}>
                             <strong>{message.role === "user" ? "Вы" : "Ответ"}</strong>
                             {message.role === "assistant" && message.status === "completed" ?
-                                <RenderBoundary key={message.id} sourceText={message.content}><MarkdownMessage content={message.content} messageId={message.id} onArtifact={(id, kind, title, content) => void openArtifact(id, kind, title, content)}/></RenderBoundary> :
+                                <RenderBoundary key={message.id} sourceText={message.content}><MarkdownMessage content={message.content} messageId={message.id} onArtifact={(id, kind, title, content, trigger) => void openArtifact(id, kind, title, content, trigger)}/></RenderBoundary> :
                                 <p>{message.content}</p>}
                             {history.attachments.filter((attachment) => attachment.message_id === message.id).map((attachment) => (
                                 <small
