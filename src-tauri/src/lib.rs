@@ -1324,7 +1324,7 @@ async fn generate_image(model_id: String, prompt: String, expected_price_rubles:
         key_entry(&state.key_service)?.get_password().map_err(|_| "Ключ SimpleClaw не сохранён")?
     };
     let response = client.post("https://simple-claw.ru/v1/images/generations").bearer_auth(key)
-        .json(&serde_json::json!({"model": model_id, "prompt": prompt, "n": 1, "size": "1024x1024", "quality": "low", "response_format": "b64_json", "output_format": "png"}))
+        .json(&serde_json::json!({"model": model_id, "prompt": prompt, "n": 1, "size": "1024x1024", "quality": "low", "response_format": "b64_json"}))
         .send().await.map_err(|_| "NETWORK_RESULT_UNKNOWN")?;
     let status = response.status();
     if !status.is_success() { return Err(format!("GENERATION_HTTP_{}", status.as_u16())); }
