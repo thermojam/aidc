@@ -1328,7 +1328,11 @@ export default function App() {
                             <p>Выберите модель и напишите сообщение. История хранится на этом компьютере.</p>
                         </div>
                     )}
-                    {visible.map((message) => (
+                    {visible.map((message) => {
+                        const attempt = history.attempts.find((item) => item.assistant_id === message.id);
+                        const context = history.contexts.find((item) => item.assistant_id === message.id)?.context;
+                        const localAttempt = context?.model_source === "ollama" || attempt?.model_id === "local-mock";
+                        return (
                         <article className={`message message-${message.role}`} key={message.id}>
                             <strong>{message.role === "user" ? "Вы" : "Ответ"}</strong>
                             {message.role === "assistant" && message.status === "completed" ?
@@ -1342,23 +1346,17 @@ export default function App() {
                             {message.role !== "assistant" && message.status !== "completed" &&
                                 <small>{statusLabel[message.status] ?? message.status}</small>}
                             {message.role === "assistant" && <small>
-                                Модель: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id ?? "локальный тест"}
-                                {history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source === "ollama" ? " · Локально · Ollama" : ""}
+                                Модель: {attempt?.model_id ?? context?.model_id ?? "неизвестна"}
+                                {context?.model_source === "ollama" ? " · Локально · Ollama" : ""}
                                 {message.status === "completed" ? " · Завершено" : ` · ${statusLabel[message.status] ?? message.status}`}
-                                {history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source !== "ollama" && history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id !== "local-mock" &&
-                                    history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id &&
-                                    (history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage ? " · Сумма не подтверждена" : " · Usage и сумма неизвестны")}
                             </small>}
                             {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed") && (() => {
-                                const attempt = history.attempts.find((item) => item.assistant_id === message.id);
-                                const local = history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source === "ollama";
-                                if (local) return <p role="alert">{attempt?.error_code === "OLLAMA_UNAVAILABLE" ? "Ollama недоступна. Запустите Ollama и проверьте модель. Частичный текст сохранён." : message.status === "interrupted" ? "Ответ Ollama прерван. Частичный текст сохранён." : "Ошибка Ollama. Проверьте, что сервер запущен и модель установлена. Частичный текст сохранён."}</p>;
+                                if (localAttempt) return <p role="alert">{attempt?.error_code === "OLLAMA_UNAVAILABLE" ? "Ollama недоступна. Запустите Ollama и проверьте модель. Частичный текст сохранён." : message.status === "interrupted" ? "Ответ Ollama прерван. Частичный текст сохранён." : "Ошибка Ollama. Проверьте, что сервер запущен и модель установлена. Частичный текст сохранён."}</p>;
                                 return <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
                                     code={attempt?.error_code ?? null} httpStatus={attempt?.http_status ?? null} requestId={attempt?.server_request_id ?? null}
                                     onConnection={() => setSettingsOpen(true)}/>;
                             })()}
                             {message.role === "assistant" && (() => {
-                                const context = history.contexts.find((item) => item.assistant_id === message.id)?.context;
                                 const sources = context?.agent_sources ?? [];
                                 const filesRead = context?.agent_files_read ?? [];
                                 return filesRead.length > 0 && <details className="agent-sources">
@@ -1379,16 +1377,24 @@ export default function App() {
                                                 onClick={(event) => { artifactTrigger.current = event.currentTarget; setSelectedArtifactId(artifact.id); }}>Artifact #{artifact.id} · {artifact.title}</button>)}
                                     <details className="answer-details">
                                         <summary>Детали ответа</summary>
-                                        <p>HTTP: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.http_status ?? "неизвестен"}</p>
-                                        <p>Код ошибки: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.error_code ?? "нет"}</p>
-                                        <p>Request ID: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.server_request_id ?? "неизвестен"}</p>
-                                        <p>Response ID: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.server_response_id ?? "неизвестен"}</p>
-                                        <p>Usage сервера: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage ? JSON.stringify(history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage) : "неизвестен"}</p>
-                                        {history.contexts.find((item) => item.assistant_id === message.id) && <details>
+                                        <p>Источник: {context?.model_source === "ollama" ? "Локально · Ollama" : context?.model_source === "simpleclaw" ? "SimpleClaw · платный API" : attempt?.model_id === "local-mock" ? "Тест · без сети" : "Источник неизвестен"}</p>
+                                        <p>Модель: {attempt?.model_id ?? context?.model_id ?? "неизвестна"}</p>
+                                        <p>Статус суммы: {localAttempt ? "не применяется" : attempt?.usage ? "usage получен; сумма не подтверждена" : context?.model_source === "simpleclaw" ? "списание неизвестно" : "неизвестен"}</p>
+                                        <p>HTTP: {attempt?.http_status ?? "неизвестен"}</p>
+                                        <p>Код ошибки: {attempt?.error_code ?? (message.status === "completed" ? "нет" : "неизвестен")}</p>
+                                        <p>Request ID: {attempt?.server_request_id ?? "неизвестен"}</p>
+                                        <p>Response ID: {attempt?.server_response_id ?? "неизвестен"}</p>
+                                        <p>Usage сервера: {attempt?.usage ? [
+                                            ["Входные токены", attempt.usage.prompt_tokens],
+                                            ["Выходные токены", attempt.usage.completion_tokens],
+                                            ["Всего токенов", attempt.usage.total_tokens],
+                                        ].filter(([, value]) => value !== undefined).map(([label, value]) => `${label}: ${value}`).join(" · ") || "частичные данные" : "неизвестен"}</p>
+                                        {!context && <p>Отправленный контекст: неизвестен</p>}
+                                        {context && <details>
                                             <summary>Отправленный контекст</summary>
-                                            {history.contexts.find((item) => item.assistant_id === message.id)?.context.messages.map((part, index) =>
+                                            {context.messages.map((part, index) =>
                                                 <pre
-                                                    key={index}>{part.role} · {part.source_message_id ?? "система"}{"\n"}{part.content}</pre>)}
+                                                    key={index}>{part.role} · {part.source_message_id ?? (part.role === "system" ? "система" : "новое сообщение")}{part.attachment_ids.length ? ` · файлы ${part.attachment_ids.join(", ")}` : ""}{"\n"}{part.content}</pre>)}
                                         </details>}
                                         {history.messages.filter((candidate) => candidate.role === "assistant" && follows(candidate, message.id)).length > 0 && <details>
                                             <summary>Продолжения этой ветки</summary>
@@ -1410,7 +1416,7 @@ export default function App() {
                                 </div>
                             )}
                         </article>
-                    ))}
+                    ); })}
                 <details className="agent-board-panel">
                     <summary>План и очередь этой беседы</summary>
                     {operationErrors("agent", ["agentBoard", "addPlanStep", "completePlanStep", "addBoardInput"])}
