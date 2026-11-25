@@ -72,7 +72,7 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
         try {
             await invoke<number>(command, {conversationId, ...args, onEvent: channel});
             if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
-            await reload();
+            await reload().catch((reason) => report("history", reason));
             return true;
         } catch (reason) {
             if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;

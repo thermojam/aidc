@@ -11,6 +11,7 @@ const calls: {command: string; args: Record<string, unknown>}[] = [];
 let generation: ReturnType<typeof useChatGeneration>;
 let changeConversation: (id: number) => void;
 let approve = false;
+let failReload = false;
 mockIPC((command, args) => {
     if (command === "stop_generation") return null;
     calls.push({command, args: args as Record<string, unknown>});
@@ -27,7 +28,7 @@ function Harness() {
     changeConversation = setConversationId;
     generation = useChatGeneration({conversationId, activeConversation, currentModelSource, setPrompt,
         history: {attempts: [{assistant_id: 1, model_id: "paid"}], contexts: [{assistant_id: 1, context: {model_source: "simpleclaw"}}]},
-        clearContext: () => {}, reload: async () => {}, refreshScheduledRuns: async () => {},
+        clearContext: () => {}, reload: async () => { if (failReload) throw new Error("history unavailable"); }, refreshScheduledRuns: async () => {},
         confirmAction: async () => approve, clear: () => {}, report: () => {}});
     return <div>{generation.busy ? "busy" : "idle"}:{generation.draft}</div>;
 }
@@ -54,7 +55,10 @@ async function run() {
     await act(async () => { channels[0].onmessage(delta(1, 2, "late")); channels[1].onmessage(delta(2, 1, "new")); frame(0); });
     check(String(generation.draft) === "new", "old event changed the new attempt");
     await act(async () => { channels[1].onmessage(end(2)); });
+    failReload = true;
     await act(async () => { await generation.retry(1); });
+    check(generation.busy, "history failure released an active stream");
+    failReload = false;
     await act(async () => { changeConversation(2); });
     await act(async () => { channels[2].onmessage(delta(3, 1, "wrong conversation")); channels[2].onmessage(end(3)); });
     check(!document.body.textContent?.includes("wrong conversation"), "event changed another conversation");
