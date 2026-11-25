@@ -10,14 +10,14 @@ type Props = {
     onSelectMaterial: (id: number) => void; onSlashCommand: (command: string, remainder: string) => void;
     pickAttachment: () => Promise<void>; pickImageAttachment: () => Promise<void>;
     openVoice: () => void; openSettings: () => void; choosingWindow: boolean; hasSnapshot: boolean; isMac: boolean;
-    captureWindowSnapshot: () => Promise<void>; submitPrompt: () => Promise<void>; checkContext: () => Promise<void>;
-    stop: () => Promise<void>; sendDisabled: boolean;
+    captureWindowSnapshot: () => Promise<void>; submitPrompt: () => Promise<void>;
+    stop: () => Promise<void>; contextChecking: boolean; contextReady: boolean; actionDisabled: boolean;
     beforeInput: ReactNode; afterInput: ReactNode; tools: ReactNode; afterActions: ReactNode;
 };
 
 export default function MessageComposer({prompt, promptField, busy, dropLoading, conversationProjectId, materialsAvailable,
     projectMaterials, pendingAttachments, selectedMaterialIds, onPromptChange, onMentionPromptChange, onSelectMaterial,
-    onSlashCommand, pickAttachment, pickImageAttachment, openVoice, openSettings, choosingWindow, hasSnapshot, isMac, captureWindowSnapshot, submitPrompt, checkContext, stop, sendDisabled, beforeInput, afterInput, tools, afterActions}: Props) {
+    onSlashCommand, pickAttachment, pickImageAttachment, openVoice, openSettings, choosingWindow, hasSnapshot, isMac, captureWindowSnapshot, submitPrompt, stop, contextChecking, contextReady, actionDisabled, beforeInput, afterInput, tools, afterActions}: Props) {
     const [composerToolsOpen, setComposerToolsOpen] = useState(false);
     const composerMenu = useRef<HTMLDivElement>(null);
     const composerMenuButton = useRef<HTMLButtonElement>(null);
@@ -153,8 +153,7 @@ export default function MessageComposer({prompt, promptField, busy, dropLoading,
                 {tools}
             </div>
             <div className="actions">
-                <button type="button" className="secondary-button" disabled={busy || dropLoading || !prompt.trim()} onClick={() => void checkContext()}>Проверить контекст</button>
-                {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit" disabled={sendDisabled}>Отправить</button>}
+                {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit" disabled={actionDisabled}>{contextChecking ? "Проверка…" : contextReady ? "Отправить" : "Проверить запрос"}</button>}
             </div>
         </div>
         {afterActions}

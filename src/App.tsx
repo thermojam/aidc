@@ -189,6 +189,8 @@ export default function App() {
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
+    const [contextChecking, setContextChecking] = useState(false);
+    const contextCheckingRef = useRef(false);
     const [previewSignature, setPreviewSignature] = useState("");
     const [selectedArtifactId, setSelectedArtifactId] = useState<number | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
@@ -865,7 +867,6 @@ export default function App() {
     async function submitPrompt() {
         if (busy || dropBusy.current || !prompt.trim()) return;
         if (!contextPreview?.confirmation_id || previewSignature !== contextSignature()) {
-            notify("Проверьте состав запроса. Для отправки нажмите Enter ещё раз или «Отправить».", "composer-check", 6000);
             await checkContext();
             return;
         }
@@ -1049,7 +1050,9 @@ export default function App() {
     liveContextSignature.current = contextSignature();
 
     async function checkContext() {
-        if (dropBusy.current) return;
+        if (dropBusy.current || contextCheckingRef.current || busy) return;
+        contextCheckingRef.current = true;
+        setContextChecking(true);
         const request = ++contextRequest.current;
         const signature = contextSignature();
         setContextPreview(null);
@@ -1065,6 +1068,9 @@ export default function App() {
             if (request !== contextRequest.current || signature !== liveContextSignature.current) return;
             setContextPreview(null);
             report("checkContext", reason);
+        } finally {
+            contextCheckingRef.current = false;
+            setContextChecking(false);
         }
     }
 
@@ -1463,8 +1469,9 @@ export default function App() {
                     onSlashCommand={runSlashCommand} pickAttachment={pickAttachment} pickImageAttachment={pickImageAttachment}
                     openVoice={() => setVoiceOpen(true)} openSettings={() => setComposerSettingsOpen(true)}
                     choosingWindow={choosingWindow} hasSnapshot={!!capturedSnapshot} isMac={isMac} captureWindowSnapshot={captureWindowSnapshot}
-                    submitPrompt={submitPrompt} checkContext={checkContext} stop={stop}
-                    sendDisabled={busy || dropLoading || !prompt.trim() || (modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}
+                    submitPrompt={submitPrompt} stop={stop} contextChecking={contextChecking}
+                    contextReady={!!contextPreview?.confirmation_id && previewSignature === contextSignature()}
+                    actionDisabled={contextChecking || dropLoading || !prompt.trim() || (!!contextPreview?.confirmation_id && previewSignature === contextSignature() && ((modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported)))}
                     beforeInput={<>
                     {operationErrors("attachment")}
                     {dropResults.length > 0 && <div className="file-drop-results" aria-live="polite">{dropResults.map((item, index) => <div key={index}>{item.name}: {item.status}</div>)}</div>}
@@ -1581,14 +1588,23 @@ export default function App() {
                     </div>; })}
                     {selectedMaterialIds.length > 0 && <button type="button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>}
                     </section>}
-                    {contextPreview && <details open className="context-preview">
-                        <summary>Состав запроса · {contextPreview.model_source === "ollama" ? "Локально · Ollama" : "SimpleClaw / тест"} · {contextPreview.model_id} · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
-                            обменов: {contextPreview.omitted_exchanges}</summary>
+                    {contextPreview && previewSignature === contextSignature() && <>
+                    <p className="composer-summary" role="status">
+                        {contextPreview.model_source === "ollama" ? "Локально · Ollama" : contextPreview.model_id === "local-mock" ? "Тест · без сети" : "SimpleClaw · платный API"} · {contextPreview.model_id}
+                        {pendingAttachments.length + selectedMaterialIds.length > 0 && ` · Вложений ${pendingAttachments.length + selectedMaterialIds.length}`}
+                        {contextPreview.omitted_exchanges > 0 && ` · История сокращена на ${contextPreview.omitted_exchanges} ${contextPreview.omitted_exchanges === 1 ? "обмен" : "обмена"}`}
+                        {contextPreview.agent_skill && ` · Навык «${contextPreview.agent_skill.name}»`}
+                        {contextPreview.model_source === "simpleclaw" && contextPreview.model_id !== "local-mock" && " · Точная стоимость неизвестна"}
+                    </p>
+                    <details className="context-preview">
+                        <summary>Состав запроса</summary>
+                        <p>{contextPreview.model_id} · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых обменов: {contextPreview.omitted_exchanges}</p>
                         <p>{contextPreview.warning}</p>
                         {contextPreview.agent_skill && <p>В этом снимке включён навык «{contextPreview.agent_skill.name}», версия {contextPreview.agent_skill.version}, SHA-256 {contextPreview.agent_skill.sha256}. Текст инструкции показан ниже в составе сообщений.</p>}
                         {contextPreview.messages.map((part, index) => <pre
                             key={index}>{part.role} · {part.source_message_id ?? "новое сообщение или система"} · вложения: {part.attachment_ids.join(", ") || "нет"}{"\n"}{part.content}</pre>)}
-                    </details>}
+                    </details>
+                    </>}
                     </>}
                     tools={<>
                             <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} source={modelSource} ollamaModels={ollamaModels} ollamaStatus={ollamaStatus} onRefreshOllama={() => void refreshOllamaCatalog()} disabled={busy}
@@ -1616,7 +1632,7 @@ export default function App() {
                     afterActions={<>
                     {operationErrors("send")}
                     {!settingsOpen && operationErrors("connection")}
-                    <p className="send-warning">{modelSource === "ollama" ? "Локально · Ollama. Текст отправится на этот компьютер; изображения и агентный режим не поддерживаются." : modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
+                    {(!contextPreview || previewSignature !== contextSignature()) && <p className="composer-route">{modelSource === "ollama" ? "Локально · Ollama" : modelId === "local-mock" ? "Тест · без сети" : "SimpleClaw · платный API"} · {modelId}</p>}
                     {hasImage && !imageModelSupported && <p role="alert">{modelSource === "ollama" ? "Изображения в Ollama пока не поддерживаются. Удалите изображение из запроса." : "Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение."}</p>}
                     {modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
 
