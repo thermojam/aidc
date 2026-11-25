@@ -1,10 +1,9 @@
 import {useEffect, useLayoutEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
-import {Channel, invoke} from "@tauri-apps/api/core";
+import {invoke} from "@tauri-apps/api/core";
 import {getCurrentWindow} from "@tauri-apps/api/window";
 import {getCurrentWebview} from "@tauri-apps/api/webview";
 import {listen} from "@tauri-apps/api/event";
-import {isPermissionGranted, onAction, requestPermission, sendNotification} from "@tauri-apps/plugin-notification";
 import MarkdownMessage from "./MarkdownMessage";
 import ArtifactPanel, {type ArtifactVersion} from "./ArtifactPanel";
 import {Button} from "./components/ui/button";
@@ -15,9 +14,14 @@ import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project, type ProjectGroup} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
 import ModelPicker from "./ModelPicker";
-import {generationCommand, retryTarget} from "./modelSource";
+import {generationCommand} from "./modelSource";
+import {useChatGeneration} from "./features/chat/useChatGeneration";
 import {useNavigationLayout} from "./useNavigationLayout";
 import {useImageGeneration} from "./features/images/useImageGeneration";
+import {useVoiceInput} from "./features/voice/useVoiceInput";
+import {useScheduledTasks, type ScheduledAgentTask} from "./features/tasks/useScheduledTasks";
+import TasksView from "./features/tasks/TasksView";
+import MessageComposer from "./features/composer/MessageComposer";
 import ImageGenerationView from "./features/images/ImageGenerationView";
 import type {CatalogModel, ModelCatalog} from "./modelCatalog";
 import "./style.css";
@@ -48,7 +52,6 @@ type ContextPreview = {
     warning: string
 };
 type CapturedSnapshot = { mime: string; size: number; sha256: string; preview: string };
-type TranscriptionResult = { text: string };
 type ModelCategory = { model_id: string; category: string; source: string; updated_at: number };
 type History = {
     messages: Message[];
@@ -60,19 +63,13 @@ type History = {
         server_request_id: string | null; usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
         error_code: string | null; http_status: number | null }[]
 };
-type StreamEvent =
-    | { event: "delta"; data: { attempt_id: number; seq: number; text: string } }
-    | { event: "end"; data: { attempt_id: number; status: string; error_code: string | null; request_id: string | null; http_status: number | null } };
 type Theme = "system" | "light" | "dark";
 type ProjectMaterial = { id: number; name: string; version: number; size: number; sha256: string };
 type ProjectFolderFile = { relative_path: string; size: number | null; blocked_reason: string | null };
 type ProjectFolderView = { folder_name: string; max_entries: number; max_file_bytes: number; files: ProjectFolderFile[] };
 type SyntheticTask = { id: number; title: string; status: "awaiting_approval" | "completed" | "denied"; created_at: number;
     steps: { id: number; ordinal: number; action: string; decision: "pending" | "approved" | "denied"; result: string | null }[] };
-type ScheduledAgentTask = { id: number; conversation_id: number; title: string; prompt: string; interval_minutes: number; next_run_at: number; status: "active" | "awaiting_confirmation" | "stopped"; due_at: number | null };
 type PreparedScheduledAgentTask = {prompt: string; run_id: number};
-type ScheduledAgentRun = {id: number; title: string; due_at: number; notified_at: number | null};
-type ScheduledAgentResult = {title: string; content: string};
 type AgentBoard = {
     plan: {id: number; ordinal: number; action: string; status: "pending" | "completed"}[];
     queue: {id: number; text: string; status: "queued" | "submitted"}[];
@@ -124,16 +121,19 @@ function App() {
     const [confirmationMessage, setConfirmationMessage] = useState<string | null>(null);
     const confirmationResolve = useRef<((confirmed: boolean) => void) | null>(null);
     const confirmationTrigger = useRef<HTMLElement | null>(null);
-    const [composerToolsOpen, setComposerToolsOpen] = useState(false);
     const [composerSettingsOpen, setComposerSettingsOpen] = useState(false);
-    const composerMenu = useRef<HTMLDivElement>(null);
-    const composerMenuButton = useRef<HTMLButtonElement>(null);
-    const [closeVoiceConfirm, setCloseVoiceConfirm] = useState(false);
-    const [replaceVoiceConfirm, setReplaceVoiceConfirm] = useState(false);
-    const [transcriptionConfirm, setTranscriptionConfirm] = useState(false);
     const isMac = /Macintosh|Mac OS X/.test(navigator.userAgent);
-    const [busy, setBusy] = useState(false);
-    const [draft, setDraft] = useState("");
+    const [modelSource, setModelSource] = useState<"simpleclaw" | "ollama">("simpleclaw");
+    const currentModelSource = useRef(modelSource);
+    currentModelSource.current = modelSource;
+    const activeConversation = useRef(conversationId);
+    activeConversation.current = conversationId;
+    const {errors, report, clear} = useOperationErrors(conversationId);
+    const {busy, draft, setDraft, runGeneration, retry, stop} = useChatGeneration({
+        conversationId, activeConversation, currentModelSource, history, setPrompt,
+        clearContext: () => setContextPreview(null), reload: () => reload(),
+        refreshScheduledRuns: () => refreshScheduledRuns(), confirmAction, clear, report
+    });
     const historyRef = useRef<HTMLDivElement>(null);
     const historyAtBottom = useRef(true);
     const [showNewMessages, setShowNewMessages] = useState(false);
@@ -145,7 +145,6 @@ function App() {
         const element = historyRef.current;
         if (element && historyAtBottom.current) element.scrollTop = element.scrollHeight;
     }, [history, draft, busy, conversationId]);
-    const {errors, report, clear} = useOperationErrors(conversationId);
     const [backups, setBackups] = useState<string[]>([]);
     const [selectedBackup, setSelectedBackup] = useState("");
     const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
@@ -158,12 +157,14 @@ function App() {
     const dropState = useRef({busy, conversationId, slots: 5});
     dropState.current = {busy: busy || materialsOpen, conversationId, slots: Math.max(0, 5 - pendingAttachments.length - selectedMaterialIds.length)};
     const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
+    const {voiceOpen, setVoiceOpen, voicePreparation, voicePreparing, recordingSeconds, recording, recordedAudio, setRecordedAudio,
+        transcriptionText, setTranscriptionText, transcriptionAvailable, setTranscriptionAvailable, transcribing, uncertainTranscription,
+        transcriptionModels, selectedTranscriptionModel, setTranscriptionModelId, closeVoiceConfirm, setCloseVoiceConfirm,
+        replaceVoiceConfirm, setReplaceVoiceConfirm, transcriptionConfirm, setTranscriptionConfirm, startVoiceRecording,
+        stopVoiceRecording, cancelVoiceRecording, cancelVoicePermission, transcribeVoice} = useVoiceInput({catalog, setCatalog, clear, report});
     const [categories, setCategories] = useState<ModelCategory[]>([]);
 
     const [modelId, setModelId] = useState("local-mock");
-    const [modelSource, setModelSource] = useState<"simpleclaw" | "ollama">("simpleclaw");
-    const currentModelSource = useRef(modelSource);
-    currentModelSource.current = modelSource;
     const [ollamaModels, setOllamaModels] = useState<string[]>([]);
     const [ollamaStatus, setOllamaStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
     const ollamaRequest = useRef(0);
@@ -177,46 +178,16 @@ function App() {
     const setTasksView = (open: boolean) => setView(open ? "tasks" : "chat");
     const imageBack = useRef<HTMLButtonElement>(null);
     const tasksBack = useRef<HTMLButtonElement>(null);
-    const scheduledResultRequest = useRef(0);
-    const [scheduledTasks, setScheduledTasks] = useState<ScheduledAgentTask[]>([]);
-    const [scheduledRuns, setScheduledRuns] = useState<ScheduledAgentRun[]>([]);
     const [scheduledDraft, setScheduledDraft] = useState<PreparedScheduledAgentTask | null>(null);
-    const [openedScheduledResult, setOpenedScheduledResult] = useState<ScheduledAgentResult | null>(null);
-    const [scheduleNotificationsEnabled, setScheduleNotificationsEnabled] = useState(localStorage.getItem("scheduleNotifications") === "enabled");
-    const [notificationListenerReady, setNotificationListenerReady] = useState(false);
-    const [notificationTaskId, setNotificationTaskId] = useState<number | null>(null);
-    const notifiedDueTasks = useRef(new Set<string>());
-    const notifiedRuns = useRef(new Set<number>());
-    const [scheduleTitle, setScheduleTitle] = useState("");
-    const [schedulePrompt, setSchedulePrompt] = useState("");
-    const [scheduleInterval, setScheduleInterval] = useState("60");
     const [agentBoard, setAgentBoard] = useState<AgentBoard>({plan: [], queue: [], steering: []});
     const [planDraft, setPlanDraft] = useState("");
     const [queueDraft, setQueueDraft] = useState("");
     const [steeringDraft, setSteeringDraft] = useState("");
     const [boardInputSource, setBoardInputSource] = useState<BoardInputSource | null>(null);
-    const [voiceOpen, setVoiceOpen] = useState(false);
-    const [voicePreparation, setVoicePreparation] = useState<"microphone" | "audio" | null>(null);
-    const voicePreparing = voicePreparation !== null;
-    const permissionRequest = useRef(0);
-    const voicePending = useRef(false);
-    const [recordingSeconds, setRecordingSeconds] = useState(0);
-    const cancelRecording = useRef(false);
-    const [recording, setRecording] = useState(false);
-    const [recordedAudio, setRecordedAudio] = useState<{id: string; base64: string; mime: string; seconds: number} | null>(null);
-    const [transcriptionText, setTranscriptionText] = useState("");
-    const [transcriptionAvailable, setTranscriptionAvailable] = useState(false);
-    const [transcribing, setTranscribing] = useState(false);
-    const [uncertainTranscription, setUncertainTranscription] = useState("");
     const snapshotGeneration = useRef(0);
     const [choosingWindow, setChoosingWindow] = useState(false);
     const [captureNotice, setCaptureNotice] = useState("");
     const [capturedSnapshot, setCapturedSnapshot] = useState<CapturedSnapshot | null>(null);
-    const [transcriptionModelId, setTranscriptionModelId] = useState("");
-    const recorder = useRef<MediaRecorder | null>(null);
-    const recordingStream = useRef<MediaStream | null>(null);
-    const audioChunks = useRef<Blob[]>([]);
-    const audioSize = useRef(0);
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
@@ -225,16 +196,13 @@ function App() {
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [paletteQuery, setPaletteQuery] = useState("");
-    const [slashDismissed, setSlashDismissed] = useState(false);
-    const [slashIndex, setSlashIndex] = useState(0);
-    const [mentionDismissed, setMentionDismissed] = useState(false);
-    const [mentionIndex, setMentionIndex] = useState(0);
-    const [promptCaret, setPromptCaret] = useState(0);
     const checkAfterSlash = useRef(false);
     const navigation = useNavigationLayout();
     const focusPromptOnSheetClose = useRef(false);
     const closeNavigationSheet = useRef(() => {});
     closeNavigationSheet.current = () => { if (navigation.modal) navigation.setOpen(false); };
+    const tasks = useScheduledTasks({conversationId, tasksView, closeNavigationSheet, setTasksView, clear, report});
+    const {scheduledTasks, refreshScheduledTasks, refreshScheduledRuns, resetScheduledTasks} = tasks;
     const [recentIds, setRecentIds] = useState<number[]>(() => {
         try { const saved = JSON.parse(localStorage.getItem("navigation.recent") ?? "[]"); return Array.isArray(saved) ? saved.filter(Number.isInteger).slice(0, 10) : []; }
         catch { return []; }
@@ -256,13 +224,10 @@ function App() {
     const chatSearchField = navigation.search;
     const artifactTrigger = useRef<HTMLElement | null>(null);
     const promptField = useRef<HTMLTextAreaElement>(null);
-    const activeConversation = useRef(conversationId);
-    activeConversation.current = conversationId;
     const currentModel = useRef(modelId);
     currentModel.current = modelId;
     const navigationRequest = useRef(0);
     const conversationGeneration = useRef(0);
-    const generationRequest = useRef(0);
     const catalogRequest = useRef(0);
     const historyRequest = useRef(0);
     const boardRequest = useRef(0);
@@ -371,38 +336,6 @@ function App() {
 
     async function refreshSyntheticTasks() {
         setSyntheticTasks(await invoke<SyntheticTask[]>("list_synthetic_tasks"));
-    }
-
-    async function refreshScheduledTasks() {
-        setScheduledTasks(await invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks"));
-    }
-
-    async function refreshScheduledRuns() {
-        setScheduledRuns(await invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs"));
-    }
-
-    async function enableScheduleNotifications() {
-        try {
-            const granted = await isPermissionGranted() || await requestPermission() === "granted";
-            if (!granted) { report("enableScheduleNotifications", "Уведомления запрещены в настройках системы."); return; }
-            localStorage.setItem("scheduleNotifications", "enabled");
-            setScheduleNotificationsEnabled(true);
-            clear("enableScheduleNotifications");
-        } catch (reason) { report("enableScheduleNotifications", reason); }
-    }
-
-    async function createScheduledTask() {
-        try {
-            await invoke("create_scheduled_agent_task", {conversationId, title: scheduleTitle, prompt: schedulePrompt, intervalMinutes: Number(scheduleInterval)});
-            setScheduleTitle(""); setSchedulePrompt("");
-            await refreshScheduledTasks();
-            clear("createScheduledTask");
-        } catch (reason) { report("createScheduledTask", reason); }
-    }
-
-    async function stopScheduledTask(taskId: number) {
-        try { await invoke("stop_scheduled_agent_task", {taskId}); await refreshScheduledTasks(); clear("stopScheduledTask"); }
-        catch (reason) { report("stopScheduledTask", reason); }
     }
 
     function confirmAction(message: string): Promise<boolean> {
@@ -521,139 +454,6 @@ function App() {
         } catch (reason) { report("decideSyntheticStep", reason); }
     }
 
-    async function startVoiceRecording(replace = false) {
-        if (voicePending.current || transcribing) return;
-        if (!replace && (recordedAudio || transcriptionText)) { setReplaceVoiceConfirm(true); return; }
-        voicePending.current = true;
-        const request = ++permissionRequest.current;
-        clear("startVoiceRecording");
-        setVoicePreparation("microphone");
-        try {
-            if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new DOMException("", "NotSupportedError");
-            const stream = await navigator.mediaDevices.getUserMedia({audio: true});
-            if (request !== permissionRequest.current) {
-                stream.getTracks().forEach((track) => track.stop());
-                return;
-            }
-            recordingStream.current = stream;
-            audioChunks.current = [];
-            audioSize.current = 0;
-            cancelRecording.current = false;
-            const options = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? {mimeType: "audio/webm;codecs=opus"} : {};
-            const nextRecorder = new MediaRecorder(stream, options);
-            recorder.current = nextRecorder;
-            nextRecorder.ondataavailable = (event) => {
-                if (!event.data.size) return;
-                audioSize.current += event.data.size;
-                if (audioSize.current <= 25 * 1024 * 1024) audioChunks.current.push(event.data);
-                else {
-                    report("startVoiceRecording", "Запись превысила 25 МиБ и удалена. Попробуйте короче.");
-                    if (nextRecorder.state === "recording") nextRecorder.stop();
-                }
-            };
-            nextRecorder.onstop = () => {
-                stream.getTracks().forEach((track) => track.stop());
-                recordingStream.current = null;
-                setRecording(false);
-                setVoicePreparation("audio");
-                if (cancelRecording.current) { audioChunks.current = []; voicePending.current = false; setVoicePreparation(null); return; }
-                if (audioSize.current > 25 * 1024 * 1024) { setRecordedAudio(null); voicePending.current = false; setVoicePreparation(null); return; }
-                const seconds = Math.min(600, (Date.now() - startedAt.current) / 1000);
-                void new Blob(audioChunks.current, {type: nextRecorder.mimeType}).arrayBuffer().then((buffer) => {
-                    const bytes = new Uint8Array(buffer);
-                    let binary = "";
-                    for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-                    setRecordedAudio({id: crypto.randomUUID(), base64: btoa(binary), mime: nextRecorder.mimeType.split(";")[0] || "audio/webm", seconds});
-                }).catch(() => report("startVoiceRecording", "Не удалось подготовить запись."))
-                    .finally(() => { voicePending.current = false; setVoicePreparation(null); });
-            };
-            startedAt.current = Date.now();
-            nextRecorder.start(1000);
-            setRecordedAudio(null);
-            setTranscriptionText("");
-            setTranscriptionAvailable(false);
-            setRecording(true);
-            setVoicePreparation(null);
-            window.setTimeout(() => { if (recorder.current === nextRecorder && nextRecorder.state === "recording") nextRecorder.stop(); }, 600_000);
-        } catch (reason) {
-            if (request !== permissionRequest.current) return;
-            voicePending.current = false;
-            setVoicePreparation(null);
-            recordingStream.current?.getTracks().forEach((track) => track.stop());
-            recordingStream.current = null;
-            report("startVoiceRecording", reason);
-        }
-    }
-
-    const voiceAtRisk = useRef(false);
-    voiceAtRisk.current = recording || voicePreparing || !!recordedAudio || !!transcriptionText || transcribing;
-    useEffect(() => {
-        let unlisten: (() => void) | undefined;
-        let disposed = false;
-        void getCurrentWindow().onCloseRequested((event) => {
-            if (voiceAtRisk.current || voicePending.current) { event.preventDefault(); setCloseVoiceConfirm(true); }
-        }).then((stop) => { if (disposed) stop(); else unlisten = stop; });
-        return () => { disposed = true; unlisten?.(); };
-    }, []);
-
-    useEffect(() => {
-        if (!composerToolsOpen) return;
-        composerMenu.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
-        function dismiss(event: PointerEvent) {
-            if (!composerMenu.current?.contains(event.target as Node) && !composerMenuButton.current?.contains(event.target as Node)) setComposerToolsOpen(false);
-        }
-        document.addEventListener("pointerdown", dismiss);
-        return () => document.removeEventListener("pointerdown", dismiss);
-    }, [composerToolsOpen]);
-
-    const startedAt = useRef(0);
-
-    useEffect(() => {
-        if (!recording) return;
-        setRecordingSeconds(0);
-        const timer = window.setInterval(() => setRecordingSeconds(Math.min(600, Math.floor((Date.now() - startedAt.current) / 1000))), 1000);
-        return () => window.clearInterval(timer);
-    }, [recording]);
-
-    useEffect(() => () => {
-        permissionRequest.current++;
-        if (recorder.current?.state === "recording") recorder.current.stop();
-        recordingStream.current?.getTracks().forEach((track) => track.stop());
-    }, []);
-
-    function stopVoiceRecording() {
-        if (recorder.current?.state === "recording") recorder.current.stop();
-    }
-
-    async function transcribeVoice(confirmed = false) {
-        if (!recordedAudio || voicePending.current || transcribing) return;
-        const model = selectedTranscriptionModel;
-        if (!model || model.audio_rubles_per_minute === null || !model.protocols.includes("audio_transcriptions")) return;
-        const signature = recordedAudio.id;
-        if (uncertainTranscription === signature) return;
-        if (!confirmed) { setTranscriptionConfirm(true); return; }
-        setTranscribing(true);
-        clear("transcribeVoice");
-        try {
-            const result = await invoke<TranscriptionResult>("transcribe_audio", {
-                modelId: model.id, audioBase64: recordedAudio.base64, mimeType: recordedAudio.mime,
-                durationSeconds: recordedAudio.seconds, expectedRatePerMinute: model.audio_rubles_per_minute
-            });
-            setTranscriptionText(result.text);
-            setTranscriptionAvailable(true);
-            setRecordedAudio(null);
-        } catch (reason) {
-            const message = String(reason);
-            if (message.includes("UNKNOWN") || /TRANSCRIPTION_HTTP_5\d\d/.test(message)) {
-                setUncertainTranscription(signature);
-                report("transcribeVoice", "Результат распознавания неизвестен; запрос мог быть принят и оплачен. Автоповтора нет.");
-            } else if (message.includes("Ставка изменилась")) {
-                try { setCatalog(await invoke<ModelCatalog>("refresh_models")); report("transcribeVoice", "Тариф изменился. Обновите оценку и подтвердите отправку снова."); }
-                catch (refreshReason) { report("transcribeVoice", `Не удалось обновить тариф: ${String(refreshReason)}`); }
-            } else report("transcribeVoice", message);
-        } finally { setTranscribing(false); }
-    }
-
     async function refreshOllamaCatalog() {
         const request = ++ollamaRequest.current;
         setOllamaStatus("loading");
@@ -736,93 +536,9 @@ function App() {
         invoke<ModelCategory[]>("list_model_categories").then(setCategories).catch((reason) => report("categories", reason));
         invoke<boolean>("key_status").then(setKeySaved).catch((reason) => report("keyStatus", reason));
         invoke<SyntheticTask[]>("list_synthetic_tasks").then(setSyntheticTasks).catch((reason) => report("syntheticTasks", reason));
-        invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => report("scheduledTasks", reason));
-        invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => report("scheduledRuns", reason));
 
         void refreshModelCatalog();
     }, []);
-
-    useEffect(() => {
-        const timer = window.setInterval(() => {
-            invoke<ScheduledAgentTask[]>("list_scheduled_agent_tasks").then(setScheduledTasks).catch((reason) => report("scheduledTasks", reason));
-            invoke<ScheduledAgentRun[]>("list_scheduled_agent_runs").then(setScheduledRuns).catch((reason) => report("scheduledRuns", reason));
-        }, 30_000);
-        return () => window.clearInterval(timer);
-    }, []);
-
-    useEffect(() => {
-        let active = true;
-        let listener: Awaited<ReturnType<typeof onAction>> | null = null;
-        onAction((event) => {
-            if (event.actionId !== "tap") return;
-            closeNavigationSheet.current();
-            const runId = event.notification?.extra?.scheduledRunId;
-            if (typeof runId === "number") {
-                setTasksView(true);
-                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => report("notifications", reason));
-                const request = ++scheduledResultRequest.current;
-                void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId}).then((result) => { if (request === scheduledResultRequest.current) setOpenedScheduledResult(result); }).catch((reason) => { if (request === scheduledResultRequest.current) report("scheduledRuns", reason); });
-                return;
-            }
-            const taskId = event.notification?.extra?.scheduledTaskId;
-            if (typeof taskId === "number") {
-                setTasksView(true);
-                scheduledResultRequest.current++;
-                void getCurrentWindow().show().then(() => getCurrentWindow().setFocus()).catch((reason) => report("scheduledRuns", reason));
-                setNotificationTaskId(taskId);
-            }
-        }).then((registered) => {
-            if (!active) void registered.unregister();
-            else { listener = registered; setNotificationListenerReady(true); }
-        }).catch((reason) => report("notifications", reason));
-        return () => { active = false; if (listener) void listener.unregister(); };
-    }, []);
-
-    useEffect(() => {
-        if (!scheduleNotificationsEnabled || !notificationListenerReady) return;
-        let active = true;
-        isPermissionGranted().then((granted) => {
-            if (!active || !granted) return;
-            for (const task of scheduledTasks) {
-                if (task.status !== "awaiting_confirmation" || task.due_at === null) continue;
-                const key = `${task.id}:${task.due_at}`;
-                if (notifiedDueTasks.current.has(key)) continue;
-                notifiedDueTasks.current.add(key);
-                sendNotification({title: "Пора подтвердить задачу", body: "Откройте приложение, чтобы просмотреть её.", extra: {scheduledTaskId: task.id}});
-            }
-        }).catch((reason) => report("notifications", reason));
-        return () => { active = false; };
-    }, [scheduledTasks, scheduleNotificationsEnabled, notificationListenerReady]);
-
-    useEffect(() => {
-        if (!scheduleNotificationsEnabled || !notificationListenerReady) return;
-        let active = true;
-        isPermissionGranted().then((granted) => {
-            if (!active || !granted) return;
-            for (const run of scheduledRuns) {
-                if (run.notified_at !== null || notifiedRuns.current.has(run.id)) continue;
-                try {
-                    sendNotification({title: "Агентная задача завершена", body: "Откройте приложение, чтобы посмотреть результат.", extra: {scheduledRunId: run.id}});
-                    notifiedRuns.current.add(run.id);
-                    void invoke("mark_scheduled_agent_run_notified", {runId: run.id}).catch((reason) => report("notifications", reason));
-                } catch (reason) { report("notifications", reason); }
-            }
-        }).catch((reason) => report("notifications", reason));
-        return () => { active = false; };
-    }, [scheduledRuns, scheduleNotificationsEnabled, notificationListenerReady]);
-
-    useEffect(() => {
-        if (notificationTaskId === null || !scheduledTasks.some((task) => task.id === notificationTaskId && task.status === "awaiting_confirmation")) return;
-        const notice = document.getElementById(`scheduled-task-${notificationTaskId}`);
-        notice?.scrollIntoView({block: "center"});
-        notice?.querySelector<HTMLButtonElement>("button")?.focus();
-        setNotificationTaskId(null);
-    }, [notificationTaskId, scheduledTasks, tasksView]);
-
-    useEffect(() => {
-        if (!openedScheduledResult) return;
-        document.getElementById("scheduled-task-result")?.scrollIntoView({block: "center"});
-    }, [openedScheduledResult, tasksView]);
 
     useEffect(() => {
         reload(conversationId).catch((reason) => report("history", reason));
@@ -1096,14 +812,8 @@ function App() {
             await invoke("restore_backup", {name: selectedBackup});
             conversationGeneration.current++;
             discardSnapshot();
-            scheduledResultRequest.current++;
-            setOpenedScheduledResult(null);
+            resetScheduledTasks();
             setScheduledDraft(null);
-            setNotificationTaskId(null);
-            setScheduledTasks([]);
-            setScheduledRuns([]);
-            notifiedDueTasks.current.clear();
-            notifiedRuns.current.clear();
             await Promise.all([refreshScheduledTasks(), refreshScheduledRuns()]);
             const items = await refreshConversations();
             await refreshProjects();
@@ -1148,65 +858,6 @@ function App() {
             setKeySaved(false);
             clear("deleteKey", "Ключ удалён");
         } catch (reason) { report("deleteKey", reason); }
-    }
-
-    async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string, retrySource?: "simpleclaw" | "ollama"): Promise<boolean> {
-        if (busy || (retrySource === undefined && (currentModelSource.current === "ollama") !== (command === "start_ollama_generation"))) return false;
-        const request = ++generationRequest.current;
-        setBusy(true);
-        clear("runGeneration");
-        setDraft("");
-        const channel = new Channel<StreamEvent>();
-        let lastSeq = 0;
-        let pending = "";
-        let frame = 0;
-        let ended = false;
-        channel.onmessage = (message) => {
-            if (ended || request !== generationRequest.current || conversationId !== activeConversation.current) return;
-            if (message.event === "delta") {
-                if (message.data.seq === lastSeq + 1) {
-                    lastSeq = message.data.seq;
-                    pending += message.data.text;
-                    if (!frame) frame = requestAnimationFrame(() => {
-                        if (request !== generationRequest.current || conversationId !== activeConversation.current) return;
-                        const chunk = pending;
-                        pending = "";
-                        setDraft((current) => current + chunk);
-                        frame = 0;
-                    });
-                } else if (message.data.seq > lastSeq + 1) {
-                    reload().catch((reason) => report("history", reason));
-                }
-            } else {
-                ended = true;
-                if (frame) cancelAnimationFrame(frame);
-                const tail = pending;
-                pending = "";
-                setDraft((current) => current + tail);
-                setBusy(false);
-                if (message.data.status === "failed" || message.data.status === "interrupted") {
-                    notify(command === "start_ollama_generation" || retrySource === "ollama" ? "Ответ Ollama не завершён. Полученный текст сохранён; проверьте сервер и модель." : "Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
-                }
-                void reload().then(() => {
-                    if (request === generationRequest.current && conversationId === activeConversation.current) setDraft("");
-                }).catch((reason) => report("history", reason));
-                refreshScheduledRuns().catch((reason) => report("scheduledRuns", reason));
-            }
-        };
-        try {
-            await invoke<number>(command, {conversationId, ...args, onEvent: channel});
-            if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
-            await reload();
-            return true;
-        } catch (reason) {
-            if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
-            if (frame) cancelAnimationFrame(frame);
-            setBusy(false);
-            if (restorePrompt !== undefined) setPrompt((current) => current || restorePrompt);
-            setContextPreview(null);
-            report("runGeneration", reason);
-            return false;
-        }
     }
 
     function contextSignature() {
@@ -1375,14 +1026,6 @@ function App() {
         }
     }
 
-    async function retry(assistantId: number) {
-        const attempt = history.attempts.find((item) => item.assistant_id === assistantId);
-        if (!attempt) return;
-        const target = retryTarget(attempt, history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source);
-        if (target.source === "simpleclaw" && target.model !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
-        await runGeneration(target.command, {assistantId, modelId: target.model}, undefined, target.source);
-    }
-
     async function selectBranch(messageId: number) {
         try {
             await invoke("select_branch", {conversationId, messageId});
@@ -1401,14 +1044,6 @@ function App() {
             clear("changeCategory");
         } catch (reason) {
             report("changeCategory", reason);
-        }
-    }
-
-    async function stop() {
-        try {
-            await invoke("stop_generation");
-        } catch (reason) {
-            report("stop", reason);
         }
     }
 
@@ -1506,48 +1141,7 @@ function App() {
         {id: "artifact", label: "Открыть последний результат"},
     ].filter((command) => command.label.toLocaleLowerCase().includes(paletteQuery.trim().toLocaleLowerCase()));
 
-    const lineStart = prompt.lastIndexOf("\n", Math.max(0, promptCaret - 1)) + 1;
-    const lineEnd = prompt.indexOf("\n", promptCaret);
-    const line = prompt.slice(lineStart, lineEnd < 0 ? undefined : lineEnd);
-    const slashQuery = /^\/([^\n]*)$/.exec(line);
-    const slashCommands = [
-        {id: "new", label: "Новая беседа"},
-        {id: "search", label: "Найти беседу"},
-        {id: "context", label: "Проверить контекст"},
-    ].filter((command) => command.label.toLocaleLowerCase().includes((slashQuery?.[1] ?? "").trim().toLocaleLowerCase()));
-    const mentionMatch = /(?:^|\s)@([^@\n]*)$/.exec(prompt.slice(0, promptCaret));
-    const mentionStart = mentionMatch ? promptCaret - mentionMatch[1].length - 1 : 0;
-    const mentionQuery = (mentionMatch?.[1] ?? "").toLocaleLowerCase();
-    const mentionItems = (conversationProjectId !== null
-        ? (materialListProject.current === conversationProjectId ? projectMaterials : []).map((item) => ({kind: "material" as const, id: item.id, name: item.name, detail: `версия ${item.version} · ${item.name.includes(".") ? item.name.split(".").pop() : "файл"}`}))
-        : pendingAttachments.map((item) => ({kind: "attachment" as const, id: item.id, name: item.name, detail: item.mime})))
-        .filter((item) => item.name.toLocaleLowerCase().includes(mentionQuery));
-    const mentionOpen = !!mentionMatch && !mentionDismissed;
-    const activeMention = Math.min(mentionIndex, mentionItems.length - 1);
-    const mentionDisabled = (item: typeof mentionItems[number]) => busy || dropLoading || (item.kind === "material" && !selectedMaterialIds.includes(item.id) && pendingAttachments.length + selectedMaterialIds.length >= 5);
-    function chooseMention(item: typeof mentionItems[number]) {
-        if (mentionDisabled(item)) return;
-        const replacement = "";
-        const next = prompt.slice(0, mentionStart) + replacement + prompt.slice(promptCaret);
-        if (next.length > 2000) return;
-        if (item.kind === "material") setSelectedMaterialIds((ids) => ids.includes(item.id) ? ids : [...ids, item.id]);
-        const caret = mentionStart + replacement.length;
-        setPrompt(next);
-        setPromptCaret(caret);
-        setMentionDismissed(true);
-        setContextPreview(null);
-        requestAnimationFrame(() => { promptField.current?.focus(); promptField.current?.setSelectionRange(caret, caret); });
-    }
-    useEffect(() => {
-        if (mentionOpen && activeMention >= 0) document.getElementById(`mention-${mentionItems[activeMention].kind}-${mentionItems[activeMention].id}`)?.scrollIntoView({block: "nearest"});
-    }, [mentionOpen, activeMention, mentionQuery]);
-    const slashOpen = !!slashQuery && !mentionOpen && !slashDismissed;
-    const activeSlash = Math.min(slashIndex, slashCommands.length - 1);
-    const slashRemainder = prompt.slice(0, lineStart) + (lineEnd < 0 ? "" : prompt.slice(lineEnd + 1));
-    const slashDisabled = (command: string) => (busy && ["new", "context"].includes(command)) || (command === "context" && !slashRemainder.trim());
-
-    function runSlashCommand(command: string) {
-        setSlashDismissed(true);
+    function runSlashCommand(command: string, slashRemainder: string) {
         if (command === "new") { void createConversation(slashRemainder); return; }
         if (command === "context") checkAfterSlash.current = true;
         setPrompt(slashRemainder);
@@ -1568,8 +1162,6 @@ function App() {
     const selectedArtifact = history.artifacts.find((artifact) => artifact.id === selectedArtifactId);
     const artifactSide = navigation.viewport >= 48 + (navigation.open && !navigation.modal ? navigation.width : 0) + 560 + 360;
     const selectedConversation = conversations.find((item) => item.id === conversationId);
-    const transcriptionModels = catalog?.models.filter((model) => model.protocols.includes("audio_transcriptions") && model.audio_rubles_per_minute !== null) ?? [];
-    const selectedTranscriptionModel = transcriptionModels.find((model) => model.id === transcriptionModelId) ?? transcriptionModels[0];
     const selectedModel = catalog?.models.find((model) => model.id === modelId);
     const hasImage = pendingAttachments.some((attachment) => attachment.mime.startsWith("image/"));
     const imageModelSupported = modelSource === "simpleclaw" && modelId === "gpt-6-luna";
@@ -1864,10 +1456,18 @@ function App() {
                     setShowNewMessages(false);
                 }}>К новым сообщениям</button>}
                 </div>
-                <form className="composer" onSubmit={(event) => {
-                    event.preventDefault();
-                    void submitPrompt();
-                }}>
+                <MessageComposer prompt={prompt} promptField={promptField} busy={busy} dropLoading={dropLoading}
+                    conversationProjectId={conversationProjectId} materialsAvailable={materialListProject.current === conversationProjectId}
+                    projectMaterials={projectMaterials} pendingAttachments={pendingAttachments} selectedMaterialIds={selectedMaterialIds}
+                    onPromptChange={(value) => { setPrompt(value); setBoardInputSource((source) => source && source.text !== value ? null : source); setContextPreview(null); }}
+                    onMentionPromptChange={(value) => { setPrompt(value); setContextPreview(null); }}
+                    onSelectMaterial={(id) => setSelectedMaterialIds((ids) => ids.includes(id) ? ids : [...ids, id])}
+                    onSlashCommand={runSlashCommand} pickAttachment={pickAttachment} pickImageAttachment={pickImageAttachment}
+                    openVoice={() => setVoiceOpen(true)} openSettings={() => setComposerSettingsOpen(true)}
+                    choosingWindow={choosingWindow} hasSnapshot={!!capturedSnapshot} isMac={isMac} captureWindowSnapshot={captureWindowSnapshot}
+                    submitPrompt={submitPrompt} checkContext={checkContext} stop={stop}
+                    sendDisabled={busy || dropLoading || !prompt.trim() || (modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}
+                    beforeInput={<>
                     {operationErrors("attachment")}
                     {dropResults.length > 0 && <div className="file-drop-results" aria-live="polite">{dropResults.map((item, index) => <div key={index}>{item.name}: {item.status}</div>)}</div>}
                     <div className="composer-project">Проект: {projects.find((project) => project.id === conversationProjectId)?.title ?? "Без проекта"}</div>
@@ -1883,72 +1483,8 @@ function App() {
                     {captureNotice && <p role="status">{captureNotice}</p>}
                     {!voiceOpen && (recording || voicePreparing || recordedAudio || transcriptionText || transcribing) && <button type="button" className="secondary-button" onClick={() => setVoiceOpen(true)}>Открыть голосовой ввод · {recording ? "идёт запись" : "есть несохранённые данные"}</button>}
                     {!selectedArtifact && operationErrors("artifact")}
-                    <label className="sr-only" htmlFor="prompt">Сообщение</label>
-                    <textarea ref={promptField} id="prompt" value={prompt} maxLength={2000} rows={2}
-                              aria-autocomplete="list" aria-controls={mentionOpen ? "material-mentions" : slashOpen ? "slash-commands" : undefined}
-                              aria-activedescendant={mentionOpen && activeMention >= 0 ? `mention-${mentionItems[activeMention].kind}-${mentionItems[activeMention].id}` : slashOpen && activeSlash >= 0 ? `slash-command-${slashCommands[activeSlash].id}` : undefined}
-                              onSelect={(event) => setPromptCaret(event.currentTarget.selectionStart)}
-                              onBlur={(event) => { setSlashDismissed(true); if (!(event.relatedTarget instanceof HTMLElement && event.relatedTarget.id === "mention-pick-file")) setMentionDismissed(true); }}
-                              onKeyDown={(event) => {
-                                  if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
-                                  if (mentionOpen) {
-                                      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setMentionDismissed(true); return; }
-                                      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) { event.preventDefault(); if (mentionItems.length) setMentionIndex((index) => (index + (event.key === "ArrowDown" ? 1 : -1) + mentionItems.length) % mentionItems.length); return; }
-                                      if ((event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) || (event.key === "Tab" && !event.shiftKey && activeMention >= 0 && !mentionDisabled(mentionItems[activeMention]))) { event.preventDefault(); if (activeMention >= 0) chooseMention(mentionItems[activeMention]); return; }
-                                  }
-                                  if (slashOpen) {
-                                      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setSlashDismissed(true); return; }
-                                      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) { event.preventDefault(); if (slashCommands.length) setSlashIndex((index) => (index + (event.key === "ArrowDown" ? 1 : -1) + slashCommands.length) % slashCommands.length); return; }
-                                      if ((event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey) || (event.key === "Tab" && !event.shiftKey && activeSlash >= 0 && !slashDisabled(slashCommands[activeSlash].id))) { event.preventDefault(); if (activeSlash >= 0 && !slashDisabled(slashCommands[activeSlash].id)) runSlashCommand(slashCommands[activeSlash].id); return; }
-                                  }
-                                  if (event.key !== "Enter" || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || event.defaultPrevented || slashOpen || mentionOpen) return;
-                                  event.preventDefault();
-                                  void submitPrompt();
-                              }}
-                              placeholder="Напишите сообщение" onChange={(event) => {
-                        setPrompt(event.target.value);
-                        setPromptCaret(event.target.selectionStart);
-                        setSlashDismissed(false);
-                        setSlashIndex(0);
-                        setMentionDismissed(false);
-                        setMentionIndex(0);
-                        setBoardInputSource((source) => source && source.text !== event.target.value ? null : source);
-                        setContextPreview(null);
-                    }}/>
-                    {mentionOpen && <div className="slash-commands mention-commands">
-                        <div id="material-mentions" role="listbox" aria-label="Материалы для сообщения">
-                            {mentionItems.map((item, index) => <div id={`mention-${item.kind}-${item.id}`} key={`${item.kind}-${item.id}`} role="option"
-                                aria-selected={index === activeMention} aria-disabled={mentionDisabled(item)}
-                                onMouseDown={(event) => event.preventDefault()} onClick={() => chooseMention(item)}>{item.name} · {item.detail}</div>)}
-                        </div>
-                        {!mentionItems.length && <><p role="status">Нет доступных материалов</p><button id="mention-pick-file" type="button" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5}
-                            onBlur={() => setMentionDismissed(true)} onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setMentionDismissed(true); promptField.current?.focus(); } }} onClick={() => { setMentionDismissed(true); void pickAttachment(); }}>Выбрать файл…</button></>}
-                    </div>}
-                    {slashOpen && <div id="slash-commands" className="slash-commands" role="listbox" aria-label="Команды сообщения">
-                        {slashCommands.map((command, index) => <div id={`slash-command-${command.id}`} key={command.id} role="option"
-                            aria-selected={index === activeSlash} aria-disabled={slashDisabled(command.id)}
-                            onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => { if (!slashDisabled(command.id)) runSlashCommand(command.id); }}>{command.label}{command.id === "context" && !slashRemainder.trim() ? " · добавьте текст сообщения" : ""}</div>)}
-                        {!slashCommands.length && <p role="status">Команды не найдены.</p>}
-                    </div>}
-                    {prompt.length >= 1600 && <small aria-live="polite">{prompt.length}/2000</small>}
-                    {composerToolsOpen && <div ref={composerMenu} className="composer-menu" role="menu" aria-label="Добавить к сообщению" onKeyDown={(event) => {
-                        if (event.key === "Escape") { event.preventDefault(); setComposerToolsOpen(false); composerMenuButton.current?.focus(); }
-                        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-                            event.preventDefault();
-                            const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
-                            const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
-                            buttons[(index + (event.key === "ArrowDown" ? 1 : buttons.length - 1)) % buttons.length]?.focus();
-                        }
-                    }}>
-                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickAttachment(); }}>Прикрепить файл</button>
-                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || dropLoading || pendingAttachments.length + selectedMaterialIds.length >= 5} onClick={() => { setComposerToolsOpen(false); void pickImageAttachment(); }}>Прикрепить изображение</button>
-                        <button type="button" className="secondary-button" role="menuitem" onClick={() => { setVoiceOpen(true); setComposerToolsOpen(false); }}>Голосовой ввод…</button>
-                        <button type="button" className="secondary-button" role="menuitem" disabled={busy || choosingWindow || !!capturedSnapshot || pendingAttachments.length + selectedMaterialIds.length >= 5 || !isMac} onClick={() => { setComposerToolsOpen(false); void captureWindowSnapshot(); }}>Снимок окна…</button>
-                        {!isMac && <small>Снимок окна доступен только на macOS.</small>}
-                        {capturedSnapshot && <small>Сначала прикрепите или удалите текущий снимок.</small>}
-                        <button type="button" className="secondary-button" role="menuitem" onClick={() => { setComposerToolsOpen(false); setComposerSettingsOpen(true); }}>Дополнительные настройки…</button>
-                    </div>}
+                    </>}
+                    afterInput={<>
                     {voiceOpen && <section className="voice-input" aria-label="Голосовой ввод">
                         {operationErrors("voice")}
                         <div className="voice-controls">
@@ -1956,13 +1492,9 @@ function App() {
                                 <button type="button" className="secondary-button" disabled={busy || transcribing || voicePreparing} onClick={() => void startVoiceRecording()}>Записать голос</button>}
                             {voicePreparation === "microphone" && <>
                                 <span role="status">Ожидаем доступ к микрофону. Проверьте системный запрос разрешения.</span>
-                                <button type="button" className="secondary-button" onClick={() => {
-                                    permissionRequest.current++;
-                                    voicePending.current = false;
-                                    setVoicePreparation(null);
-                                }}>Отменить ожидание</button>
+                                <button type="button" className="secondary-button" onClick={cancelVoicePermission}>Отменить ожидание</button>
                             </>}
-                            {recording && <><span role="status">Идёт запись · {Math.floor(recordingSeconds / 60)}:{String(recordingSeconds % 60).padStart(2, "0")} / 10:00</span><button type="button" className="secondary-button" onClick={() => { cancelRecording.current = true; stopVoiceRecording(); }}>Отменить запись</button></>}
+                            {recording && <><span role="status">Идёт запись · {Math.floor(recordingSeconds / 60)}:{String(recordingSeconds % 60).padStart(2, "0")} / 10:00</span><button type="button" className="secondary-button" onClick={cancelVoiceRecording}>Отменить запись</button></>}
             {recordedAudio && <span>Запись: {recordedAudio.seconds.toFixed(1)} с · {(recordedAudio.base64.length * 0.75 / 1024).toFixed(0)} КБ</span>}
                         </div>
                         {transcriptionModels.length > 0 && <>
@@ -2059,9 +1591,8 @@ function App() {
                         {contextPreview.messages.map((part, index) => <pre
                             key={index}>{part.role} · {part.source_message_id ?? "новое сообщение или система"} · вложения: {part.attachment_ids.join(", ") || "нет"}{"\n"}{part.content}</pre>)}
                     </details>}
-                    <div className="composer-footer">
-                        <div className="composer-tools">
-                            <button ref={composerMenuButton} type="button" className="secondary-button" aria-label="Добавить вложение или открыть инструменты" aria-haspopup="menu" aria-expanded={composerToolsOpen} onClick={() => setComposerToolsOpen((open) => !open)}>+</button>
+                    </>}
+                    tools={<>
                             <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} source={modelSource} ollamaModels={ollamaModels} ollamaStatus={ollamaStatus} onRefreshOllama={() => void refreshOllamaCatalog()} disabled={busy}
                                          fetchedAt={catalog?.fetched_at ?? null} catalogFailed={errors.some((error) => error.area === "catalog")}
                                          onChange={(id, source) => { setModelSource(source); setModelId(id); if (source === "ollama" || id !== "gpt-oss-20b") setAgentMode(false); setContextPreview(null); }}/>
@@ -2083,74 +1614,24 @@ function App() {
                                     <p>{selectedCategory ? `Помечено вами: ${new Date(selectedCategory.updated_at * 1000).toLocaleString()}. ` : ""}Свойства модели не проверены.</p>
                                 </>}
                             </details>
-                        </div>
-                        <div className="actions">
-                            <button type="button" className="secondary-button" disabled={busy || dropLoading || !prompt.trim()}
-                                    onClick={() => void checkContext()}>Проверить контекст
-                            </button>
-                            {busy ? <button type="button" onClick={() => void stop()}>Остановить</button> : <button type="submit"
-                                    disabled={busy || dropLoading || !prompt.trim() || (modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}>Отправить
-                            </button>}
-                        </div>
-                    </div>
+                    </>}
+                    afterActions={<>
                     {operationErrors("send")}
                     {!settingsOpen && operationErrors("connection")}
                     <p className="send-warning">{modelSource === "ollama" ? "Локально · Ollama. Текст отправится на этот компьютер; изображения и агентный режим не поддерживаются." : modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
                     {hasImage && !imageModelSupported && <p role="alert">{modelSource === "ollama" ? "Изображения в Ollama пока не поддерживаются. Удалите изображение из запроса." : "Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение."}</p>}
                     {modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
 
-                </form>
+                    </>}/>
+
                 </div>
             </section>
             {imageView && <ImageGenerationView image={image} catalog={catalog} backRef={imageBack}
                 onBack={() => { setSelectedArtifactId(null); setView("chat"); requestAnimationFrame(() => promptField.current?.focus()); }}
                 onRefresh={() => void refreshModelCatalog()} errors={<>{operationErrors("image")}{operationErrors("connection", ["generateImage"])}{operationErrors("catalog")}</>}/>}
-            {tasksView && <section className="tasks-view" aria-label="Задачи">
-                <header className="chat-header"><button ref={tasksBack} type="button" className="secondary-button" onClick={() => { setSelectedArtifactId(null); setTasksView(false); requestAnimationFrame(() => promptField.current?.focus()); }}>К беседе</button><h1>Задачи</h1></header>
-                <div className="tasks-content">
-                {openedScheduledResult && <section className="scheduled-task-notice" role="region" aria-label="Результат агентной задачи" id="scheduled-task-result">
-                    <strong>Результат задачи: {openedScheduledResult.title}</strong>
-                    <p className="scheduled-result-content">{openedScheduledResult.content || "Ответ завершён без текста."}</p>
-                    <button type="button" className="secondary-button" onClick={() => setOpenedScheduledResult(null)}>Закрыть результат</button>
-                </section>}
-                {operationErrors("navigation")}
-                {scheduledTasks.filter((task) => task.status === "awaiting_confirmation").map((task) => <section className="scheduled-task-notice" role="status" id={`scheduled-task-${task.id}`} key={task.id}>
-                    <strong>По расписанию наступила задача: {task.title}</strong>
-                    <p>Автоматический запуск не выполнялся. После подтверждения текст попадёт в черновик; платный запрос потребует обычной проверки контекста и отдельного подтверждения.</p>
-                    <button type="button" disabled={busy} onClick={() => void prepareScheduledTask(task)}>Подтвердить и подготовить черновик</button>
-                    <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить расписание</button>
-                </section>)}
-                <div className="scheduled-task-panel">
-                    <h2>Результаты</h2>
-                    {!scheduledRuns.length && <p>Готовых результатов пока нет.</p>}
-                    {scheduledRuns.map((run) => <div className="scheduled-task-row" key={run.id}>
-                        <span>{run.title} · {new Date(run.due_at * 1000).toLocaleString()}</span>
-                        <button type="button" className="secondary-button" onClick={() => {
-                            const request = ++scheduledResultRequest.current;
-                            void invoke<ScheduledAgentResult>("get_scheduled_agent_result", {runId: run.id}).then((result) => { if (request === scheduledResultRequest.current) setOpenedScheduledResult(result); }).catch((reason) => { if (request === scheduledResultRequest.current) report("scheduledRuns", reason); });
-                        }}>Открыть результат</button>
-                    </div>)}
-                </div>
-                <div className="scheduled-task-panel">
-                    <h2>Новое расписание</h2>
-                    <p>Беседа: {selectedConversation?.title ?? "Текущая беседа"}</p>
-                    {operationErrors("schedule")}
-                    <p>Срок проверяется при запуске приложения и каждые 30 секунд, пока окно открыто. Уведомление ведёт к ожидающей задаче или готовому результату. Закрытое приложение не выполняет задачи. Отправка всегда остаётся ручной.</p>
-                    {scheduleNotificationsEnabled ?
-                        <button type="button" className="secondary-button" onClick={() => { localStorage.removeItem("scheduleNotifications"); setScheduleNotificationsEnabled(false); }}>Выключить уведомления</button> :
-                        <button type="button" className="secondary-button" onClick={() => void enableScheduleNotifications()}>Включить уведомления</button>}
-                    <label>Название<input value={scheduleTitle} maxLength={120} onChange={(event) => setScheduleTitle(event.target.value)}/></label>
-                    <label>Текст задачи<textarea value={schedulePrompt} maxLength={2000} rows={2} onChange={(event) => setSchedulePrompt(event.target.value)}/></label>
-                    <label>Повторять каждые, минут<input type="number" min={1} max={10080} value={scheduleInterval} onChange={(event) => setScheduleInterval(event.target.value)}/></label>
-                    <button type="button" className="secondary-button" disabled={!scheduleTitle.trim() || !schedulePrompt.trim() || !scheduleInterval}
-                            onClick={() => void createScheduledTask()}>Сохранить расписание</button>
-                    {scheduledTasks.map((task) => <div className="scheduled-task-row" key={task.id}>
-                        <span>{task.title} · {conversations.find((item) => item.id === task.conversation_id)?.title ?? "Беседа"} · каждые {task.interval_minutes} мин · {task.status === "active" ? `следующий срок ${new Date(task.next_run_at * 1000).toLocaleString()}` : task.status === "awaiting_confirmation" ? "ожидает подтверждения" : "остановлено"}</span>
-                        {task.status !== "stopped" && <button type="button" className="secondary-button" onClick={() => void stopScheduledTask(task.id)}>Остановить</button>}
-                    </div>)}
-                </div>
-                </div>
-            </section>}
+            {tasksView && <TasksView tasks={tasks.view} busy={busy} conversations={conversations} selectedConversation={selectedConversation}
+                backRef={tasksBack} onBack={() => { setSelectedArtifactId(null); setTasksView(false); requestAnimationFrame(() => promptField.current?.focus()); }}
+                onPrepare={prepareScheduledTask} navigationErrors={operationErrors("navigation")} scheduleErrors={operationErrors("schedule")}/>}
             {selectedArtifact && !tasksView && !imageView && <ArtifactPanel artifact={selectedArtifact} versions={history.artifacts}
                                                  onSelect={setSelectedArtifactId} onClose={closeArtifact}
                                                  onExport={(id) => void exportArtifact(id)} side={artifactSide} errorNotice={operationErrors("artifact")}/>}
