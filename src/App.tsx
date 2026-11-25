@@ -49,6 +49,10 @@ type ContextPreview = {
     agent_skill?: AgentSkill | null;
     warning: string
 };
+function formatExchangeCount(count: number) {
+    const plural = new Intl.PluralRules("ru").select(count);
+    return `${count} ${plural === "one" ? "обмен" : plural === "few" ? "обмена" : "обменов"}`;
+}
 type CapturedSnapshot = { mime: string; size: number; sha256: string; preview: string };
 type ModelCategory = { model_id: string; category: string; source: string; updated_at: number };
 type History = {
@@ -1592,7 +1596,7 @@ export default function App() {
                     <p className="composer-summary" role="status">
                         {contextPreview.model_source === "ollama" ? "Локально · Ollama" : contextPreview.model_id === "local-mock" ? "Тест · без сети" : "SimpleClaw · платный API"} · {contextPreview.model_id}
                         {pendingAttachments.length + selectedMaterialIds.length > 0 && ` · Вложений ${pendingAttachments.length + selectedMaterialIds.length}`}
-                        {contextPreview.omitted_exchanges > 0 && ` · История сокращена на ${contextPreview.omitted_exchanges} ${contextPreview.omitted_exchanges === 1 ? "обмен" : "обмена"}`}
+                        {contextPreview.omitted_exchanges > 0 && ` · История сокращена на ${formatExchangeCount(contextPreview.omitted_exchanges)}`}
                         {contextPreview.agent_skill && ` · Навык «${contextPreview.agent_skill.name}»`}
                         {contextPreview.model_source === "simpleclaw" && contextPreview.model_id !== "local-mock" && " · Точная стоимость неизвестна"}
                     </p>
