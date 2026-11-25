@@ -1,6 +1,6 @@
 import {useEffect, useLayoutEffect, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
-import {Channel, invoke} from "@tauri-apps/api/core";
+import {invoke} from "@tauri-apps/api/core";
 import {getCurrentWindow} from "@tauri-apps/api/window";
 import {getCurrentWebview} from "@tauri-apps/api/webview";
 import {listen} from "@tauri-apps/api/event";
@@ -14,7 +14,8 @@ import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project, type ProjectGroup} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
 import ModelPicker from "./ModelPicker";
-import {generationCommand, retryTarget} from "./modelSource";
+import {generationCommand} from "./modelSource";
+import {useChatGeneration} from "./features/chat/useChatGeneration";
 import {useNavigationLayout} from "./useNavigationLayout";
 import {useImageGeneration} from "./features/images/useImageGeneration";
 import {useVoiceInput} from "./features/voice/useVoiceInput";
@@ -62,9 +63,6 @@ type History = {
         server_request_id: string | null; usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
         error_code: string | null; http_status: number | null }[]
 };
-type StreamEvent =
-    | { event: "delta"; data: { attempt_id: number; seq: number; text: string } }
-    | { event: "end"; data: { attempt_id: number; status: string; error_code: string | null; request_id: string | null; http_status: number | null } };
 type Theme = "system" | "light" | "dark";
 type ProjectMaterial = { id: number; name: string; version: number; size: number; sha256: string };
 type ProjectFolderFile = { relative_path: string; size: number | null; blocked_reason: string | null };
@@ -125,8 +123,17 @@ function App() {
     const confirmationTrigger = useRef<HTMLElement | null>(null);
     const [composerSettingsOpen, setComposerSettingsOpen] = useState(false);
     const isMac = /Macintosh|Mac OS X/.test(navigator.userAgent);
-    const [busy, setBusy] = useState(false);
-    const [draft, setDraft] = useState("");
+    const [modelSource, setModelSource] = useState<"simpleclaw" | "ollama">("simpleclaw");
+    const currentModelSource = useRef(modelSource);
+    currentModelSource.current = modelSource;
+    const activeConversation = useRef(conversationId);
+    activeConversation.current = conversationId;
+    const {errors, report, clear} = useOperationErrors(conversationId);
+    const {busy, draft, setDraft, runGeneration, retry, stop} = useChatGeneration({
+        conversationId, activeConversation, currentModelSource, history, setPrompt,
+        clearContext: () => setContextPreview(null), reload: () => reload(),
+        refreshScheduledRuns: () => refreshScheduledRuns(), confirmAction, clear, report
+    });
     const historyRef = useRef<HTMLDivElement>(null);
     const historyAtBottom = useRef(true);
     const [showNewMessages, setShowNewMessages] = useState(false);
@@ -138,7 +145,6 @@ function App() {
         const element = historyRef.current;
         if (element && historyAtBottom.current) element.scrollTop = element.scrollHeight;
     }, [history, draft, busy, conversationId]);
-    const {errors, report, clear} = useOperationErrors(conversationId);
     const [backups, setBackups] = useState<string[]>([]);
     const [selectedBackup, setSelectedBackup] = useState("");
     const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
@@ -159,9 +165,6 @@ function App() {
     const [categories, setCategories] = useState<ModelCategory[]>([]);
 
     const [modelId, setModelId] = useState("local-mock");
-    const [modelSource, setModelSource] = useState<"simpleclaw" | "ollama">("simpleclaw");
-    const currentModelSource = useRef(modelSource);
-    currentModelSource.current = modelSource;
     const [ollamaModels, setOllamaModels] = useState<string[]>([]);
     const [ollamaStatus, setOllamaStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
     const ollamaRequest = useRef(0);
@@ -221,13 +224,10 @@ function App() {
     const chatSearchField = navigation.search;
     const artifactTrigger = useRef<HTMLElement | null>(null);
     const promptField = useRef<HTMLTextAreaElement>(null);
-    const activeConversation = useRef(conversationId);
-    activeConversation.current = conversationId;
     const currentModel = useRef(modelId);
     currentModel.current = modelId;
     const navigationRequest = useRef(0);
     const conversationGeneration = useRef(0);
-    const generationRequest = useRef(0);
     const catalogRequest = useRef(0);
     const historyRequest = useRef(0);
     const boardRequest = useRef(0);
@@ -860,65 +860,6 @@ function App() {
         } catch (reason) { report("deleteKey", reason); }
     }
 
-    async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string, retrySource?: "simpleclaw" | "ollama"): Promise<boolean> {
-        if (busy || (retrySource === undefined && (currentModelSource.current === "ollama") !== (command === "start_ollama_generation"))) return false;
-        const request = ++generationRequest.current;
-        setBusy(true);
-        clear("runGeneration");
-        setDraft("");
-        const channel = new Channel<StreamEvent>();
-        let lastSeq = 0;
-        let pending = "";
-        let frame = 0;
-        let ended = false;
-        channel.onmessage = (message) => {
-            if (ended || request !== generationRequest.current || conversationId !== activeConversation.current) return;
-            if (message.event === "delta") {
-                if (message.data.seq === lastSeq + 1) {
-                    lastSeq = message.data.seq;
-                    pending += message.data.text;
-                    if (!frame) frame = requestAnimationFrame(() => {
-                        if (request !== generationRequest.current || conversationId !== activeConversation.current) return;
-                        const chunk = pending;
-                        pending = "";
-                        setDraft((current) => current + chunk);
-                        frame = 0;
-                    });
-                } else if (message.data.seq > lastSeq + 1) {
-                    reload().catch((reason) => report("history", reason));
-                }
-            } else {
-                ended = true;
-                if (frame) cancelAnimationFrame(frame);
-                const tail = pending;
-                pending = "";
-                setDraft((current) => current + tail);
-                setBusy(false);
-                if (message.data.status === "failed" || message.data.status === "interrupted") {
-                    notify(command === "start_ollama_generation" || retrySource === "ollama" ? "Ответ Ollama не завершён. Полученный текст сохранён; проверьте сервер и модель." : "Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
-                }
-                void reload().then(() => {
-                    if (request === generationRequest.current && conversationId === activeConversation.current) setDraft("");
-                }).catch((reason) => report("history", reason));
-                refreshScheduledRuns().catch((reason) => report("scheduledRuns", reason));
-            }
-        };
-        try {
-            await invoke<number>(command, {conversationId, ...args, onEvent: channel});
-            if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
-            await reload();
-            return true;
-        } catch (reason) {
-            if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
-            if (frame) cancelAnimationFrame(frame);
-            setBusy(false);
-            if (restorePrompt !== undefined) setPrompt((current) => current || restorePrompt);
-            setContextPreview(null);
-            report("runGeneration", reason);
-            return false;
-        }
-    }
-
     function contextSignature() {
         return JSON.stringify([conversationId, prompt.trim(), pendingAttachments.map((attachment) => attachment.id), selectedMaterialIds, modelSource, modelId, history.active_leaf_id, agentMode, agentSkill?.material_id ?? null, agentSkill?.enabled ?? false, responseStyle, conversationProjectId]);
     }
@@ -1085,14 +1026,6 @@ function App() {
         }
     }
 
-    async function retry(assistantId: number) {
-        const attempt = history.attempts.find((item) => item.assistant_id === assistantId);
-        if (!attempt) return;
-        const target = retryTarget(attempt, history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source);
-        if (target.source === "simpleclaw" && target.model !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
-        await runGeneration(target.command, {assistantId, modelId: target.model}, undefined, target.source);
-    }
-
     async function selectBranch(messageId: number) {
         try {
             await invoke("select_branch", {conversationId, messageId});
@@ -1111,14 +1044,6 @@ function App() {
             clear("changeCategory");
         } catch (reason) {
             report("changeCategory", reason);
-        }
-    }
-
-    async function stop() {
-        try {
-            await invoke("stop_generation");
-        } catch (reason) {
-            report("stop", reason);
         }
     }
 
