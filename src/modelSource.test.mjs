@@ -1,6 +1,6 @@
 import {test} from "node:test";
 import assert from "node:assert/strict";
-import {generationCommand, retryTarget} from "./modelSource.ts";
+import {answerSource, generationCommand, retryTarget} from "./modelSource.ts";
 
 test("source keeps matching model names out of SimpleClaw for send and retry", () => {
     for (const model of ["same:latest", "local-mock", "gpt-oss-20b"]) {
@@ -18,4 +18,12 @@ test("retry target uses the saved source and model", () => {
     assert.deepEqual(retryTarget(saved, "ollama"), {source: "ollama", model: "same:latest", command: "retry_generation"});
     assert.deepEqual(retryTarget(saved, "simpleclaw"), {source: "simpleclaw", model: "same:latest", command: "retry_generation"});
     assert.deepEqual(retryTarget({model_id: null}, undefined), {source: "simpleclaw", model: "local-mock", command: "retry_mock_generation"});
+});
+
+test("answer details identify mock attempts independently of the stored cloud source", () => {
+    assert.equal(answerSource("local-mock", "simpleclaw"), "mock");
+    assert.equal(answerSource("local-mock", undefined), "mock");
+    assert.equal(answerSource("local-mock", "ollama"), "ollama");
+    assert.equal(answerSource("gpt-oss-20b", "simpleclaw"), "cloud");
+    assert.equal(answerSource(null, undefined), "unknown");
 });

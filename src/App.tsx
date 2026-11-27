@@ -13,7 +13,7 @@ import RenderBoundary from "./RenderBoundary";
 import ProjectSidebar, {type Conversation, type Project, type ProjectGroup} from "./ProjectSidebar";
 import ShellIcon from "./ShellIcon";
 import ModelPicker from "./ModelPicker";
-import {generationCommand} from "./modelSource";
+import {answerSource, generationCommand} from "./modelSource";
 import {useChatGeneration} from "./features/chat/useChatGeneration";
 import {useNavigationLayout} from "./useNavigationLayout";
 import {useImageGeneration} from "./features/images/useImageGeneration";
@@ -905,7 +905,6 @@ export default function App() {
             return;
         }
         if (currentModelSource.current !== modelSource || currentModel.current !== modelId || signature !== liveContextSignature.current) return;
-        setPrompt("");
         const ids = pendingAttachments.map((attachment) => attachment.id);
         const inputSource = boardInputSource?.text === value ? boardInputSource : null;
         if (await runGeneration(generationCommand(modelSource, modelId, false)!, {confirmationId: contextPreview.confirmation_id, prompt: value, attachmentIds: ids, projectMaterialIds: selectedMaterialIds, modelId, agentMode, scheduledRunId: scheduledDraft?.prompt === value ? scheduledDraft.run_id : null}, value)) {
@@ -1331,7 +1330,8 @@ export default function App() {
                     {visible.map((message) => {
                         const attempt = history.attempts.find((item) => item.assistant_id === message.id);
                         const context = history.contexts.find((item) => item.assistant_id === message.id)?.context;
-                        const localAttempt = context?.model_source === "ollama" || attempt?.model_id === "local-mock";
+                        const source = answerSource(attempt?.model_id ?? context?.model_id, context?.model_source);
+                        const localAttempt = source === "ollama" || source === "mock";
                         return (
                         <article className={`message message-${message.role}`} key={message.id}>
                             <strong>{message.role === "user" ? "Вы" : "Ответ"}</strong>
@@ -1352,7 +1352,7 @@ export default function App() {
                             </small>}
                             {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed" || message.status === "stopped") && <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
                                     code={attempt?.error_code ?? null} httpStatus={attempt?.http_status ?? null} requestId={attempt?.server_request_id ?? null}
-                                    source={context?.model_source === "ollama" ? "ollama" : attempt?.model_id === "local-mock" ? "mock" : context?.model_source === "simpleclaw" ? "cloud" : "unknown"}
+                                    source={source}
                                     ollamaStatus={ollamaStatus} onConnection={() => setSettingsOpen(true)} onOllama={() => void refreshOllamaCatalog()}/>}
                             {retryError?.assistantId === message.id && retryError.error.conversation === conversationId && <OperationNotice error={retryError.error}>
                                 {retryError.error.area === "connection" && <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button>}
@@ -1378,7 +1378,7 @@ export default function App() {
                                                 onClick={(event) => { artifactTrigger.current = event.currentTarget; setSelectedArtifactId(artifact.id); }}>Artifact #{artifact.id} · {artifact.title}</button>)}
                                     <details className="answer-details">
                                         <summary>Детали ответа</summary>
-                                        <p>Источник: {context?.model_source === "ollama" ? "Локально · Ollama" : context?.model_source === "simpleclaw" ? "SimpleClaw · платный API" : attempt?.model_id === "local-mock" ? "Тест · без сети" : "Источник неизвестен"}</p>
+                                        <p>Источник: {source === "ollama" ? "Локально · Ollama" : source === "mock" ? "Тест · без сети" : source === "cloud" ? "SimpleClaw · платный API" : "Источник неизвестен"}</p>
                                         <p>Модель: {attempt?.model_id ?? context?.model_id ?? "неизвестна"}</p>
                                         <p>Статус суммы: {localAttempt ? "не применяется" : attempt?.usage ? "usage получен; сумма не подтверждена" : context?.model_source === "simpleclaw" ? "списание неизвестно" : "неизвестен"}</p>
                                         <p>HTTP: {attempt?.http_status ?? "неизвестен"}</p>
