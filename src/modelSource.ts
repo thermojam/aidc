@@ -1,5 +1,11 @@
 export type ModelSource = "simpleclaw" | "ollama";
 
+export function answerSource(modelId: string | null | undefined, savedSource: ModelSource | undefined) {
+    if (savedSource === "ollama") return "ollama";
+    if (modelId === "local-mock") return "mock";
+    return savedSource === "simpleclaw" ? "cloud" : "unknown";
+}
+
 export function generationCommand(source: ModelSource, modelId: string, retry: boolean): string | null {
     if (source === "ollama") return retry ? "retry_generation" : "start_ollama_generation";
     if (modelId === "local-mock") return retry ? "retry_mock_generation" : "start_mock_generation";

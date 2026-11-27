@@ -63,5 +63,20 @@ async function run() {
     await act(async () => { channels[2].onmessage(delta(3, 1, "wrong conversation")); channels[2].onmessage(end(3)); });
     check(!document.body.textContent?.includes("wrong conversation"), "event changed another conversation");
     await act(async () => root.unmount());
+    calls.length = 0;
+    channels.length = 0;
+    const duplicateRoot = createRoot(document.getElementById("root")!);
+    await act(async () => duplicateRoot.render(<Harness/>));
+    await act(async () => {
+        const send = generation.runGeneration;
+        await Promise.all([send("start_ollama_generation", {}), send("start_ollama_generation", {})]);
+    });
+    check(Number(calls.length) === 1, "two sends before the next render reached IPC");
+    await act(async () => { channels[0].onmessage(delta(1, 1, "accepted")); frame(0); });
+    check(String(generation.draft) === "accepted", "duplicate send replaced the active stream");
+    await act(async () => { channels[0].onmessage(end(1)); });
+    await act(async () => { await generation.runGeneration("start_ollama_generation", {}); });
+    check(Number(calls.length) === 2, "completed attempt blocked the next send");
+    await act(async () => duplicateRoot.unmount());
 }
 run().then(() => { document.getElementById("result")!.textContent = "PASS"; }, (error) => { document.getElementById("result")!.textContent = `FAIL: ${String(error)}`; });

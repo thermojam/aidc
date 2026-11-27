@@ -27,10 +27,13 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
     const [streamAnnouncement, setStreamAnnouncement] = useState("");
     const [retryError, setRetryError] = useState<{assistantId: number; error: OperationError} | null>(null);
     const generationRequest = useRef(0);
+    const generationActive = useRef(false);
 
     async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string, retrySource?: "simpleclaw" | "ollama"): Promise<boolean> {
-        if (busy || (retrySource === undefined && (currentModelSource.current === "ollama") !== (command === "start_ollama_generation"))) return false;
+        if (generationActive.current || (retrySource === undefined && (currentModelSource.current === "ollama") !== (command === "start_ollama_generation"))) return false;
+        generationActive.current = true;
         const request = ++generationRequest.current;
+        if (restorePrompt !== undefined) setPrompt("");
         setBusy(true);
         clear("runGeneration");
         setDraft("");
@@ -41,8 +44,9 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
         let frame = 0;
         let ended = false;
         channel.onmessage = (message) => {
-            if (ended || request !== generationRequest.current || conversationId !== activeConversation.current) return;
+            if (ended || request !== generationRequest.current) return;
             if (message.event === "delta") {
+                if (conversationId !== activeConversation.current) return;
                 if (message.data.seq === lastSeq + 1) {
                     lastSeq = message.data.seq;
                     pending += message.data.text;
@@ -59,10 +63,12 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
             } else {
                 ended = true;
                 if (frame) cancelAnimationFrame(frame);
+                generationActive.current = false;
+                setBusy(false);
+                if (conversationId !== activeConversation.current) return;
                 const tail = pending;
                 pending = "";
                 setDraft((current) => current + tail);
-                setBusy(false);
                 if (["failed", "interrupted", "stopped"].includes(message.data.status)) setStreamAnnouncement(message.data.status === "stopped" ? "Ответ остановлен. Частичный текст сохранён." : "Ответ прерван. Частичный текст сохранён; подробности у ответа.");
                 void reload().then(() => {
                     if (request === generationRequest.current && conversationId === activeConversation.current) setDraft("");
@@ -76,9 +82,11 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
             await reload().catch((reason) => report("history", reason));
             return true;
         } catch (reason) {
-            if (request !== generationRequest.current || conversationId !== activeConversation.current) return false;
+            if (request !== generationRequest.current) return false;
             if (frame) cancelAnimationFrame(frame);
+            generationActive.current = false;
             setBusy(false);
+            if (conversationId !== activeConversation.current) return false;
             if (restorePrompt !== undefined) setPrompt((current) => current || restorePrompt);
             clearContext();
             if (retrySource !== undefined && typeof args.assistantId === "number") {
