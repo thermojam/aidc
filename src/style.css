@@ -916,6 +916,11 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-
     outline-offset: 2px;
 }
 
+summary:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: -2px;
+}
+
 [role="alert"] {
     margin: 0;
     color: var(--alert);
