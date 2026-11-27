@@ -587,10 +587,11 @@ input::placeholder, textarea::placeholder {
     flex-wrap: wrap;
 }
 
-.send-warning {
+.composer-summary, .composer-route {
     margin: 0;
     color: var(--muted);
     font-size: 12px;
+    overflow-wrap: anywhere;
 }
 
 .composer-tools, .actions, .settings-actions {
@@ -913,6 +914,11 @@ button:disabled {
 button:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-visible {
     outline: 2px solid var(--focus);
     outline-offset: 2px;
+}
+
+summary:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: -2px;
 }
 
 [role="alert"] {

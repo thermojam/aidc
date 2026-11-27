@@ -49,6 +49,10 @@ type ContextPreview = {
     agent_skill?: AgentSkill | null;
     warning: string
 };
+function formatExchangeCount(count: number) {
+    const plural = new Intl.PluralRules("ru").select(count);
+    return `${count} ${plural === "one" ? "обмен" : plural === "few" ? "обмена" : "обменов"}`;
+}
 type CapturedSnapshot = { mime: string; size: number; sha256: string; preview: string };
 type ModelCategory = { model_id: string; category: string; source: string; updated_at: number };
 type History = {
@@ -127,7 +131,7 @@ export default function App() {
     const activeConversation = useRef(conversationId);
     activeConversation.current = conversationId;
     const {errors, report, clear} = useOperationErrors(conversationId);
-    const {busy, draft, setDraft, runGeneration, retry, stop} = useChatGeneration({
+    const {busy, draft, setDraft, runGeneration, retry, retryError, streamAnnouncement, stop} = useChatGeneration({
         conversationId, activeConversation, currentModelSource, history, setPrompt,
         clearContext: () => setContextPreview(null), reload: () => reload(),
         refreshScheduledRuns: () => refreshScheduledRuns(), confirmAction, clear, report
@@ -189,6 +193,8 @@ export default function App() {
     const [key, setKey] = useState("");
     const [keySaved, setKeySaved] = useState(false);
     const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
+    const [contextChecking, setContextChecking] = useState(false);
+    const contextCheckingRef = useRef(false);
     const [previewSignature, setPreviewSignature] = useState("");
     const [selectedArtifactId, setSelectedArtifactId] = useState<number | null>(null);
     const [settingsOpen, setSettingsOpen] = useState(false);
@@ -865,7 +871,6 @@ export default function App() {
     async function submitPrompt() {
         if (busy || dropBusy.current || !prompt.trim()) return;
         if (!contextPreview?.confirmation_id || previewSignature !== contextSignature()) {
-            notify("Проверьте состав запроса. Для отправки нажмите Enter ещё раз или «Отправить».", "composer-check", 6000);
             await checkContext();
             return;
         }
@@ -1049,7 +1054,9 @@ export default function App() {
     liveContextSignature.current = contextSignature();
 
     async function checkContext() {
-        if (dropBusy.current) return;
+        if (dropBusy.current || contextCheckingRef.current || busy) return;
+        contextCheckingRef.current = true;
+        setContextChecking(true);
         const request = ++contextRequest.current;
         const signature = contextSignature();
         setContextPreview(null);
@@ -1065,6 +1072,9 @@ export default function App() {
             if (request !== contextRequest.current || signature !== liveContextSignature.current) return;
             setContextPreview(null);
             report("checkContext", reason);
+        } finally {
+            contextCheckingRef.current = false;
+            setContextChecking(false);
         }
     }
 
@@ -1318,7 +1328,11 @@ export default function App() {
                             <p>Выберите модель и напишите сообщение. История хранится на этом компьютере.</p>
                         </div>
                     )}
-                    {visible.map((message) => (
+                    {visible.map((message) => {
+                        const attempt = history.attempts.find((item) => item.assistant_id === message.id);
+                        const context = history.contexts.find((item) => item.assistant_id === message.id)?.context;
+                        const localAttempt = context?.model_source === "ollama" || attempt?.model_id === "local-mock";
+                        return (
                         <article className={`message message-${message.role}`} key={message.id}>
                             <strong>{message.role === "user" ? "Вы" : "Ответ"}</strong>
                             {message.role === "assistant" && message.status === "completed" ?
@@ -1332,23 +1346,18 @@ export default function App() {
                             {message.role !== "assistant" && message.status !== "completed" &&
                                 <small>{statusLabel[message.status] ?? message.status}</small>}
                             {message.role === "assistant" && <small>
-                                Модель: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id ?? "локальный тест"}
-                                {history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source === "ollama" ? " · Локально · Ollama" : ""}
+                                Модель: {attempt?.model_id ?? context?.model_id ?? "неизвестна"}
+                                {context?.model_source === "ollama" ? " · Локально · Ollama" : ""}
                                 {message.status === "completed" ? " · Завершено" : ` · ${statusLabel[message.status] ?? message.status}`}
-                                {history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source !== "ollama" && history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id !== "local-mock" &&
-                                    history.attempts.find((attempt) => attempt.assistant_id === message.id)?.model_id &&
-                                    (history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage ? " · Сумма не подтверждена" : " · Usage и сумма неизвестны")}
                             </small>}
-                            {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed") && (() => {
-                                const attempt = history.attempts.find((item) => item.assistant_id === message.id);
-                                const local = history.contexts.find((item) => item.assistant_id === message.id)?.context.model_source === "ollama";
-                                if (local) return <p role="alert">{attempt?.error_code === "OLLAMA_UNAVAILABLE" ? "Ollama недоступна. Запустите Ollama и проверьте модель. Частичный текст сохранён." : message.status === "interrupted" ? "Ответ Ollama прерван. Частичный текст сохранён." : "Ошибка Ollama. Проверьте, что сервер запущен и модель установлена. Частичный текст сохранён."}</p>;
-                                return <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
+                            {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed" || message.status === "stopped") && <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
                                     code={attempt?.error_code ?? null} httpStatus={attempt?.http_status ?? null} requestId={attempt?.server_request_id ?? null}
-                                    onConnection={() => setSettingsOpen(true)}/>;
-                            })()}
+                                    source={context?.model_source === "ollama" ? "ollama" : attempt?.model_id === "local-mock" ? "mock" : context?.model_source === "simpleclaw" ? "cloud" : "unknown"}
+                                    ollamaStatus={ollamaStatus} onConnection={() => setSettingsOpen(true)} onOllama={() => void refreshOllamaCatalog()}/>}
+                            {retryError?.assistantId === message.id && retryError.error.conversation === conversationId && <OperationNotice error={retryError.error}>
+                                {retryError.error.area === "connection" && <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button>}
+                            </OperationNotice>}
                             {message.role === "assistant" && (() => {
-                                const context = history.contexts.find((item) => item.assistant_id === message.id)?.context;
                                 const sources = context?.agent_sources ?? [];
                                 const filesRead = context?.agent_files_read ?? [];
                                 return filesRead.length > 0 && <details className="agent-sources">
@@ -1369,16 +1378,24 @@ export default function App() {
                                                 onClick={(event) => { artifactTrigger.current = event.currentTarget; setSelectedArtifactId(artifact.id); }}>Artifact #{artifact.id} · {artifact.title}</button>)}
                                     <details className="answer-details">
                                         <summary>Детали ответа</summary>
-                                        <p>HTTP: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.http_status ?? "неизвестен"}</p>
-                                        <p>Код ошибки: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.error_code ?? "нет"}</p>
-                                        <p>Request ID: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.server_request_id ?? "неизвестен"}</p>
-                                        <p>Response ID: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.server_response_id ?? "неизвестен"}</p>
-                                        <p>Usage сервера: {history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage ? JSON.stringify(history.attempts.find((attempt) => attempt.assistant_id === message.id)?.usage) : "неизвестен"}</p>
-                                        {history.contexts.find((item) => item.assistant_id === message.id) && <details>
+                                        <p>Источник: {context?.model_source === "ollama" ? "Локально · Ollama" : context?.model_source === "simpleclaw" ? "SimpleClaw · платный API" : attempt?.model_id === "local-mock" ? "Тест · без сети" : "Источник неизвестен"}</p>
+                                        <p>Модель: {attempt?.model_id ?? context?.model_id ?? "неизвестна"}</p>
+                                        <p>Статус суммы: {localAttempt ? "не применяется" : attempt?.usage ? "usage получен; сумма не подтверждена" : context?.model_source === "simpleclaw" ? "списание неизвестно" : "неизвестен"}</p>
+                                        <p>HTTP: {attempt?.http_status ?? "неизвестен"}</p>
+                                        <p>Код ошибки: {attempt?.error_code ?? (message.status === "completed" ? "нет" : "неизвестен")}</p>
+                                        <p>Request ID: {attempt?.server_request_id ?? "неизвестен"}</p>
+                                        <p>Response ID: {attempt?.server_response_id ?? "неизвестен"}</p>
+                                        <p>Usage сервера: {attempt?.usage ? [
+                                            ["Входные токены", attempt.usage.prompt_tokens],
+                                            ["Выходные токены", attempt.usage.completion_tokens],
+                                            ["Всего токенов", attempt.usage.total_tokens],
+                                        ].filter(([, value]) => value !== undefined).map(([label, value]) => `${label}: ${value}`).join(" · ") || "частичные данные" : "неизвестен"}</p>
+                                        {!context && <p>Отправленный контекст: неизвестен</p>}
+                                        {context && <details>
                                             <summary>Отправленный контекст</summary>
-                                            {history.contexts.find((item) => item.assistant_id === message.id)?.context.messages.map((part, index) =>
+                                            {context.messages.map((part, index) =>
                                                 <pre
-                                                    key={index}>{part.role} · {part.source_message_id ?? "система"}{"\n"}{part.content}</pre>)}
+                                                    key={index}>{part.role} · {part.source_message_id ?? (part.role === "system" ? "система" : "новое сообщение")}{part.attachment_ids.length ? ` · файлы ${part.attachment_ids.join(", ")}` : ""}{"\n"}{part.content}</pre>)}
                                         </details>}
                                         {history.messages.filter((candidate) => candidate.role === "assistant" && follows(candidate, message.id)).length > 0 && <details>
                                             <summary>Продолжения этой ветки</summary>
@@ -1400,7 +1417,7 @@ export default function App() {
                                 </div>
                             )}
                         </article>
-                    ))}
+                    ); })}
                 <details className="agent-board-panel">
                     <summary>План и очередь этой беседы</summary>
                     {operationErrors("agent", ["agentBoard", "addPlanStep", "completePlanStep", "addBoardInput"])}
@@ -1454,6 +1471,7 @@ export default function App() {
                     setShowNewMessages(false);
                 }}>К новым сообщениям</button>}
                 </div>
+                <span className="sr-only" role="status">{streamAnnouncement}</span>
                 <MessageComposer prompt={prompt} promptField={promptField} busy={busy} dropLoading={dropLoading}
                     conversationProjectId={conversationProjectId} materialsAvailable={materialListProject.current === conversationProjectId}
                     projectMaterials={projectMaterials} pendingAttachments={pendingAttachments} selectedMaterialIds={selectedMaterialIds}
@@ -1463,8 +1481,9 @@ export default function App() {
                     onSlashCommand={runSlashCommand} pickAttachment={pickAttachment} pickImageAttachment={pickImageAttachment}
                     openVoice={() => setVoiceOpen(true)} openSettings={() => setComposerSettingsOpen(true)}
                     choosingWindow={choosingWindow} hasSnapshot={!!capturedSnapshot} isMac={isMac} captureWindowSnapshot={captureWindowSnapshot}
-                    submitPrompt={submitPrompt} checkContext={checkContext} stop={stop}
-                    sendDisabled={busy || dropLoading || !prompt.trim() || (modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported) || !contextPreview?.confirmation_id || previewSignature !== contextSignature()}
+                    submitPrompt={submitPrompt} stop={stop} contextChecking={contextChecking}
+                    contextReady={!!contextPreview?.confirmation_id && previewSignature === contextSignature()}
+                    actionDisabled={contextChecking || dropLoading || !prompt.trim() || (!!contextPreview?.confirmation_id && previewSignature === contextSignature() && ((modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved) || (hasImage && !imageModelSupported)))}
                     beforeInput={<>
                     {operationErrors("attachment")}
                     {dropResults.length > 0 && <div className="file-drop-results" aria-live="polite">{dropResults.map((item, index) => <div key={index}>{item.name}: {item.status}</div>)}</div>}
@@ -1581,14 +1600,23 @@ export default function App() {
                     </div>; })}
                     {selectedMaterialIds.length > 0 && <button type="button" onClick={() => void openMaterials()}>Просмотреть выбранные версии</button>}
                     </section>}
-                    {contextPreview && <details open className="context-preview">
-                        <summary>Состав запроса · {contextPreview.model_source === "ollama" ? "Локально · Ollama" : "SimpleClaw / тест"} · {contextPreview.model_id} · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых
-                            обменов: {contextPreview.omitted_exchanges}</summary>
+                    {contextPreview && previewSignature === contextSignature() && <>
+                    <p className="composer-summary" role="status">
+                        {contextPreview.model_source === "ollama" ? "Локально · Ollama" : contextPreview.model_id === "local-mock" ? "Тест · без сети" : "SimpleClaw · платный API"} · {contextPreview.model_id}
+                        {pendingAttachments.length + selectedMaterialIds.length > 0 && ` · Вложений ${pendingAttachments.length + selectedMaterialIds.length}`}
+                        {contextPreview.omitted_exchanges > 0 && ` · История сокращена на ${formatExchangeCount(contextPreview.omitted_exchanges)}`}
+                        {contextPreview.agent_skill && ` · Навык «${contextPreview.agent_skill.name}»`}
+                        {contextPreview.model_source === "simpleclaw" && contextPreview.model_id !== "local-mock" && " · Точная стоимость неизвестна"}
+                    </p>
+                    <details className="context-preview">
+                        <summary>Состав запроса</summary>
+                        <p>{contextPreview.model_id} · стиль: {{concise: "кратко", balanced: "сбалансированно", detailed: "подробно"}[contextPreview.response_style]} · текст {contextPreview.bytes} Б · запрос {contextPreview.request_bytes} Б · пропущено завершённых обменов: {contextPreview.omitted_exchanges}</p>
                         <p>{contextPreview.warning}</p>
                         {contextPreview.agent_skill && <p>В этом снимке включён навык «{contextPreview.agent_skill.name}», версия {contextPreview.agent_skill.version}, SHA-256 {contextPreview.agent_skill.sha256}. Текст инструкции показан ниже в составе сообщений.</p>}
                         {contextPreview.messages.map((part, index) => <pre
                             key={index}>{part.role} · {part.source_message_id ?? "новое сообщение или система"} · вложения: {part.attachment_ids.join(", ") || "нет"}{"\n"}{part.content}</pre>)}
-                    </details>}
+                    </details>
+                    </>}
                     </>}
                     tools={<>
                             <ModelPicker models={catalog?.models ?? []} categories={categories} value={modelId} source={modelSource} ollamaModels={ollamaModels} ollamaStatus={ollamaStatus} onRefreshOllama={() => void refreshOllamaCatalog()} disabled={busy}
@@ -1616,7 +1644,7 @@ export default function App() {
                     afterActions={<>
                     {operationErrors("send")}
                     {!settingsOpen && operationErrors("connection")}
-                    <p className="send-warning">{modelSource === "ollama" ? "Локально · Ollama. Текст отправится на этот компьютер; изображения и агентный режим не поддерживаются." : modelId === "local-mock" ? "Локальный тест · без сети" : "Перед отправкой: контекстное окно и токенизатор неизвестны; размер в байтах не подтверждает, что запрос поместится. Запрос в SimpleClaw может стоить денег, а расход при обрыве неизвестен."}</p>
+                    {(!contextPreview || previewSignature !== contextSignature()) && <p className="composer-route">{modelSource === "ollama" ? "Локально · Ollama" : modelId === "local-mock" ? "Тест · без сети" : "SimpleClaw · платный API"} · {modelId}</p>}
                     {hasImage && !imageModelSupported && <p role="alert">{modelSource === "ollama" ? "Изображения в Ollama пока не поддерживаются. Удалите изображение из запроса." : "Изображения поддерживаются только для gpt-6-luna по документации SimpleClaw. Выберите эту модель или удалите изображение."}</p>}
                     {modelSource === "simpleclaw" && modelId !== "local-mock" && !keySaved && <p role="alert">Подключите API-ключ. <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button></p>}
 
