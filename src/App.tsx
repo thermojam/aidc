@@ -131,7 +131,7 @@ export default function App() {
     const activeConversation = useRef(conversationId);
     activeConversation.current = conversationId;
     const {errors, report, clear} = useOperationErrors(conversationId);
-    const {busy, draft, setDraft, runGeneration, retry, stop} = useChatGeneration({
+    const {busy, draft, setDraft, runGeneration, retry, retryError, streamAnnouncement, stop} = useChatGeneration({
         conversationId, activeConversation, currentModelSource, history, setPrompt,
         clearContext: () => setContextPreview(null), reload: () => reload(),
         refreshScheduledRuns: () => refreshScheduledRuns(), confirmAction, clear, report
@@ -1350,12 +1350,13 @@ export default function App() {
                                 {context?.model_source === "ollama" ? " · Локально · Ollama" : ""}
                                 {message.status === "completed" ? " · Завершено" : ` · ${statusLabel[message.status] ?? message.status}`}
                             </small>}
-                            {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed") && (() => {
-                                if (localAttempt) return <p role="alert">{attempt?.error_code === "OLLAMA_UNAVAILABLE" ? "Ollama недоступна. Запустите Ollama и проверьте модель. Частичный текст сохранён." : message.status === "interrupted" ? "Ответ Ollama прерван. Частичный текст сохранён." : "Ошибка Ollama. Проверьте, что сервер запущен и модель установлена. Частичный текст сохранён."}</p>;
-                                return <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
+                            {message.role === "assistant" && (message.status === "interrupted" || message.status === "failed" || message.status === "stopped") && <AnswerFailure key={`${message.id}:${message.status}`} assistantId={message.id} status={message.status}
                                     code={attempt?.error_code ?? null} httpStatus={attempt?.http_status ?? null} requestId={attempt?.server_request_id ?? null}
-                                    onConnection={() => setSettingsOpen(true)}/>;
-                            })()}
+                                    source={context?.model_source === "ollama" ? "ollama" : attempt?.model_id === "local-mock" ? "mock" : context?.model_source === "simpleclaw" ? "cloud" : "unknown"}
+                                    ollamaStatus={ollamaStatus} onConnection={() => setSettingsOpen(true)} onOllama={() => void refreshOllamaCatalog()}/>}
+                            {retryError?.assistantId === message.id && retryError.error.conversation === conversationId && <OperationNotice error={retryError.error}>
+                                {retryError.error.area === "connection" && <Button type="button" onClick={() => setSettingsOpen(true)}>Настройки подключения</Button>}
+                            </OperationNotice>}
                             {message.role === "assistant" && (() => {
                                 const sources = context?.agent_sources ?? [];
                                 const filesRead = context?.agent_files_read ?? [];
@@ -1470,6 +1471,7 @@ export default function App() {
                     setShowNewMessages(false);
                 }}>К новым сообщениям</button>}
                 </div>
+                <span className="sr-only" role="status">{streamAnnouncement}</span>
                 <MessageComposer prompt={prompt} promptField={promptField} busy={busy} dropLoading={dropLoading}
                     conversationProjectId={conversationProjectId} materialsAvailable={materialListProject.current === conversationProjectId}
                     projectMaterials={projectMaterials} pendingAttachments={pendingAttachments} selectedMaterialIds={selectedMaterialIds}

@@ -98,7 +98,7 @@ export type OperationError = {
 // Never retain the original exception: native errors can contain file paths or request data.
 export function safeDiagnostic(operation: string, reason: unknown, metadata?: {code: string | null; httpStatus: number | null; requestId: string | null}) {
     const text = typeof reason === "string" ? reason : "";
-    const knownCodes = ["UPSTREAM_USAGE_UNCERTAIN", "RUBLE_LIMIT", "TOKEN_LIMIT", "UNAUTHORIZED", "INVALID_API_KEY", "HTTP_ERROR", "STREAM_INTERRUPTED", "NETWORK_ERROR", "PRICE_CHANGED", "IMAGE_PRICE_CHANGED", "AUDIO_PRICE_CHANGED", "SERVER_ERROR", "NETWORK_RESULT_UNKNOWN", "STREAM_IDLE_TIMEOUT", "INVALID_SSE", "RESPONSE_TOO_LARGE", "DATABASE_ERROR", "MODEL_SNAPSHOT_MISMATCH", "TOOL_LOOP_LIMIT", "INVALID_TOOL_CALL", "UNKNOWN_TOOL", "RUBLE_RATE_LIMIT", "TOKEN_RATE_LIMIT"];
+    const knownCodes = ["OLLAMA_UNAVAILABLE", "OLLAMA_MODEL_UNAVAILABLE", "UPSTREAM_USAGE_UNCERTAIN", "RUBLE_LIMIT", "TOKEN_LIMIT", "UNAUTHORIZED", "INVALID_API_KEY", "HTTP_ERROR", "STREAM_INTERRUPTED", "NETWORK_ERROR", "PRICE_CHANGED", "IMAGE_PRICE_CHANGED", "AUDIO_PRICE_CHANGED", "SERVER_ERROR", "NETWORK_RESULT_UNKNOWN", "STREAM_IDLE_TIMEOUT", "INVALID_SSE", "RESPONSE_TOO_LARGE", "DATABASE_ERROR", "MODEL_SNAPSHOT_MISMATCH", "TOOL_LOOP_LIMIT", "INVALID_TOOL_CALL", "UNKNOWN_TOOL", "RUBLE_RATE_LIMIT", "TOKEN_RATE_LIMIT"];
     const microphoneCodes: Record<string, string> = {
         NotAllowedError: "MICROPHONE_PERMISSION_DENIED", SecurityError: "MICROPHONE_PERMISSION_DENIED",
         NotFoundError: "MICROPHONE_NOT_FOUND", NotReadableError: "MICROPHONE_UNAVAILABLE",
@@ -140,7 +140,7 @@ export function useOperationErrors(conversation: number) {
         const id = identity(operation);
         const error: OperationError = {...diagnostic, id, area, conversation: definition.global ? null : conversation, message};
         setErrors((current) => ({...current, [id]: error}));
-        if (operation !== "stop" && (definition.global || conversation === activeConversation.current)) notify(message, id, area === "catalog" || area === "schedule" ? 8000 : Infinity);
+        if (!["stop", "runGeneration", "send", "checkContext"].includes(operation) && (definition.global || conversation === activeConversation.current)) notify(message, id, area === "catalog" || area === "schedule" ? 8000 : Infinity);
     }
     function clear(operation: string, success?: string) {
         const id = identity(operation);
@@ -155,18 +155,18 @@ export function useOperationErrors(conversation: number) {
     return {errors: Object.values(errors).filter((error) => error.conversation === null || error.conversation === conversation), report, clear};
 }
 
-export function OperationNotice({error, children}: {error: OperationError; children?: React.ReactNode}) {
+export function OperationNotice({error, children, announce = true, saved = false}: {error: OperationError; children?: React.ReactNode; announce?: boolean; saved?: boolean}) {
     const [open, setOpen] = useState(false);
     const [copyStatus, setCopyStatus] = useState("");
     const detailsButton = useRef<HTMLButtonElement>(null);
     // Only these explicitly selected fields are copied; no raw exception or state dump.
-    const diagnostic = {time: error.time, operation: error.operation, code: error.code, httpStatus: error.httpStatus, requestId: error.requestId, message: error.message};
+    const diagnostic = {time: saved ? null : error.time, operation: error.operation, code: error.code, httpStatus: error.httpStatus, requestId: error.requestId, message: error.message};
     async function copy() {
         try { await navigator.clipboard.writeText(JSON.stringify(diagnostic, null, 2)); setCopyStatus("Скопировано"); }
         catch { setCopyStatus("Не удалось скопировать. Выделите подробности вручную."); }
     }
     return <div className="operation-error" data-operation={error.id}>
-        <p role={error.area === "catalog" || error.area === "schedule" ? "status" : "alert"}>{error.message}</p>
+        <p role={announce ? error.area === "catalog" || error.area === "schedule" ? "status" : "alert" : undefined}>{error.message}</p>
         {children}
         <Button ref={detailsButton} type="button" onClick={() => { setCopyStatus(""); setOpen(true); }}>Технические подробности</Button>
         <Dialog open={open} onOpenChange={setOpen}>
@@ -175,7 +175,7 @@ export function OperationNotice({error, children}: {error: OperationError; child
                 detailsButton.current?.focus();
             }}>
                 <DialogTitle>Подробности операции</DialogTitle>
-                <dl><dt>Время обнаружения</dt><dd>{error.time}</dd><dt>Операция</dt><dd>{error.operation}</dd>
+                <dl>{!saved && <><dt>Время обнаружения</dt><dd>{error.time}</dd></>}<dt>Операция</dt><dd>{error.operation}</dd>
                     <dt>Код</dt><dd>{error.code}</dd><dt>HTTP</dt><dd>{error.httpStatus ?? "неизвестен"}</dd>
                     <dt>Request ID</dt><dd>{error.requestId ?? "неизвестен"}</dd></dl>
                 <p>{error.message}</p>
@@ -226,12 +226,14 @@ export function OperationToaster() {
                     closeButton containerAriaLabel="Уведомления" toastOptions={{className: "operation-toast"}}/>;
 }
 
-export function AnswerFailure({status, code, httpStatus, requestId, assistantId, onConnection}: {
-    status: string; code: string | null; httpStatus: number | null; requestId: string | null; assistantId: number; onConnection: () => void;
+export function AnswerFailure({status, code, httpStatus, requestId, assistantId, source, ollamaStatus, onConnection, onOllama}: {
+    status: string; code: string | null; httpStatus: number | null; requestId: string | null; assistantId: number; source: "ollama" | "mock" | "cloud" | "unknown"; ollamaStatus: "idle" | "loading" | "ready" | "error"; onConnection: () => void; onOllama: () => void;
 }) {
-    const [diagnostic] = useState(() => safeDiagnostic(`Ответ #${assistantId}`, "", {code, httpStatus, requestId}));
+    const [checkingOllama, setCheckingOllama] = useState(false);
+    const diagnostic = safeDiagnostic(`Ответ #${assistantId}`, "", {code, httpStatus, requestId});
     const error: OperationError = {...diagnostic, id: `answer:${assistantId}`, area: "send", conversation: null,
-        message: status === "interrupted" ? "Ответ прерван. Частичный текст сохранён. Расход неизвестен. Повтор возможен только по вашему действию." :
-            diagnostic.connection ? "Ключ не принят. Откройте настройки подключения." : "Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; проверьте детали перед повтором."};
-    return <OperationNotice error={error}>{diagnostic.connection && <Button type="button" onClick={onConnection}>Настройки подключения</Button>}</OperationNotice>;
+        message: `${status === "stopped" ? "Ответ остановлен." : status === "interrupted" ? "Ответ прерван." : diagnostic.connection ? "Ключ не принят." : source === "ollama" ? "Не удалось завершить ответ Ollama. Запустите сервер и проверьте модель." : "Не удалось завершить ответ."} Частичный текст сохранён. ${source === "cloud" ? "Списание неизвестно. " : ""}Вы можете повторить запрос.`};
+    return <OperationNotice error={error} announce={false} saved>{diagnostic.connection && <Button type="button" onClick={onConnection}>Настройки подключения</Button>}
+        {source === "ollama" && status !== "stopped" && <><Button type="button" onClick={() => { setCheckingOllama(true); onOllama(); }}>Проверить Ollama</Button>
+            {checkingOllama && <p role="status">{ollamaStatus === "loading" ? "Проверяем Ollama…" : ollamaStatus === "ready" ? "Ollama доступна. Проверьте, установлена ли нужная модель." : ollamaStatus === "error" ? "Ollama недоступна. Запустите её и проверьте соединение." : "Проверяем Ollama…"}</p>}</>}</OperationNotice>;
 }

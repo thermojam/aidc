@@ -1,6 +1,6 @@
 import {useRef, useState, type Dispatch, type RefObject, type SetStateAction} from "react";
 import {Channel, invoke} from "@tauri-apps/api/core";
-import {notify} from "../../OperationErrors";
+import {safeDiagnostic, type OperationError} from "../../OperationErrors";
 import {retryTarget, type ModelSource} from "../../modelSource";
 
 type StreamEvent =
@@ -24,6 +24,8 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
     clearContext, reload, refreshScheduledRuns, confirmAction, clear, report}: Options) {
     const [busy, setBusy] = useState(false);
     const [draft, setDraft] = useState("");
+    const [streamAnnouncement, setStreamAnnouncement] = useState("");
+    const [retryError, setRetryError] = useState<{assistantId: number; error: OperationError} | null>(null);
     const generationRequest = useRef(0);
 
     async function runGeneration(command: string, args: Record<string, unknown>, restorePrompt?: string, retrySource?: "simpleclaw" | "ollama"): Promise<boolean> {
@@ -32,6 +34,7 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
         setBusy(true);
         clear("runGeneration");
         setDraft("");
+        setStreamAnnouncement("");
         const channel = new Channel<StreamEvent>();
         let lastSeq = 0;
         let pending = "";
@@ -60,9 +63,7 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
                 pending = "";
                 setDraft((current) => current + tail);
                 setBusy(false);
-                if (message.data.status === "failed" || message.data.status === "interrupted") {
-                    notify(command === "start_ollama_generation" || retrySource === "ollama" ? "Ответ Ollama не завершён. Полученный текст сохранён; проверьте сервер и модель." : "Не удалось завершить ответ. Полученный текст сохранён. Без usage расход неизвестен; подробности у ответа.", `attempt:${message.data.attempt_id}`, Infinity);
-                }
+                if (["failed", "interrupted", "stopped"].includes(message.data.status)) setStreamAnnouncement(message.data.status === "stopped" ? "Ответ остановлен. Частичный текст сохранён." : "Ответ прерван. Частичный текст сохранён; подробности у ответа.");
                 void reload().then(() => {
                     if (request === generationRequest.current && conversationId === activeConversation.current) setDraft("");
                 }).catch((reason) => report("history", reason));
@@ -80,7 +81,11 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
             setBusy(false);
             if (restorePrompt !== undefined) setPrompt((current) => current || restorePrompt);
             clearContext();
-            report("runGeneration", reason);
+            if (retrySource !== undefined && typeof args.assistantId === "number") {
+                const diagnostic = safeDiagnostic("Повтор ответа", reason);
+                setRetryError({assistantId: args.assistantId, error: {...diagnostic, id: `retry:${args.assistantId}`, area: diagnostic.connection ? "connection" : "send", conversation: conversationId,
+                    message: diagnostic.connection ? "Ключ не принят. Откройте настройки подключения перед повтором." : "Не удалось начать повтор. Проверьте состояние подключения и попробуйте снова."}});
+            } else report("runGeneration", reason);
             return false;
         }
     }
@@ -90,6 +95,7 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
         if (!attempt) return;
         const target = retryTarget(attempt, history.contexts.find((item) => item.assistant_id === assistantId)?.context.model_source);
         if (target.source === "simpleclaw" && target.model !== "local-mock" && !await confirmAction("Повторить платный запрос? Предыдущий запрос мог быть принят и списан. Расход при обрыве неизвестен.")) return;
+        setRetryError(null);
         await runGeneration(target.command, {assistantId, modelId: target.model}, undefined, target.source);
     }
 
@@ -101,5 +107,5 @@ export function useChatGeneration({conversationId, activeConversation, currentMo
         }
     }
 
-    return {busy, draft, setDraft, runGeneration, retry, stop};
+    return {busy, draft, setDraft, runGeneration, retry, retryError, streamAnnouncement, stop};
 }
